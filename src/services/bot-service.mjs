@@ -113,6 +113,7 @@ function delay(ms) {
 const TELEGRAM_PHOTO_CAPTION_LIMIT = 1024;
 const TOPIC_LIKE_PAGE_SIZE = 10;
 const TOPIC_LIKE_PICKER_TTL_MINUTES = 120;
+const SOURCE_RECLAIM_CACHE_MS = 30_000;
 
 const TOPIC_LIKE_MODE_CONFIG = {
   topic: {
@@ -212,6 +213,7 @@ export class SalonBotService {
     this.promptConfig = promptConfig;
     this.botLogger = botLogger;
     this.localLocks = new Map();
+    this.sourceReclaimState = new Map();
   }
 
   buildUserErrorMessage(error, fallback = USER_MESSAGES.genericError) {
@@ -357,6 +359,35 @@ export class SalonBotService {
       durationMs: Math.max(0, Date.now() - startedAt),
       ...(payload ? { payload } : {}),
     });
+  }
+
+  isExpiredSourceReservation(row = {}) {
+    const reclaimed = reclaimExpiredTopic({
+      ...row,
+      reserved_until: row.reservation_expires_at,
+      reserved_by_job_id: row.reserved_by,
+    });
+    return reclaimed.status !== row.status;
+  }
+
+  async reclaimExpiredSourceRow(sheetName, row) {
+    if (!row || !this.isExpiredSourceReservation(row)) {
+      return row;
+    }
+    const nextRow = {
+      ...row,
+      status: 'ready',
+      reserved_by: '',
+      reserved_at: '',
+      reservation_expires_at: '',
+    };
+    await this.store.updateRowByNumber(
+      sheetName,
+      row.__rowNumber,
+      nextRow,
+      SHEET_HEADERS[sheetName],
+    );
+    return nextRow;
   }
 
   async ensureSourceRowReserved(sheetName, topicId, jobId) {
@@ -1820,31 +1851,46 @@ export class SalonBotService {
   }
 
   async reclaimExpiredSourceRows(sheetName) {
+    const state = this.sourceReclaimState.get(sheetName) ?? {};
+    const now = Date.now();
+    if (state.promise) {
+      return state.promise;
+    }
+    if (state.lastRunAt && (now - state.lastRunAt) < SOURCE_RECLAIM_CACHE_MS) {
+      return 0;
+    }
+
+    const run = (async () => {
     const rows = typeof this.store.getRowsByQuery === 'function'
       ? await this.store.getRowsByQuery(sheetName, {
         eq: { status: 'reserved' },
       })
       : await this.store.getRows(sheetName);
+    let reclaimedCount = 0;
     for (const row of rows) {
-      const reclaimed = reclaimExpiredTopic({
-        ...row,
-        reserved_until: row.reservation_expires_at,
-        reserved_by_job_id: row.reserved_by,
-      });
-      if (reclaimed.status !== row.status) {
-        await this.store.updateRowByNumber(
-          sheetName,
-          row.__rowNumber,
-          {
-            ...row,
-            status: 'ready',
-            reserved_by: '',
-            reserved_at: '',
-            reservation_expires_at: '',
-          },
-          SHEET_HEADERS[sheetName],
-        );
+      if (this.isExpiredSourceReservation(row)) {
+        reclaimedCount += 1;
+        await this.reclaimExpiredSourceRow(sheetName, row);
       }
+    }
+      return reclaimedCount;
+    })();
+
+    this.sourceReclaimState.set(sheetName, {
+      ...state,
+      promise: run,
+      lastRunAt: now,
+    });
+
+    try {
+      return await run;
+    } finally {
+      const nextState = this.sourceReclaimState.get(sheetName) ?? {};
+      this.sourceReclaimState.set(sheetName, {
+        ...nextState,
+        promise: null,
+        lastRunAt: Date.now(),
+      });
     }
   }
 
@@ -1873,8 +1919,10 @@ export class SalonBotService {
   }
 
   async reserveSourceRow(sheetName, topicId, reservedBy) {
-    await this.reclaimExpiredSourceRows(sheetName);
-    const sourceRow = await this.getSourceRowByTopicId(sheetName, topicId);
+    let sourceRow = await this.getSourceRowByTopicId(sheetName, topicId);
+    if (sourceRow && String(sourceRow.status).toLowerCase() === 'reserved' && this.isExpiredSourceReservation(sourceRow)) {
+      sourceRow = await this.reclaimExpiredSourceRow(sheetName, sourceRow);
+    }
     if (!sourceRow || String(sourceRow.status).toLowerCase() !== 'ready') {
       return null;
     }
