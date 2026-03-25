@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TopicItem",
+  "type": "object",
+  "required": [
+    "topic_id",
+    "title",
+    "status",
+    "priority"
+  ],
+  "properties": {
+    "topic_id": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string"
+    },
+    "brief": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "ready",
+        "reserved",
+        "published",
+        "disabled"
+      ]
+    },
+    "priority": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "reserved_by": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "reserved_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "reservation_expires_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "last_job_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "last_published_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false
+}

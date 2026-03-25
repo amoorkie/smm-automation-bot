@@ -1,0 +1,1 @@
+queue_id,job_id,job_type,revision,status,scheduled_at,publish_channel,caption_text,collage_drive_file_id,asset_drive_file_ids,topic_id,vk_post_id,publish_attempt_count,last_publish_attempt_at,last_error_code,last_error_message,created_at,updated_at

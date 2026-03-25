@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "QueueItem",
+  "type": "object",
+  "required": [
+    "queue_id",
+    "job_id",
+    "job_type",
+    "status",
+    "created_at"
+  ],
+  "properties": {
+    "queue_id": {
+      "type": "string"
+    },
+    "job_id": {
+      "type": "string"
+    },
+    "job_type": {
+      "type": "string",
+      "enum": [
+        "work",
+        "topic"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "draft",
+        "preview_ready",
+        "cancelled"
+      ]
+    },
+    "scheduled_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "publish_channel": {
+      "type": "string",
+      "enum": [
+        "telegram"
+      ]
+    },
+    "last_publish_attempt_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "publish_attempt_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "vk_post_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false
+}

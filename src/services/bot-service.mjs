@@ -1,0 +1,4373 @@
+﻿import { InputFile } from 'grammy';
+
+import {
+  CALLBACK_TTL_MINUTES,
+  DEFAULT_PROMPTS,
+  SHEET_HEADERS,
+  SHEET_NAMES,
+  USER_MESSAGES,
+  TOPIC_RESERVATION_MINUTES,
+  WORK_COLLECTION_DEBOUNCE_SECONDS,
+  WORK_COLLECTION_INITIAL_ALBUM_GRACE_SECONDS,
+  WORK_SESSION_TTL_MINUTES,
+} from '../config/defaults.mjs';
+import {
+  TOPIC_SALON_INTERIOR_GUIDANCE,
+  TOPIC_SALON_REFERENCE_IMAGE_URLS,
+} from '../config/topic-salon-refs.mjs';
+import {
+  buildCallbackTokenPayload,
+  buildControlMessageText,
+  buildHelpMessage,
+  buildPreviewKeyboard,
+  buildPreviewCaption,
+  buildQueueRow,
+  buildRenderModeKeyboard,
+  computeIdempotencyKey,
+  normalizeTelegramUpdate,
+  nowIso,
+  parseTags,
+  reclaimExpiredTopic,
+  safeJsonParse,
+  stableId,
+  toDataUrl,
+  validateCallbackToken,
+} from '../domain/index.mjs';
+import { isRetryableHttpError, withRetry, withTimeout } from './resilience.mjs';
+import { InlineKeyboard } from 'grammy';
+import {
+  composeCreativeSlide,
+  composeSliderSlides,
+  composeStorySlide,
+} from './slide-composer.mjs';
+
+function addMinutes(base, minutes) {
+  return new Date(new Date(base).getTime() + (minutes * 60_000)).toISOString();
+}
+
+function addSeconds(base, seconds) {
+  return new Date(new Date(base).getTime() + (seconds * 1000)).toISOString();
+}
+
+function sanitizeCaption(text) {
+  return String(text ?? '').trim() || USER_MESSAGES.fallbackCaption;
+}
+
+function appendContactBlock(text, contactBlock) {
+  const caption = sanitizeCaption(text);
+  const line = String(contactBlock ?? '').trim();
+  if (!line || /\[.*номер.*\]/iu.test(line) || /укажите номер/iu.test(line) || caption.includes(line)) {
+    return caption;
+  }
+  return `${caption}\n\n${line}`;
+}
+
+function extractPhoneNumber(contactBlock) {
+  const line = String(contactBlock ?? '').trim();
+  const match = line.match(/(\+?\d[\d\s()-]{8,}\d)/u);
+  return match?.[1]?.trim() ?? '';
+}
+
+function appendTopicOutro(text, contactBlock) {
+  const caption = sanitizeCaption(text);
+  const phone = extractPhoneNumber(contactBlock);
+  if (phone && caption.includes(phone)) {
+    return caption;
+  }
+
+  const outroLines = [
+    'Так что вот, такие дела) Следите за собой, а я вам в этом помогу 💛',
+    phone ? `Записаться можно по телефону ${phone} 📞` : String(contactBlock ?? '').trim(),
+  ].filter(Boolean);
+
+  if (outroLines.length === 0) {
+    return caption;
+  }
+
+  return `${caption}\n\n${outroLines.join('\n')}`;
+}
+
+function basenameForMime(mimeType, fallback = 'image.jpg') {
+  if (mimeType?.includes('png')) {
+    return fallback.replace(/\.\w+$/u, '.png');
+  }
+  if (mimeType?.includes('webp')) {
+    return fallback.replace(/\.\w+$/u, '.webp');
+  }
+  return fallback;
+}
+
+async function measureDuration(action) {
+  const startedAt = Date.now();
+  const result = await action();
+  return {
+    result,
+    durationMs: Date.now() - startedAt,
+  };
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const TELEGRAM_PHOTO_CAPTION_LIMIT = 1024;
+const TOPIC_LIKE_PAGE_SIZE = 10;
+const TOPIC_LIKE_PICKER_TTL_MINUTES = 120;
+
+const TOPIC_LIKE_MODE_CONFIG = {
+  topic: {
+    command: '/topic',
+    sourceSheetName: SHEET_NAMES.expertTopics,
+    pickerTitle: 'Выбери тему для профессионального поста',
+    emptyMessage: USER_MESSAGES.noReadyTopic,
+    promptKeys: {
+      text: 'topic_post_generation',
+      image: 'topic_image_generation',
+    },
+    previewKind: 'topic',
+  },
+  stories: {
+    command: '/stories',
+    sourceSheetName: SHEET_NAMES.storyTopics,
+    pickerTitle: 'Выбери тему для stories',
+    emptyMessage: 'Сейчас нет готовых тем для stories.',
+    promptKeys: {
+      manifest: 'story_manifest_generation',
+      visual: 'story_visual_generation',
+    },
+    previewKind: 'story',
+  },
+  creative: {
+    command: '/creative',
+    sourceSheetName: SHEET_NAMES.creativeIdeas,
+    pickerTitle: 'Выбери идею для креатива',
+    emptyMessage: 'Сейчас нет готовых идей для креативов.',
+    promptKeys: {
+      manifest: 'creative_manifest_generation',
+      visual: 'creative_visual_generation',
+    },
+    previewKind: 'creative',
+  },
+  slider: {
+    command: '/slider',
+    sourceSheetName: SHEET_NAMES.sliderTopics,
+    pickerTitle: 'Выбери тему для слайдера',
+    emptyMessage: 'Сейчас нет готовых тем для слайдеров.',
+    promptKeys: {
+      manifest: 'slider_manifest_generation',
+      visual: 'slider_visual_generation',
+    },
+    previewKind: 'slider',
+  },
+};
+
+function shouldDetachPreviewText(caption, runtime = null) {
+  if (String(caption ?? '').length > TELEGRAM_PHOTO_CAPTION_LIMIT) {
+    return true;
+  }
+  return Boolean(
+    runtime?.collage_message_id
+    && runtime?.text_message_id
+    && runtime.text_message_id !== runtime.collage_message_id,
+  );
+}
+
+function buildPreviewMetaCaption({
+  revision,
+  totalRevisions,
+  renderMode,
+}) {
+  return buildPreviewCaption({
+    caption: '',
+    revision,
+    totalRevisions,
+    renderMode,
+  }).trim();
+}
+
+function toStoredText(value) {
+  if (value === undefined || value === null) {
+    return '';
+  }
+  return String(value);
+}
+
+const PINNED_WORK_TEXT_MODEL_ID = 'openai/gpt-5.4';
+
+export class SalonBotService {
+  constructor({
+    env,
+    bot,
+    repos,
+    store,
+    openrouter,
+    promptConfig,
+    botLogger,
+  }) {
+    this.env = env;
+    this.bot = bot;
+    this.repos = repos;
+    this.store = store;
+    this.openrouter = openrouter;
+    this.promptConfig = promptConfig;
+    this.botLogger = botLogger;
+    this.localLocks = new Map();
+  }
+
+  buildUserErrorMessage(error, fallback = USER_MESSAGES.genericError) {
+    return error?.userMessage || fallback;
+  }
+
+  formatCaptionWithContact(text, contactBlock = DEFAULT_PROMPTS.contact_block) {
+    return appendContactBlock(text, contactBlock);
+  }
+
+  formatTopicCaption(text, contactBlock = DEFAULT_PROMPTS.contact_block) {
+    return appendTopicOutro(text, contactBlock);
+  }
+
+  buildWorkCaptionUserPrompt(assetCount) {
+    return [
+      `Сделай готовый короткий пост к работе мастера. Количество фото: ${assetCount}.`,
+      'Это должен быть финальный текст для публикации, а не комментарий к задаче.',
+      'Не задавай вопросов, не проси прислать фото, не объясняй процесс.',
+      'Пиши от первого лица одного мастера.',
+      'Не используй формулировки "мы", "наши мастера", "один из мастеров", "команда".',
+      'Сделай 1-2 коротких абзаца, без воды, короче текущего стандартного поста.',
+      'Если тип работы можно уверенно определить по фото, назови его в начале. Если уверенности нет — не выдумывай и используй нейтральную формулировку.',
+      'Не называй работу свадебной, вечерней, мужской, окрашиванием или любой другой конкретной услугой без прямых визуальных признаков.',
+      'Добавь умеренно больше эмодзи и живую человеческую подачу.',
+      'Допустима лёгкая разговорная шероховатость и местами чуть неидеальная разговорная фраза, но без явных ошибок и без сломанной грамматики.',
+      'Контактный блок добавлять не нужно.',
+    ].join('\n');
+  }
+
+  buildWorkCaptionImageUrls(assets) {
+    return (assets ?? [])
+      .map((asset) => {
+        if (!asset?.buffer) {
+          return null;
+        }
+        return toDataUrl(asset.buffer, asset.mimeType ?? 'image/jpeg');
+      })
+      .filter(Boolean)
+      .slice(0, 3);
+  }
+
+  buildWorkCollageImageUrls(assets) {
+    return (assets ?? [])
+      .map((asset) => {
+        if (!asset?.buffer) {
+          return null;
+        }
+        return toDataUrl(asset.buffer, asset.mimeType ?? 'image/jpeg');
+      })
+      .filter(Boolean)
+      .slice(0, 3);
+  }
+
+  buildTopicUserPrompt(topic) {
+    return [
+      `Title: ${topic?.title ?? ''}`,
+      `Brief: ${topic?.brief ?? ''}`,
+      `Tags: ${Array.isArray(topic?.tags) ? topic.tags.join(', ') : topic?.tags ?? ''}`,
+    ].join('\n');
+  }
+
+  buildTopicImagePrompt(topic, prompts) {
+    const visualMode = this.pickTopicVisualMode(topic);
+    return [
+      prompts.topic_image_generation,
+      this.buildTopicVisualModePrompt(visualMode),
+      TOPIC_SALON_INTERIOR_GUIDANCE,
+      this.buildTopicUserPrompt(topic),
+    ].join('\n');
+  }
+
+  getTopicLikeModeConfig(jobType) {
+    return TOPIC_LIKE_MODE_CONFIG[jobType] ?? null;
+  }
+
+  getTopicLikeModeByCommand(command) {
+    return Object.entries(TOPIC_LIKE_MODE_CONFIG)
+      .find(([, config]) => config.command === command)?.[0] ?? null;
+  }
+
+  getPickerSessionId(chatId, jobType) {
+    return `picker:${jobType}:${chatId}`;
+  }
+
+  truncatePickerLabel(text, limit = 52) {
+    const value = String(text ?? '').trim();
+    if (!value) {
+      return 'Без названия';
+    }
+    if (value.length <= limit) {
+      return value;
+    }
+    return `${value.slice(0, Math.max(0, limit - 1)).trim()}…`;
+  }
+
+  toPickerSnapshotRows(rows = []) {
+    return (Array.isArray(rows) ? rows : [])
+      .map((row) => ({
+        topic_id: row.topic_id,
+        title: row.title,
+        priority: row.priority,
+      }))
+      .filter((row) => row.topic_id && row.title);
+  }
+
+  getTopicLikeSourceSheet(jobType) {
+    return this.getTopicLikeModeConfig(jobType)?.sourceSheetName ?? null;
+  }
+
+  async ensureSourceRowReserved(sheetName, topicId, jobId) {
+    if (!sheetName || !topicId || !jobId) {
+      return;
+    }
+
+    const rows = await this.store.getRows(sheetName);
+    const row = rows.find((item) => item.topic_id === topicId);
+    if (!row || String(row.status ?? '').toLowerCase() === 'published') {
+      return;
+    }
+
+    await this.store.updateRowByNumber(
+      sheetName,
+      row.__rowNumber,
+      {
+        ...row,
+        status: 'reserved',
+        reserved_by: jobId,
+        reserved_at: row.reserved_at || nowIso(),
+        reservation_expires_at: row.reservation_expires_at || addMinutes(new Date(), TOPIC_RESERVATION_MINUTES),
+        last_job_id: jobId,
+      },
+      SHEET_HEADERS[sheetName],
+    );
+  }
+
+  buildTopicVisualModePrompt(mode) {
+    const promptsByMode = {
+      exact_salon_room: [
+        'Visual planner mode: exact_salon_room.',
+        'Keep the salon room as close to the references as possible.',
+        'Preserve the same black-and-white checkered floor pattern, the same mirror shapes, the same diploma placement between mirrors, the same black chairs, and the same room proportions.',
+        'Allowed change: only camera angle, crop, distance, or focus inside the same room.',
+      ],
+      exact_salon_closeup: [
+        'Visual planner mode: exact_salon_closeup.',
+        'Stay inside the exact same salon, but move closer to one working zone or object.',
+        'The room still needs to be recognisable by floor pattern, mirrors, diplomas, chair geometry, and furniture language.',
+        'Do not turn this into a different salon or abstract beauty studio.',
+      ],
+      neutral_nonhuman_object: [
+        'Visual planner mode: neutral_nonhuman_object.',
+        'A non-human object-first scene is allowed when the topic is better explained through tools, products, towels, brushes, or routine details.',
+        'Do not use faces, people, or finished hairstyles as the hero subject.',
+      ],
+    };
+    return (promptsByMode[mode] ?? promptsByMode.exact_salon_closeup).join(' ');
+  }
+
+  pickTopicVisualMode(topic) {
+    const haystack = [
+      topic?.title ?? '',
+      topic?.brief ?? '',
+      Array.isArray(topic?.tags) ? topic.tags.join(', ') : topic?.tags ?? '',
+    ].join(' ').toLowerCase();
+
+    if (/(чек|топ|подбор|средств|набор|что\s+нужно|что\s+купить|ошибк|термо|маск|шампун|кондиционер|спрей|масл|расчес|щетк|диффуз|полотенц)/u.test(haystack)) {
+      return 'neutral_nonhuman_object';
+    }
+    if (/(салон|рабоч|кресл|зеркал|интерьер|уголок|место)/u.test(haystack)) {
+      return 'exact_salon_room';
+    }
+    return 'exact_salon_closeup';
+  }
+
+  pickStoryBackgroundStyle(seedSource = '') {
+    const seed = String(seedSource ?? '');
+    let hash = 0;
+    for (let index = 0; index < seed.length; index += 1) {
+      hash = ((hash * 31) + seed.charCodeAt(index)) >>> 0;
+    }
+
+    const variants = ['clear', 'light_blur', 'soft_blur'];
+    return variants[hash % variants.length] ?? 'light_blur';
+  }
+
+  isWeakStoryBrief(brief = '') {
+    const value = String(brief ?? '').trim().toLowerCase();
+    if (!value) {
+      return true;
+    }
+
+    if (/[;|]/u.test(value)) {
+      return true;
+    }
+
+    const weakMarkers = [
+      'тема про',
+      'это тема',
+      'это про',
+      'короткая тема',
+      'короткая памятка',
+      'проверка нового режима',
+      'проверка публикации',
+      'помогает цвету и длине выглядеть аккуратно',
+      'короткое объяснение',
+      'подборка по теме',
+    ];
+
+    return weakMarkers.some((marker) => value.startsWith(marker) || value.includes(marker));
+  }
+
+  getStoryVoiceLead(sourceRow = {}) {
+    const seed = String(sourceRow?.title ?? sourceRow?.topic_id ?? '');
+    const variants = [
+      'Если коротко,',
+      'Часто слышу этот вопрос.',
+      'Я бы сказала так:',
+      'По опыту скажу так:',
+    ];
+    const index = [...seed].reduce((sum, char) => sum + char.charCodeAt(0), 0) % variants.length;
+    return variants[index];
+  }
+
+  hasStoryFirstPerson(text = '') {
+    return /\b(я|мне|у меня|я бы|я обычно|я всегда|скажу|слышу)\b/iu.test(String(text ?? ''));
+  }
+
+  lowercaseStoryLead(text = '') {
+    const value = String(text ?? '').trim();
+    if (!value) {
+      return value;
+    }
+    return value.charAt(0).toLowerCase() + value.slice(1);
+  }
+
+  humanizeStoryBody(body = '', sourceRow = {}) {
+    const value = String(body ?? '').trim().replace(/\s+/gu, ' ');
+    if (!value || this.hasStoryFirstPerson(value)) {
+      return value;
+    }
+
+    const lead = this.getStoryVoiceLead(sourceRow);
+    if (lead.endsWith(',') || lead.endsWith(':')) {
+      return `${lead} ${this.lowercaseStoryLead(value)}`.trim();
+    }
+    return `${lead} ${value}`.trim();
+  }
+
+  isWeakCreativeSubhead(text = '') {
+    const value = String(text ?? '').trim().toLowerCase();
+    if (!value) {
+      return true;
+    }
+    if (value.split(/\s+/u).length < 4) {
+      return true;
+    }
+    return [
+      'ироничный креатив про',
+      'креатив про',
+      'тема про',
+      'это про',
+      'короткий креатив',
+      'идея про',
+      'шутка про',
+      'ирония про',
+    ].some((marker) => value.startsWith(marker) || value.includes(marker));
+  }
+
+  buildCreativeFallbackSubhead(sourceRow) {
+    const title = String(sourceRow?.title ?? '').toLowerCase();
+    const tags = parseTags(sourceRow?.tags);
+    const signal = `${title} ${tags.join(' ').toLowerCase()}`.trim();
+
+    if (signal.includes('термо') || signal.includes('утюж') || signal.includes('фен')) {
+      return 'Когда жара в уходе становится слишком частой, длина это замечает раньше всех.';
+    }
+
+    if (signal.includes('окраш') || signal.includes('цвет')) {
+      return 'Иногда цвет устаёт не от краски, а от того, как с ним живут дома потом.';
+    }
+
+    if (signal.includes('сух') || signal.includes('ломк') || signal.includes('длин')) {
+      return 'Сухая длина чаще просит не магии, а пары простых привычек без перегруза.';
+    }
+
+    return 'Иногда вся разница между красивым видом и уставшей длиной сидит в одной привычке.';
+  }
+
+  normalizeCreativeBullets(items = []) {
+    const list = Array.isArray(items) ? items : [];
+    return list
+      .flatMap((item) => String(item ?? '').split(/\n+/u))
+      .map((item) => this.normalizeOverlayBullet(item))
+      .filter(Boolean)
+      .filter((item) => item.length > 6)
+      .slice(0, 2);
+  }
+
+  normalizeOverlayBullet(item = '') {
+      const cleaned = String(item ?? '')
+        .replace(/\r/gu, '')
+        .replace(/^[•●◦▪▸►‣–—−‑-]+\s*/u, '')
+        .replace(/^\(?\d{1,2}[.)]\s*/u, '')
+        .replace(/\s+/gu, ' ')
+        .replace(/[;]+/gu, ', ')
+        .trim();
+    return this.normalizeDisplaySentenceCase(this.simplifyEverydayHairText(cleaned));
+  }
+
+  capitalizeOverlayText(text = '') {
+      const value = String(text ?? '').trim();
+      if (!value) {
+        return '';
+      }
+      return value.replace(/^([«"(\[]*\s*)([a-zа-яё])/iu, (_, prefix, letter) => `${prefix}${letter.toUpperCase()}`);
+  }
+
+  normalizeDisplaySentenceCase(text = '') {
+      const value = String(text ?? '').trim();
+      if (!value) {
+        return '';
+      }
+
+      const words = value.split(/\s+/u);
+      const titleCaseWords = words.filter((word) => /^[А-ЯЁ][а-яё-]+$/u.test(word)).length;
+      const looksLikeTitleCase = words.length >= 2 && titleCaseWords >= Math.max(2, Math.ceil(words.length * 0.6));
+
+      if (!looksLikeTitleCase) {
+        return this.capitalizeOverlayText(value);
+      }
+
+      const normalized = words.map((word, index) => {
+        if (!/[А-ЯЁа-яё]/u.test(word)) {
+          return word;
+        }
+        if (/[A-Za-z]/u.test(word) || /^[А-ЯЁ]{2,}$/u.test(word)) {
+          return index === 0 ? this.capitalizeOverlayText(word) : word;
+        }
+
+        const lower = word.toLocaleLowerCase('ru-RU');
+        return index === 0
+          ? lower.replace(/^([«"(\[]*\s*)([а-яё])/u, (_, prefix, letter) => `${prefix}${letter.toUpperCase()}`)
+          : lower;
+      }).join(' ');
+
+      return this.capitalizeOverlayText(normalized);
+  }
+
+  simplifyEverydayHairText(text = '') {
+      return String(text ?? '')
+      .replace(/коже головы и длине/giu, 'коже головы и волосам')
+      .replace(/корни и длина/giu, 'корни и волосы')
+      .replace(/сама длина/giu, 'сами волосы')
+      .replace(/сухая длина/giu, 'сухие волосы')
+      .replace(/окрашенная длина/giu, 'окрашенные волосы')
+      .replace(/по длине волос/giu, 'на волосы')
+      .replace(/по длине и концам/giu, 'на волосы, особенно от середины к концам')
+      .replace(/по длине/giu, 'на волосы')
+      .replace(/длина остаётся/giu, 'волосы остаются')
+      .replace(/длина теряет/giu, 'волосы теряют')
+      .replace(/длина собирает/giu, 'волосы собирают')
+      .replace(/длина выглядит/giu, 'волосы выглядят')
+      .replace(/длина быстрее/giu, 'волосы быстрее')
+      .replace(/длине /giu, 'волосам ')
+      .replace(/длину/giu, 'волосы')
+      .replace(/длина/giu, 'волосы')
+      .replace(/длиной/giu, 'волосами')
+      .replace(/щётка/giu, 'расчёска')
+      .replace(/щетк/giu, 'расческ')
+      .replace(/несмываемый уход/giu, 'несмываемый уход, например спрей, крем или лосьон')
+      .replace(/несмываемого ухода/giu, 'несмываемого ухода, например спрея, крема или лосьона')
+      .replace(/несмываемому уходу/giu, 'несмываемому уходу, например спрею, крему или лосьону')
+      .replace(/несмываемым уходом/giu, 'несмываемым уходом, например спреем, кремом или лосьоном')
+      .replace(/несмываемом уходе/giu, 'несмываемом уходе, например спрее, креме или лосьоне')
+        .replace(/закрывает кутикулу/giu, 'сглаживает внешний слой волоса')
+        .replace(/закрыть кутикулу/giu, 'сгладить внешний слой волоса')
+        .replace(/кутикулу/giu, 'внешний слой волоса')
+        .replace(/себум/giu, 'кожный жир');
+  }
+
+  getOverlayGlossaryEntries() {
+      return [
+        ['себум', 'Себум — это кожный жир, который вырабатывает кожа головы.'],
+        ['кутикул', 'Кутикула — это внешний слой волоса, который отвечает за гладкость и блеск.'],
+        ['полотно', 'Полотно — это основная длина волос, без акцента на корни и концы.'],
+        ['детокс-шампун', 'Детокс-шампунь — это более глубоко очищающий шампунь для снятия накоплений ухода и себума.'],
+        ['термозащит', 'Термозащита — это средство, которое снижает пересушивание волос от фена и горячих инструментов.'],
+      ];
+  }
+
+  buildOverlayGlossaryHaystack(...parts) {
+      return parts
+        .flatMap((part) => Array.isArray(part) ? part : [part])
+        .map((item) => String(item ?? '').toLowerCase())
+        .join('\n');
+  }
+
+  buildOverlayGlossaryFooter(...parts) {
+      const glossary = this.getOverlayGlossaryEntries();
+
+      const haystack = this.buildOverlayGlossaryHaystack(...parts);
+
+      const lines = glossary
+        .filter(([needle]) => haystack.includes(needle))
+        .map(([, explanation]) => explanation);
+
+      return lines.join('\n');
+  }
+
+  normalizeExplicitOverlayFooter(existingFooter = '', ...parts) {
+      const explicit = String(existingFooter ?? '').trim();
+      if (!explicit) {
+        return '';
+      }
+
+      const haystack = this.buildOverlayGlossaryHaystack(...parts);
+      const glossary = this.getOverlayGlossaryEntries();
+
+      const lines = explicit
+        .split(/\n+/u)
+        .map((line) => this.normalizeSliderText(line))
+        .map((line) => this.capitalizeOverlayText(line))
+        .filter(Boolean)
+        .filter((line) => {
+          const lower = line.toLowerCase();
+          const glossaryEntry = glossary.find(([needle, explanation]) => lower.includes(needle) || lower === explanation.toLowerCase());
+          if (!glossaryEntry) {
+            return true;
+          }
+          return haystack.includes(glossaryEntry[0]);
+        });
+
+      return [...new Set(lines)].join('\n');
+  }
+
+  mergeOverlayFooter(existingFooter = '', ...parts) {
+      const explicit = this.normalizeExplicitOverlayFooter(existingFooter, ...parts);
+      const glossary = this.buildOverlayGlossaryFooter(...parts);
+      return [...new Set([explicit, glossary].filter(Boolean).flatMap((chunk) => chunk.split(/\n+/u).map((line) => line.trim()).filter(Boolean)))]
+        .join('\n')
+        .trim();
+  }
+
+  splitDisplaySentences(text = '') {
+      return String(text ?? '')
+        .split(/(?<=[.!?…])\s+/u)
+        .map((item) => item.trim())
+        .filter(Boolean);
+  }
+
+  looksLikeInlineTermDefinition(sentence = '') {
+      const value = String(sentence ?? '').trim().toLowerCase();
+      if (!value) {
+        return false;
+      }
+      const hasGlossaryNeedle = this.getOverlayGlossaryEntries().some(([needle]) => value.includes(needle));
+      return hasGlossaryNeedle && /(?:—|-)\s*это\b/u.test(value);
+  }
+
+  removeInlineTermDefinition(text = '') {
+      const sentences = this.splitDisplaySentences(text);
+      if (sentences.length === 0) {
+        return '';
+      }
+
+      const filtered = sentences.filter((sentence, index) => {
+        if (!this.looksLikeInlineTermDefinition(sentence)) {
+          return true;
+        }
+        return sentences.length === 1 && index === 0;
+      });
+
+      return filtered.join(' ').trim();
+  }
+
+  normalizeCompareText(text = '') {
+      return String(text ?? '')
+        .toLowerCase()
+        .replace(/^\d+\.\s*/u, '')
+        .replace(/[«»"“”'.,:;!?()\-—]/gu, ' ')
+        .replace(/\s+/gu, ' ')
+        .trim();
+  }
+
+  dedupeRepeatedPhrase(title = '', body = '') {
+      const normalizedTitle = this.normalizeCompareText(title);
+      const sentences = this.splitDisplaySentences(body);
+      if (!normalizedTitle || sentences.length <= 1) {
+        return body;
+      }
+
+      const filtered = [...sentences];
+      const first = this.normalizeCompareText(filtered[0]);
+      if (first && (first.startsWith(normalizedTitle) || first.includes(normalizedTitle))) {
+        filtered.shift();
+      }
+
+      return filtered.join(' ').trim() || body;
+  }
+
+  normalizeDisplayBody(text = '', { title = '' } = {}) {
+      const simplified = this.normalizeSliderText(text);
+      const withoutDefinitions = this.removeInlineTermDefinition(simplified);
+      const deduped = this.dedupeRepeatedPhrase(title, withoutDefinitions || simplified);
+      return this.capitalizeOverlayText(deduped || simplified);
+  }
+
+  normalizeCreativeManifest(manifest, sourceRow) {
+      const headline = String(manifest.headline ?? manifest.title ?? sourceRow.title ?? '').trim();
+    const subheadCandidates = [
+      manifest.subhead,
+      manifest.body,
+      manifest.support,
+      manifest.description,
+      sourceRow.brief,
+    ];
+    const subheadRaw = subheadCandidates
+      .map((item) => String(item ?? '').trim())
+      .find(Boolean) ?? '';
+      const normalizedSubhead = this.normalizeDisplayBody(subheadRaw, { title: headline });
+      const subhead = this.isWeakCreativeSubhead(normalizedSubhead)
+        ? this.buildCreativeFallbackSubhead(sourceRow)
+        : normalizedSubhead;
+      const bullets = this.normalizeCreativeBullets(manifest.bullets ?? manifest.points ?? []);
+
+      return {
+        eyebrow: '',
+        headline: this.capitalizeOverlayText(this.normalizeSliderText(headline)),
+        subhead,
+        bullets,
+        footer: this.mergeOverlayFooter(
+          String(manifest.footer ?? manifest.closing ?? '').trim(),
+          this.capitalizeOverlayText(this.normalizeSliderText(headline)),
+          subhead,
+          bullets,
+        ),
+      };
+  }
+
+  isWeakSliderCopy(text = '') {
+    const value = String(text ?? '').trim().toLowerCase();
+    if (!value) {
+      return true;
+    }
+    if (/[;|]/u.test(value)) {
+      return true;
+    }
+    return [
+      'небольшая карусель',
+      'карусель о',
+      'тема про',
+      'это про',
+      'короткая карусель',
+      'повседневных действиях',
+    ].some((marker) => value.startsWith(marker) || value.includes(marker));
+  }
+
+  getSliderScenario(sourceRow) {
+    const title = String(sourceRow?.title ?? '').toLowerCase();
+    const tags = parseTags(sourceRow?.tags);
+    const signal = `${title} ${tags.join(' ').toLowerCase()}`.trim();
+
+    if (signal.includes('баз') || signal.includes('набор') || signal.includes('средств') || signal.includes('дома') || signal.includes('домаш')) {
+      return 'basic_set';
+    }
+
+    if (signal.includes('чищ') || signal.includes('свеж') || signal.includes('жир')) {
+      return 'freshness';
+    }
+
+    if (signal.includes('окраш') || signal.includes('цвет') || signal.includes('мягк')) {
+      return 'color_care';
+    }
+
+    if (signal.includes('термо') || signal.includes('фен') || signal.includes('утюж')) {
+      return 'heat_protection';
+    }
+
+    if (
+      signal.includes('constant delight')
+      || signal.includes('constanta delight')
+      || signal.includes('чем работ')
+      || signal.includes('что использ')
+      || signal.includes('какую косметик')
+      || signal.includes('какой шампун')
+    ) {
+      return 'master_products';
+    }
+
+    return 'generic';
+  }
+
+  buildSliderCoverSubtitle(sourceRow) {
+    switch (this.getSliderScenario(sourceRow)) {
+      case 'basic_set':
+        return 'Если дома держать шампунь, кондиционер, маску и несмываемый уход, например спрей, крем или лосьон, уже закрываются очищение, мягкость, питание и защита длины без лишних баночек.';
+      case 'freshness':
+        return 'Когда корни и длина получают разный уход, волосы дольше выглядят чище, а сама длина остаётся мягкой и аккуратной без тяжести.';
+      case 'color_care':
+        return 'После окрашивания мягкость держится дольше, если дома оставить мягкое мытьё, кондиционер после каждого мытья, маску по необходимости и меньше перегрева.';
+      case 'heat_protection':
+        return 'Даже обычный фен пересушивает длину, если сушить волосы слишком жарко. Здесь собрала короткую схему, как этого не допускать каждый день.';
+      case 'master_products':
+        return 'Когда спрашивают, чем я бы закрыла базовый уход дома, я всегда смотрю на мягкое очищение, уход по длине, питание без перегруза и защиту под фен.';
+      default:
+        return 'Здесь собрала короткую рабочую схему по теме: без воды, но с понятным объяснением, что делать и зачем это нужно волосам.';
+    }
+  }
+
+  buildSliderCoverBullets(sourceRow, slides = []) {
+    const scenario = this.getSliderScenario(sourceRow);
+    const slideTitles = Array.isArray(slides)
+      ? slides
+        .map((slide) => this.normalizeOverlayBullet(slide?.title ?? ''))
+        .filter(Boolean)
+      : [];
+
+    if (scenario !== 'basic_set' && slideTitles.length >= 3) {
+      return slideTitles.slice(0, 4);
+    }
+
+    switch (scenario) {
+      case 'basic_set':
+        return [
+          'Шампунь по коже головы',
+          'Кондиционер после каждого мытья',
+          'Маска 1-2 раза в неделю',
+          'Несмываемый уход по длине, например спрей или крем',
+        ];
+      case 'freshness':
+        return [
+          'Шампунь по коже головы',
+          'Кондиционер только по длине',
+          'Меньше касаний руками',
+          'Чистая щётка',
+        ];
+      case 'color_care':
+        return [
+          'Мягкое мытьё',
+          'Кондиционер после каждого мытья',
+          'Маска 1-2 раза в неделю',
+          'Меньше перегрева',
+        ];
+      case 'heat_protection':
+        return [
+          'Термозащита перед феном',
+          'Не греть одну зону',
+          'Средний нагрев',
+          'Внимание к концам',
+        ];
+      case 'master_products':
+        return [
+          'Мягкий шампунь',
+          'Кондиционер как база',
+          'Маска без перегруза',
+          'Защита под фен',
+        ];
+      default:
+        return [];
+    }
+  }
+
+  buildSliderFallbackSlides(sourceRow) {
+    switch (this.getSliderScenario(sourceRow)) {
+      case 'basic_set':
+      return [
+        {
+          eyebrow: 'Шаг 1',
+          title: '1. Шампунь',
+          body: 'Шампунь отвечает за чистую кожу головы и мягкое очищение без ощущения сухости или тяжести по длине.',
+          bullets: [
+            'Подбирайте по коже головы, а не по длине волос.',
+            'Для базы дома лучше мягкое очищение без агрессивного скрипа.',
+          ],
+        },
+        {
+          eyebrow: 'Шаг 2',
+          title: '2. Кондиционер',
+          body: 'Кондиционер сглаживает длину после шампуня, делает волосы мягче и помогает им меньше путаться после каждого мытья.',
+          bullets: [
+            'Наносите после каждого мытья, но только по длине и концам.',
+            'Если волосы быстро утяжеляются, на корни его лучше не поднимать.',
+          ],
+        },
+        {
+          eyebrow: 'Шаг 3',
+          title: '3. Маска',
+          body: 'Маска даёт более глубокое питание и поддерживает сухую или окрашенную длину, когда обычного кондиционера уже становится мало.',
+          bullets: [
+            'Обычно хватает 1-2 раз в неделю вместо кондиционера.',
+            'Если волосы тонкие, держите меньше по времени и не наносите на корни.',
+          ],
+        },
+        {
+          eyebrow: 'Шаг 4',
+          title: '4. Несмываемый уход',
+          body: 'Несмываемый уход, например спрей, крем или лосьон, снимает пушение, облегчает расчёсывание и помогает длине дольше выглядеть гладкой и собранной каждый день.',
+          bullets: [
+            'Крем или спрей выбирайте по плотности волос и задаче.',
+            'Перед феном он часто работает и как защита, и как уход по длине.',
+          ],
+        },
+      ];
+      case 'freshness':
+      return [
+        {
+          eyebrow: 'Шаг 1',
+          title: 'Шампунь по коже головы',
+          body: 'Корни дольше выглядят свежими, если шампунь подбираете именно под кожу головы, а не по обещаниям для длины.',
+          bullets: [
+            'Если кожа жирнится быстро, слишком мягкий шампунь не всегда справляется.',
+            'Длину отдельно тереть шампунем не нужно, ей обычно хватает пены при смывании.',
+          ],
+        },
+        {
+          eyebrow: 'Шаг 2',
+          title: 'Меньше касаний руками',
+          body: 'Чем чаще трогают волосы в течение дня, тем быстрее длина теряет аккуратный вид и собирает всё лишнее.',
+          bullets: [
+            'Если постоянно поправлять пряди у лица, чистота уходит заметно быстрее.',
+          ],
+        },
+        {
+          eyebrow: 'Шаг 3',
+          title: 'Кондиционер только по длине',
+          body: 'Так волосы остаются мягкими, но корни не утяжеляются раньше времени и не теряют свежесть к вечеру.',
+          bullets: [
+            'По корням кондиционер и плотные маски лучше не распределять.',
+          ],
+        },
+        {
+          eyebrow: 'Шаг 4',
+          title: 'Чистая щётка тоже важна',
+          body: 'Щётка быстро возвращает на волосы всё, что на ней накопилось, поэтому уход работает хуже, чем мог бы.',
+          bullets: [
+            'Щётку и расчёску лучше мыть регулярно, особенно если пользуетесь несмываемым уходом.',
+          ],
+        },
+      ];
+      case 'color_care':
+      return [
+        {
+          eyebrow: 'Шаг 1',
+          title: 'Мягкое мытьё',
+          body: 'После окрашивания длину проще сохранить мягкой, если шампунь очищает спокойно и не пересушивает полотно.',
+          bullets: [
+            'Слишком жёсткое очищение быстрее съедает и мягкость, и красивый блеск.',
+          ],
+        },
+        {
+          eyebrow: 'Шаг 2',
+          title: 'Кондиционер каждый раз',
+          body: 'Кондиционер помогает длине оставаться более гладкой, мягкой и меньше путаться уже после каждого мытья.',
+          bullets: [
+            'Это базовый шаг, который после окрашивания лучше не пропускать.',
+          ],
+        },
+        {
+          eyebrow: 'Шаг 3',
+          title: 'Маска без перегруза',
+          body: 'Маска поддерживает сухую длину глубже, но чаще всего достаточно 1-2 раз в неделю без лишнего утяжеления.',
+          bullets: [
+            'Если волосы тонкие, наносите меньше и держите умеренно по времени.',
+          ],
+        },
+        {
+          eyebrow: 'Шаг 4',
+          title: 'Меньше жара',
+          body: 'Чем аккуратнее с феном и утюжком, тем дольше цвет и сама длина выглядят живыми и аккуратными.',
+          bullets: [
+            'Термозащита и средний нагрев здесь работают лучше, чем сильный жар каждый день.',
+          ],
+        },
+      ];
+      case 'heat_protection':
+      return [
+        {
+          eyebrow: 'Шаг 1',
+          title: 'Защита перед феном',
+          body: 'Термозащита нужна не только под утюжок. Фен и горячий воздух тоже постепенно сушат длину и делают её жёстче.',
+          bullets: [
+            'Наносить её удобнее на влажную длину перед сушкой.',
+          ],
+        },
+        {
+          eyebrow: 'Шаг 2',
+          title: 'Не грейте одну зону',
+          body: 'Если долго держать горячий воздух в одном месте, длина быстрее теряет мягкость и начинает сильнее пушиться.',
+          bullets: [
+            'Фен лучше двигать, а не держать в одной точке.',
+          ],
+        },
+        {
+          eyebrow: 'Шаг 3',
+          title: 'Средний нагрев лучше',
+          body: 'Для повседневной сушки среднего режима обычно достаточно, особенно если не нужна жёсткая укладка.',
+          bullets: [
+            'Сильный жар лучше оставлять только под конкретную задачу.',
+          ],
+        },
+        {
+          eyebrow: 'Шаг 4',
+          title: 'Концы берегите сильнее',
+          body: 'Именно концы чаще всего первыми теряют мягкость, блеск и начинают выглядеть пересушенными.',
+          bullets: [
+            'На эту зону уход и защита почти всегда нужны чуть внимательнее.',
+          ],
+        },
+      ];
+      case 'master_products':
+        return [
+          {
+            eyebrow: 'Шаг 1',
+            title: 'Мягкий шампунь',
+            body: 'Когда спрашивают, чем я бы закрыла базу дома, я сначала смотрю на мягкий шампунь, который чисто работает по коже головы и не сушит длину.',
+            bullets: [
+              'Из рабочих линеек мне часто нравятся спокойные формулы Constant Delight.',
+              'Но сам шампунь всё равно подбираю под кожу головы, а не под концы.',
+            ],
+          },
+          {
+            eyebrow: 'Шаг 2',
+            title: 'Кондиционер как база',
+            body: 'Кондиционер собирает длину после мытья обратно в более гладкое и мягкое состояние, поэтому я бы не убирала его из регулярного ухода.',
+            bullets: [
+              'Это шаг после каждого мытья.',
+              'Наносить лучше по длине и концам.',
+            ],
+          },
+          {
+            eyebrow: 'Шаг 3',
+            title: 'Маска без перегруза',
+            body: 'Маска нужна, когда длине уже мало базы и хочется больше питания, но без ощущения тяжёлой плёнки на волосах.',
+            bullets: [
+              'Обычно достаточно 1-2 раз в неделю.',
+              'На тонких волосах важнее не количество, а умеренность.',
+            ],
+          },
+          {
+            eyebrow: 'Шаг 4',
+            title: 'Защита под фен',
+            body: 'Несмываемый уход и защита под фен помогают держать длину более гладкой, меньше пушащейся и легче расчёсываемой каждый день.',
+            bullets: [
+              'Формат крема или спрея выбирайте по плотности длины.',
+              'Перед феном защита особенно важна для концов.',
+            ],
+          },
+        ];
+      default:
+        return [
+          {
+            eyebrow: 'Шаг 1',
+            title: 'Мягкое очищение',
+            body: 'Обычно результат начинается с спокойного мытья без лишней агрессии, особенно если кожа головы быстро реагирует на слишком жёсткий шампунь.',
+            bullets: [
+              'Шампунь лучше подбирать по состоянию кожи головы.',
+              'Длину отдельно тереть шампунем чаще всего не нужно.',
+            ],
+          },
+          {
+            eyebrow: 'Шаг 2',
+            title: 'Уход по длине',
+            body: 'После мытья длине почти всегда нужен кондиционер или другой базовый уход, иначе она быстрее становится сухой и непослушной.',
+            bullets: [
+              'Если длина сухая, одного шампуня обычно мало.',
+              'Кондиционер лучше не поднимать на корни.',
+            ],
+          },
+          {
+            eyebrow: 'Шаг 3',
+            title: 'Питание по мере необходимости',
+            body: 'Когда волосам уже мало базового ухода, маска закрывает этот вопрос лучше, чем постоянное утяжеление каждого этапа.',
+            bullets: [
+              'Обычно хватает 1-2 раз в неделю.',
+              'Лучше точечно, чем каждый день и слишком много.',
+            ],
+          },
+          {
+            eyebrow: 'Шаг 4',
+            title: 'Защита каждый день',
+            body: 'Фен, жара и сухой воздух тоже влияют на длину, даже если укладка кажется лёгкой и уже привычной.',
+            bullets: [
+              'Если сушите волосы регулярно, защиту лучше не пропускать.',
+              'Несмываемый уход помогает держать гладкость дольше.',
+            ],
+          },
+        ];
+    }
+  }
+
+  normalizeSliderText(text = '') {
+    return this.simplifyEverydayHairText(String(text ?? '')
+      .replace(/[;]+/gu, ', ')
+      .replace(/\s+/gu, ' ')
+      .trim());
+  }
+
+  alignSliderCoverCount(title = '', slideCount = 0) {
+    const normalizedTitle = this.normalizeSliderText(title);
+    if (!normalizedTitle || !Number.isFinite(slideCount) || slideCount < 1) {
+      return normalizedTitle;
+    }
+
+    if (/^\s*(?:топ[-\s]*)?\d+\b/iu.test(normalizedTitle)) {
+      return normalizedTitle.replace(/^(\s*(?:топ[-\s]*)?)(\d+)\b/iu, `$1${slideCount}`);
+    }
+
+    return normalizedTitle;
+  }
+
+  normalizeSliderSlide(slide = {}, sourceRow = {}, index = 0) {
+      const title = this.capitalizeOverlayText(this.normalizeSliderText(slide.title ?? ''));
+      const body = this.normalizeDisplayBody(slide.body ?? '', { title });
+      const bullets = this.normalizeCreativeBullets(slide.bullets ?? []).slice(0, 2);
+      return {
+        eyebrow: String(slide.eyebrow ?? `Шаг ${index + 1}`).trim(),
+        title,
+        body,
+        bullets,
+        footer: this.mergeOverlayFooter(this.normalizeSliderText(slide.footer ?? ''), title, body, bullets),
+      };
+  }
+
+  isWeakSliderSlideTitle(text = '') {
+    const value = this.normalizeSliderText(text).toLowerCase();
+    if (!value) {
+      return true;
+    }
+    return value.split(/\s+/u).length < 2 || ['привычки', 'уход', 'советы', 'шаг', 'набор'].includes(value);
+  }
+
+  isWeakSliderSlideBody(text = '') {
+    const value = this.normalizeSliderText(text);
+    return !value || value.split(/\s+/u).length < 10 || this.isWeakSliderCopy(value);
+  }
+
+  buildStoryFallbackBody(sourceRow) {
+    const title = String(sourceRow?.title ?? '').toLowerCase();
+    const tags = parseTags(sourceRow?.tags);
+    const signal = `${title} ${tags.join(' ').toLowerCase()}`.trim();
+
+    if (signal.includes('окраш') || signal.includes('цвет') || signal.includes('мягк')) {
+      return 'Часто слышу этот вопрос. После окрашивания я обычно советую оставить мягкий шампунь, кондиционер после каждого мытья и маску пару раз в неделю. Тогда длина остаётся мягче, а цвет не тускнеет раньше времени.';
+    }
+
+    if (signal.includes('термо') || signal.includes('фен') || signal.includes('утюж')) {
+      return 'Если коротко, термозащита нужна не только под утюжок. Я наношу её и перед феном, потому что горячий воздух тоже сушит длину и со временем делает её жёстче.';
+    }
+
+    if (signal.includes('жир') || signal.includes('корн') || signal.includes('свеж')) {
+      return 'По опыту скажу так: коже головы и длине часто правда нужен разный уход. Корням важнее хорошее очищение, а длине мягкость и защита, тогда волосы выглядят аккуратнее без лишней тяжести.';
+    }
+
+    if (signal.includes('сух') || signal.includes('ломк') || signal.includes('длин')) {
+      return 'Я бы сказала так: когда длина сухая, не нужен сложный ритуал. Обычно я советую мягкий шампунь, кондиционер после мытья и одно хорошее несмываемое средство по длине.';
+    }
+
+    if (!this.isWeakStoryBrief(sourceRow?.brief)) {
+      return this.humanizeStoryBody(String(sourceRow?.brief ?? '').trim(), sourceRow);
+    }
+
+    return 'Чаще всего лучше работает спокойный домашний уход без перегруза. Я бы оставила мягкое мытьё, уход по длине и защиту от пересушивания, этого уже хватает для заметного результата.';
+  }
+
+  buildStoryFallbackBullets(sourceRow) {
+    const title = String(sourceRow?.title ?? '').toLowerCase();
+    const tags = parseTags(sourceRow?.tags);
+    const signal = `${title} ${tags.join(' ').toLowerCase()}`.trim();
+
+    if (signal.includes('окраш') || signal.includes('цвет') || signal.includes('мягк')) {
+      return [
+        'После каждого мытья я бы оставила кондиционер по длине.',
+        'Слишком очищающий шампунь после окрашивания лучше не брать.',
+        'Маску достаточно подключать 1-2 раза в неделю.',
+      ];
+    }
+
+    if (signal.includes('термо') || signal.includes('фен') || signal.includes('утюж')) {
+      return [
+        'Перед феном я бы термозащиту не пропускала.',
+        'Слишком горячий воздух в одну зону долго не направляйте.',
+        'Концы лучше сушить на среднем нагреве.',
+      ];
+    }
+
+    if (signal.includes('жир') || signal.includes('корн') || signal.includes('свеж')) {
+      return [
+        'Шампунь подбирайте под кожу головы, а не под длину.',
+        'Плотные маски и масла на корни лучше не наносить.',
+        'По длине уход нужен отдельно, чтобы она не пересушивалась.',
+      ];
+    }
+
+    return [
+      'Я бы не делала уход слишком сложным без необходимости.',
+      'После мытья длине почти всегда нужен кондиционер или бальзам.',
+      'Перед сушкой феном термозащиту лучше не пропускать.',
+    ];
+  }
+
+  normalizeStoryBullets(items = []) {
+    const list = Array.isArray(items) ? items : [];
+    return list
+      .flatMap((item) => String(item ?? '').split(/\n+/u))
+      .map((item) => this.normalizeOverlayBullet(item))
+      .filter(Boolean)
+      .filter((item) => item.length > 6)
+      .slice(0, 4);
+  }
+
+  normalizeStoryBody(body = '', sourceRow = {}) {
+      const raw = String(body ?? '').trim();
+      const candidate = this.isWeakStoryBrief(raw) ? this.buildStoryFallbackBody(sourceRow) : this.humanizeStoryBody(raw, sourceRow);
+      const simplified = this.normalizeDisplayBody(candidate, { title: sourceRow?.title ?? '' });
+      const sentences = simplified
+        .split(/(?<=[.!?…])\s+/u)
+        .map((item) => item.trim())
+      .filter(Boolean);
+
+    if (sentences.length >= 2) {
+      return `${sentences[0]} ${sentences[1]}`.trim();
+    }
+    if (sentences.length === 1) {
+      return sentences[0];
+    }
+    return simplified;
+  }
+
+  normalizeStoryManifest(manifest, sourceRow) {
+    const bodyCandidates = [
+      manifest.body,
+      manifest.answer,
+      manifest.support,
+      manifest.supportLine,
+      manifest.subtitle,
+      manifest.description,
+      sourceRow.brief,
+    ];
+    const body = bodyCandidates
+      .map((item) => String(item ?? '').trim())
+      .find(Boolean) ?? '';
+    const normalizedBody = this.normalizeStoryBody(body, sourceRow);
+    const normalizedBullets = this.normalizeStoryBullets(
+      manifest.bullets
+      ?? manifest.points
+      ?? manifest.tips
+      ?? manifest.steps
+      ?? manifest.items
+      ?? [],
+    );
+
+      return {
+        eyebrow: '',
+        title: this.capitalizeOverlayText(String(manifest.title ?? sourceRow.title ?? '').trim()),
+        body: normalizedBody,
+        bullets: normalizedBullets.length > 0 ? normalizedBullets : this.buildStoryFallbackBullets(sourceRow),
+        footer: this.mergeOverlayFooter(
+          String(manifest.footer ?? manifest.closing ?? '').trim(),
+          String(manifest.title ?? sourceRow.title ?? '').trim(),
+          normalizedBody,
+          normalizedBullets.length > 0 ? normalizedBullets : this.buildStoryFallbackBullets(sourceRow),
+      ),
+    };
+  }
+
+  getTopicImageReferenceUrls() {
+    return TOPIC_SALON_REFERENCE_IMAGE_URLS;
+  }
+
+  async extractAlbumConsistencyNotes({ assets, prompts, jobId, revision = null }) {
+    if (!Array.isArray(assets) || assets.length <= 1) {
+      return '';
+    }
+    const imageUrls = assets
+      .map((asset) => {
+        if (!asset?.buffer) {
+          return null;
+        }
+        return toDataUrl(asset.buffer, asset.mimeType ?? 'image/jpeg');
+      })
+      .filter(Boolean)
+      .slice(0, 3);
+    if (imageUrls.length <= 1) {
+      return '';
+    }
+    const consistency = await this.openrouter.generateText({
+      systemPrompt: prompts.work_album_consistency_extraction ?? DEFAULT_PROMPTS.work_album_consistency_extraction,
+      userPrompt: 'Опиши только locked facts, которые должны сохраняться одинаковыми на всех кадрах альбома.',
+      imageUrls,
+      temperature: 0.1,
+      model: this.getWorkTextModelId(),
+      metadata: {
+        source_type: 'work',
+        job_id: jobId,
+        revision,
+        model: this.getWorkTextModelId(),
+        pass: 'consistency',
+        source_asset_count: imageUrls.length,
+      },
+    });
+    return String(consistency?.text ?? '').trim();
+  }
+
+  getWorkTextModelId() {
+    return PINNED_WORK_TEXT_MODEL_ID;
+  }
+
+  getCollectionDeadlineAt(currentTime, { mediaGroupId, assetCount }) {
+    if (mediaGroupId && Number(assetCount) <= 1) {
+      return addSeconds(currentTime, WORK_COLLECTION_INITIAL_ALBUM_GRACE_SECONDS);
+    }
+    return addSeconds(currentTime, WORK_COLLECTION_DEBOUNCE_SECONDS);
+  }
+
+  shouldAwaitInlineFinalize({ mediaGroupId, collectionCount }) {
+    return !mediaGroupId || Number(collectionCount) > 1;
+  }
+
+  async buildFinalWorkPreviewAsset(assets, jobId, prompts = DEFAULT_PROMPTS, consistencyNotes = '') {
+    if (!Array.isArray(assets) || assets.length === 0) {
+      throw new Error('No processed work assets available for preview');
+    }
+    if (assets.length === 1) {
+      return {
+        finalRenderMode: 'single',
+        asset: assets[0],
+      };
+    }
+    const collageImageUrls = this.buildWorkCollageImageUrls(assets);
+    if (collageImageUrls.length !== assets.length) {
+      throw new Error('Missing processed work assets for collage composition');
+    }
+    const collageResult = await this.openrouter.generateImages({
+      prompt: [
+        prompts.work_collage_generation ?? DEFAULT_PROMPTS.work_collage_generation,
+        consistencyNotes ? `Locked album facts:\n${consistencyNotes}` : '',
+      ].filter(Boolean).join('\n'),
+      imageUrls: collageImageUrls,
+      metadata: {
+        source_type: 'work',
+        job_id: jobId,
+        model: this.env.imageModelId,
+        pass: 'compose_collage',
+        source_asset_count: assets.length,
+      },
+    });
+    const generatedSource = collageResult.images[0];
+    if (!generatedSource) {
+      throw new Error('OpenRouter did not return a composed work collage');
+    }
+    const asset = await this.resolveRemoteImage(generatedSource);
+
+    return {
+      finalRenderMode: 'collage',
+      asset,
+    };
+  }
+
+  buildRevisionEntry({
+    revision,
+    captionText,
+    previewTelegramFileIds,
+    finalRenderMode,
+    sourceAssetCount,
+    createdAt = nowIso(),
+  }) {
+    return {
+      revision,
+      captionText,
+      previewTelegramFileIds: [...(previewTelegramFileIds ?? [])],
+      finalRenderMode,
+      sourceAssetCount,
+      createdAt,
+    };
+  }
+
+  getRevisionHistory(payload) {
+    return [...(payload?.revisionHistory ?? [])]
+      .map((entry) => ({
+        ...entry,
+        revision: Number(entry.revision ?? 0),
+        previewTelegramFileIds: [...(entry.previewTelegramFileIds ?? [])],
+        sourceAssetCount: Number(entry.sourceAssetCount ?? 0),
+      }))
+      .sort((left, right) => left.revision - right.revision);
+  }
+
+  getViewedRevision(payload) {
+    const revisions = this.getRevisionHistory(payload);
+    const requested = Number(payload?.viewRevision ?? payload?.revision ?? revisions.at(-1)?.revision ?? 0);
+    return revisions.find((entry) => entry.revision === requested) ?? revisions.at(-1) ?? null;
+  }
+
+  buildPreviewKeyboardForRuntime(tokensByAction, options, jobType) {
+    const keyboard = buildPreviewKeyboard(tokensByAction, options);
+    if (jobType !== 'work' && tokensByAction.publish_confirm) {
+      keyboard.row().text('Подтвердить публикацию', `publish_confirm:${tokensByAction.publish_confirm}`);
+    }
+    return keyboard;
+  }
+
+  buildTopicLikePickerKeyboard({
+    itemButtons = [],
+    prevButton = null,
+    nextButton = null,
+    cancelButton = null,
+  }) {
+    const keyboard = new InlineKeyboard();
+
+    for (const item of itemButtons) {
+      if (!item?.token || !item?.action) {
+        continue;
+      }
+      keyboard.text(item.label, `${item.action}:${item.token}`).row();
+    }
+
+    if (prevButton?.token && prevButton?.action) {
+      keyboard.text('← Назад', `${prevButton.action}:${prevButton.token}`);
+    }
+    if (nextButton?.token && nextButton?.action) {
+      keyboard.text('Дальше →', `${nextButton.action}:${nextButton.token}`);
+    }
+    if (prevButton?.token || nextButton?.token) {
+      keyboard.row();
+    }
+
+    if (cancelButton?.token && cancelButton?.action) {
+      keyboard.text('Отмена', `${cancelButton.action}:${cancelButton.token}`);
+    }
+
+    return keyboard;
+  }
+
+  createCallbackRows({ jobId, revision, chatId, definitions = [] }) {
+    const issuedAt = new Date();
+    const rows = [];
+    const entries = [];
+
+    for (const definition of definitions) {
+      const payload = buildCallbackTokenPayload({
+        jobId,
+        revision,
+        action: definition.action,
+        ttlMinutes: CALLBACK_TTL_MINUTES,
+        now: issuedAt,
+      });
+      rows.push({
+        token: payload.token,
+        token_set_id: payload.tokenSetId,
+        job_id: jobId,
+        revision,
+        action: definition.action,
+        used: 0,
+        superseded: 0,
+        expires_at: payload.expiresAt,
+        issued_at: payload.issuedAt,
+        payload_json: JSON.stringify({
+          chatId,
+          ...(definition.payload ?? {}),
+        }),
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      });
+      entries.push({
+        ...definition,
+        token: payload.token,
+      });
+    }
+
+    return {
+      tokenRows: rows,
+      entries,
+      tokenSetId: rows[0]?.token_set_id ?? '',
+    };
+  }
+
+  async processSingleWorkAsset({
+    fileId,
+    prompts,
+    jobId,
+    index,
+    revision = null,
+    consistencyNotes = '',
+    originalAsset = null,
+  }) {
+    const original = originalAsset ?? await this.downloadTelegramFile(fileId);
+    const imageResult = await this.openrouter.generateImages({
+      prompt: [
+        prompts.work_image_enhancement_master,
+        prompts.work_image_enhancement_short,
+        consistencyNotes ? `Locked album facts:\n${consistencyNotes}` : '',
+        `Negative prompt: ${prompts.work_image_enhancement_negative}`,
+      ].filter(Boolean).join('\n'),
+      imageUrls: [toDataUrl(original.buffer, original.mimeType)],
+      metadata: {
+        source_type: 'work',
+        job_id: jobId,
+        asset_index: index,
+        revision,
+        model: this.env.imageModelId,
+        pass: 'enhance',
+      },
+    });
+    const generatedSource = imageResult.images[0];
+    if (!generatedSource) {
+      throw new Error('OpenRouter did not return an enhanced work image');
+    }
+    const firstPassAsset = await this.resolveRemoteImage(generatedSource);
+    const reframeResult = await this.openrouter.generateImages({
+      prompt: [
+        prompts.work_image_reframe_master,
+        consistencyNotes ? `Locked album facts:\n${consistencyNotes}` : '',
+        `Negative prompt: ${prompts.work_image_enhancement_negative}`,
+      ].filter(Boolean).join('\n'),
+      imageUrls: [toDataUrl(firstPassAsset.buffer, firstPassAsset.mimeType)],
+      metadata: {
+        source_type: 'work',
+        job_id: jobId,
+        asset_index: index,
+        revision,
+        model: this.env.imageModelId,
+        pass: 'reframe',
+      },
+    });
+
+    return {
+      originalTelegramFileId: fileId,
+      asset: reframeResult.images[0]
+        ? await this.resolveRemoteImage(reframeResult.images[0])
+        : firstPassAsset,
+    };
+  }
+
+  async sendProgress(chatId, text) {
+    return this.sendMessage(chatId, text);
+  }
+
+  async logEvent(entry) {
+    return this.botLogger.log(entry);
+  }
+
+  async logEventBestEffort(entry) {
+    this.logEvent(entry).catch(() => {});
+  }
+
+  getWorkModeStatusText(renderMode) {
+    return USER_MESSAGES.generationQueued[renderMode] ?? USER_MESSAGES.workProcessingStarted;
+  }
+
+  async updateRuntimeStatusMessage(runtime, text) {
+    if (!runtime?.text_message_id) {
+      const message = await this.sendMessage(runtime.chat_id, text);
+      return message.message_id;
+    }
+
+    const emptyKeyboard = { inline_keyboard: [] };
+    const isMediaMessage = runtime.collage_message_id
+      && String(runtime.collage_message_id) === String(runtime.text_message_id);
+    if (isMediaMessage) {
+      const edited = await this.callTelegram('editMessageCaption', runtime.chat_id, runtime.text_message_id, {
+        caption: text,
+        reply_markup: emptyKeyboard,
+      });
+      return edited?.message_id ?? runtime.text_message_id;
+    }
+
+    const edited = await this.callTelegram('editMessageText', runtime.chat_id, runtime.text_message_id, text, {
+      reply_markup: emptyKeyboard,
+    });
+    return edited?.message_id ?? runtime.text_message_id;
+  }
+
+  async queueRuntimeGeneration(runtime, { action, renderMode = '' }) {
+    const previousPayload = runtime.draft_payload ?? runtime.preview_payload ?? {};
+    const nextPayload = {
+      ...previousPayload,
+      renderMode: renderMode || previousPayload.renderMode || previousPayload.finalRenderMode || 'collage',
+      viewRevision: Number(previousPayload.viewRevision ?? previousPayload.revision ?? runtime.active_revision ?? 0),
+    };
+    const controlMessageId = await this.updateRuntimeStatusMessage(
+      runtime,
+      action === 'generate_initial'
+        ? this.getWorkModeStatusText(nextPayload.renderMode)
+        : USER_MESSAGES.actionMessages[action] || USER_MESSAGES.workProcessingStarted,
+    );
+
+    if (runtime.active_callback_set_id) {
+      await this.repos.supersedeTokenSet(runtime.active_callback_set_id, nowIso());
+    }
+
+    await this.repos.upsertRuntime({
+      job_id: runtime.job_id,
+      job_type: runtime.job_type,
+      chat_id: runtime.chat_id,
+      user_id: runtime.user_id,
+      topic_id: runtime.topic_id ?? '',
+      collection_id: runtime.collection_id ?? '',
+      active_revision: runtime.active_revision,
+      runtime_status: 'queued_for_generation',
+      collage_message_id: toStoredText(runtime.collage_message_id),
+      assets_message_ids_json: JSON.stringify(runtime.assets_message_ids ?? []),
+      text_message_id: toStoredText(controlMessageId),
+      active_callback_set_id: '',
+      schedule_input_pending: 0,
+      lock_flags_json: JSON.stringify({
+        ...(runtime.lock_flags ?? {}),
+        queued_action: action,
+      }),
+      preview_payload_json: JSON.stringify(nextPayload),
+      draft_payload_json: JSON.stringify(nextPayload),
+      updated_at: nowIso(),
+    });
+
+    await this.logEvent({
+      event: 'generation_queued',
+      stage: 'processing',
+      chatId: runtime.chat_id,
+      userId: runtime.user_id,
+      jobId: runtime.job_id,
+      queueId: nextPayload.queueId ?? '',
+      collectionId: runtime.collection_id ?? '',
+      sourceType: runtime.job_type,
+      status: action,
+      message: nextPayload.renderMode || action,
+      payload: {
+        action,
+        renderMode: nextPayload.renderMode || '',
+        sourceAssetCount: nextPayload.sourceAssetCount ?? 0,
+      },
+    });
+
+    const result = await this.runQueuedGenerationJob(runtime.job_id, action);
+    return {
+      ok: true,
+      queued: false,
+      inline: true,
+      result,
+    };
+  }
+
+  async handleTelegramUpdate(update) {
+    const normalized = normalizeTelegramUpdate(update);
+    const incomingIdem = computeIdempotencyKey('telegram_update', { updateId: normalized.updateId });
+    if (await this.repos.hasIdempotency(incomingIdem)) {
+      return { ok: true, duplicate: true };
+    }
+    await this.repos.recordIdempotency(
+      'telegram_update',
+      { updateId: normalized.updateId },
+      nowIso(),
+      addMinutes(new Date(), 1_440),
+    );
+
+    await this.logEvent({
+      event: 'incoming_update',
+      stage: normalized.kind === 'callback'
+        ? 'callback'
+        : normalized.kind === 'text'
+          ? 'message'
+          : normalized.kind === 'photo'
+            ? 'collection'
+            : 'command',
+      chatId: normalized.chatId,
+      userId: normalized.userId,
+      status: normalized.kind,
+      message: normalized.command ?? normalized.text ?? normalized.callbackData ?? '',
+      payload: { updateId: normalized.updateId },
+    });
+
+    try {
+      if (normalized.kind === 'command') {
+        return await this.handleCommand(normalized);
+      }
+      if (normalized.kind === 'photo') {
+        return await this.handlePhoto(normalized);
+      }
+      if (normalized.kind === 'callback') {
+        return await this.handleCallback(normalized);
+      }
+      if (normalized.kind === 'text') {
+        return await this.handleText(normalized);
+      }
+      return { ok: true, ignored: true };
+    } catch (error) {
+      await this.logEvent({
+        level: 'ERROR',
+        event: 'update_failed',
+        stage: 'error',
+        chatId: normalized.chatId,
+        userId: normalized.userId,
+        status: 'failed',
+        collectionId: error.collectionId ?? null,
+        jobId: error.jobId ?? null,
+        queueId: error.queueId ?? null,
+        node: error.step ?? null,
+        message: error.message,
+      });
+      if (normalized.chatId) {
+        await this.sendMessage(normalized.chatId, this.buildUserErrorMessage(error));
+      }
+      return { ok: false, error: error.message };
+    }
+  }
+
+  async handleCommand(normalized) {
+    switch (normalized.command) {
+      case '/help':
+        return this.handleHelp(normalized);
+      case '/work':
+        return this.handleWorkCommand(normalized);
+      case '/topic':
+        return this.openTopicLikePicker(normalized, 'topic');
+      case '/stories':
+        return this.openTopicLikePicker(normalized, 'stories');
+      case '/creative':
+        return this.openTopicLikePicker(normalized, 'creative');
+      case '/slider':
+        return this.openTopicLikePicker(normalized, 'slider');
+      default:
+        await this.sendMessage(normalized.chatId, USER_MESSAGES.unknownCommand);
+        return { ok: true, command: normalized.command };
+    }
+  }
+
+  async handleHelp(normalized) {
+    const helpMessage = buildHelpMessage(await this.promptConfig.get('help_message', DEFAULT_PROMPTS.help_message));
+    await this.sendMessage(normalized.chatId, helpMessage);
+    return { ok: true, command: '/help' };
+  }
+
+  async reclaimExpiredSourceRows(sheetName) {
+    const rows = typeof this.store.getRowsByQuery === 'function'
+      ? await this.store.getRowsByQuery(sheetName, {
+        eq: { status: 'reserved' },
+      })
+      : await this.store.getRows(sheetName);
+    for (const row of rows) {
+      const reclaimed = reclaimExpiredTopic({
+        ...row,
+        reserved_until: row.reservation_expires_at,
+        reserved_by_job_id: row.reserved_by,
+      });
+      if (reclaimed.status !== row.status) {
+        await this.store.updateRowByNumber(
+          sheetName,
+          row.__rowNumber,
+          {
+            ...row,
+            status: 'ready',
+            reserved_by: '',
+            reserved_at: '',
+            reservation_expires_at: '',
+          },
+          SHEET_HEADERS[sheetName],
+        );
+      }
+    }
+  }
+
+  async listReadySourceRows(sheetName) {
+    await this.reclaimExpiredSourceRows(sheetName);
+    const rows = typeof this.store.getRowsByQuery === 'function'
+      ? await this.store.getRowsByQuery(sheetName, {
+        eq: { status: 'ready' },
+        columns: ['id', 'topic_id', 'title', 'priority', 'status'],
+        orderBy: [
+          { column: 'priority', ascending: true },
+          { column: 'title', ascending: true },
+        ],
+      })
+      : await this.store.getRows(sheetName);
+    return rows
+      .filter((row) => String(row.status).toLowerCase() === 'ready')
+      .sort((left, right) => {
+        const leftPriority = Number(left.priority ?? 9999);
+        const rightPriority = Number(right.priority ?? 9999);
+        if (leftPriority !== rightPriority) {
+          return leftPriority - rightPriority;
+        }
+        return String(left.title ?? '').localeCompare(String(right.title ?? ''), 'ru');
+      });
+  }
+
+  async reserveSourceRow(sheetName, topicId, reservedBy) {
+    await this.reclaimExpiredSourceRows(sheetName);
+    const rows = await this.store.getRows(sheetName);
+    const sourceRow = rows.find((row) => row.topic_id === topicId);
+    if (!sourceRow || String(sourceRow.status).toLowerCase() !== 'ready') {
+      return null;
+    }
+    const reservedAt = nowIso();
+    const nextRow = {
+      ...sourceRow,
+      status: 'reserved',
+      reserved_by: reservedBy,
+      reserved_at: reservedAt,
+      reservation_expires_at: addMinutes(reservedAt, TOPIC_RESERVATION_MINUTES),
+    };
+    await this.store.updateRowByNumber(
+      sheetName,
+      sourceRow.__rowNumber,
+      nextRow,
+      SHEET_HEADERS[sheetName],
+    );
+    return nextRow;
+  }
+
+  async releaseSourceRow(sheetName, topicId) {
+    const rows = await this.store.getRows(sheetName);
+    const row = rows.find((item) => item.topic_id === topicId);
+    if (!row) {
+      return;
+    }
+    await this.store.updateRowByNumber(
+      sheetName,
+      row.__rowNumber,
+      {
+        ...row,
+        status: 'ready',
+        reserved_by: '',
+        reserved_at: '',
+        reservation_expires_at: '',
+      },
+      SHEET_HEADERS[sheetName],
+    );
+  }
+
+  async markSourceRowPublished(sheetName, topicId, jobId) {
+    const rows = await this.store.getRows(sheetName);
+    const row = rows.find((item) => item.topic_id === topicId);
+    if (!row) {
+      return;
+    }
+    await this.store.updateRowByNumber(
+      sheetName,
+      row.__rowNumber,
+      {
+        ...row,
+        status: 'published',
+        reserved_by: '',
+        reserved_at: '',
+        reservation_expires_at: '',
+        last_job_id: jobId,
+        last_published_at: nowIso(),
+      },
+      SHEET_HEADERS[sheetName],
+    );
+  }
+
+  async openTopicLikePicker(normalized, jobType) {
+    const config = this.getTopicLikeModeConfig(jobType);
+    if (!config) {
+      return { ok: false, unknownMode: true };
+    }
+
+    const readyRows = await this.listReadySourceRows(config.sourceSheetName);
+    if (readyRows.length === 0) {
+      await this.sendMessage(normalized.chatId, config.emptyMessage);
+      return { ok: true, command: config.command, empty: true };
+    }
+
+    const pickerMessage = await this.presentTopicLikePicker({
+      chatId: normalized.chatId,
+      userId: normalized.userId,
+      jobType,
+      page: 0,
+      existingMessageId: null,
+      readyRows,
+    });
+
+    await this.repos.upsertSession({
+      session_id: this.getPickerSessionId(normalized.chatId, jobType),
+      chat_id: normalized.chatId,
+      user_id: normalized.userId,
+      mode: `${jobType}_picker`,
+      state: 'choosing_source',
+      active_job_id: pickerMessage.jobId,
+      pending_payload_json: JSON.stringify({
+        page: 0,
+        tokenSetId: pickerMessage.tokenSetId,
+        messageId: pickerMessage.messageId,
+        jobType,
+        readyRows: this.toPickerSnapshotRows(readyRows),
+      }),
+      expires_at: addMinutes(new Date(), TOPIC_LIKE_PICKER_TTL_MINUTES),
+      updated_at: nowIso(),
+    });
+
+    return { ok: true, command: config.command, picker: true };
+  }
+
+  async presentTopicLikePicker({
+    chatId,
+    userId,
+    jobType,
+    page = 0,
+    existingMessageId = null,
+    readyRows = null,
+  }) {
+    const config = this.getTopicLikeModeConfig(jobType);
+    const rows = Array.isArray(readyRows) ? readyRows : await this.listReadySourceRows(config.sourceSheetName);
+    if (rows.length === 0) {
+      return {
+        messageId: existingMessageId,
+        tokenSetId: '',
+        page: 0,
+        jobId: `PICK:${jobType}:${chatId}`,
+        userId,
+        empty: true,
+      };
+    }
+    const totalPages = Math.max(1, Math.ceil(rows.length / TOPIC_LIKE_PAGE_SIZE));
+    const safePage = Math.max(0, Math.min(totalPages - 1, page));
+    const pageRows = rows.slice(
+      safePage * TOPIC_LIKE_PAGE_SIZE,
+      (safePage + 1) * TOPIC_LIKE_PAGE_SIZE,
+    );
+    const pickerJobId = `PICK:${jobType}:${chatId}`;
+    const definitions = [];
+
+    for (const [index, row] of pageRows.entries()) {
+      definitions.push({
+        action: `pick_source_${safePage}_${index}`,
+        kind: 'item',
+        payload: {
+          pickerJobType: jobType,
+          sourceSheetName: config.sourceSheetName,
+          topicId: row.topic_id,
+          page: safePage,
+        },
+      });
+    }
+
+    if (safePage > 0) {
+      definitions.push({
+        action: `picker_prev_${safePage}`,
+        kind: 'prev',
+        payload: { pickerJobType: jobType, page: safePage - 1 },
+      });
+    }
+    if (safePage < totalPages - 1) {
+      definitions.push({
+        action: `picker_next_${safePage}`,
+        kind: 'next',
+        payload: { pickerJobType: jobType, page: safePage + 1 },
+      });
+    }
+    definitions.push({
+      action: `picker_cancel_${safePage}`,
+      kind: 'cancel',
+      payload: { pickerJobType: jobType, page: safePage },
+    });
+
+    const { tokenRows, entries, tokenSetId } = this.createCallbackRows({
+      jobId: pickerJobId,
+      revision: 0,
+      chatId,
+      definitions,
+    });
+    await this.repos.createCallbackTokens(tokenRows);
+
+    const itemButtons = pageRows.map((row, index) => {
+      const entry = entries.find((item) => item.kind === 'item' && item.payload?.topicId === row.topic_id && item.action === `pick_source_${safePage}_${index}`);
+      return {
+        label: this.truncatePickerLabel(row.title),
+        action: entry.action,
+        token: entry.token,
+      };
+    });
+    const prevButton = entries.find((entry) => entry.kind === 'prev') ?? null;
+    const nextButton = entries.find((entry) => entry.kind === 'next') ?? null;
+    const cancelButton = entries.find((entry) => entry.kind === 'cancel') ?? null;
+
+    const text = [
+      config.pickerTitle,
+      '',
+      `Страница ${safePage + 1}/${totalPages}`,
+      `Доступно тем: ${rows.length}`,
+      '',
+      'Нажми на нужную тему ниже.',
+    ].join('\n');
+
+    const keyboard = this.buildTopicLikePickerKeyboard({
+      itemButtons,
+      prevButton,
+      nextButton,
+      cancelButton,
+    });
+
+    let messageId = existingMessageId;
+    if (existingMessageId) {
+      const edited = await this.callTelegram('editMessageText', chatId, existingMessageId, text, {
+        reply_markup: keyboard,
+      });
+      messageId = edited.message_id ?? existingMessageId;
+    } else {
+      const message = await this.sendMessage(chatId, text, {
+        reply_markup: keyboard,
+      });
+      messageId = message.message_id;
+    }
+
+    return {
+      messageId,
+      tokenSetId,
+      page: safePage,
+      jobId: pickerJobId,
+      userId,
+    };
+  }
+
+  async handleWorkCommand(normalized) {
+    const sessionId = `work:${normalized.chatId}`;
+    await this.repos.upsertSession({
+      session_id: sessionId,
+      chat_id: normalized.chatId,
+      user_id: normalized.userId,
+      mode: 'work',
+      state: 'awaiting_assets',
+      active_job_id: '',
+      pending_payload_json: '',
+      expires_at: addMinutes(new Date(), WORK_SESSION_TTL_MINUTES),
+      updated_at: nowIso(),
+    });
+    await this.sendMessage(normalized.chatId, USER_MESSAGES.workStarted);
+    this.logEventBestEffort({
+      event: 'work_command_started',
+      stage: 'command',
+      chatId: normalized.chatId,
+      userId: normalized.userId,
+      sourceType: 'work',
+      status: 'awaiting_assets',
+      message: USER_MESSAGES.workWindowOpened,
+    });
+    return { ok: true, command: '/work' };
+  }
+
+  async handleTopicCommand(normalized) {
+    return this.openTopicLikePicker(normalized, 'topic');
+  }
+
+  parseJsonModelOutput(text, fallback = {}) {
+    const raw = String(text ?? '').trim();
+    if (!raw) {
+      return fallback;
+    }
+    const fenced = raw.match(/```(?:json)?\s*([\s\S]+?)```/u)?.[1];
+    const candidate = fenced ?? raw.slice(raw.indexOf('{') >= 0 ? raw.indexOf('{') : 0, raw.lastIndexOf('}') + 1);
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      return fallback;
+    }
+  }
+
+  buildSliderContentSlides(sourceRow, candidateSlides = []) {
+    const normalized = Array.isArray(candidateSlides)
+      ? candidateSlides
+        .filter((slide) => slide && (slide.title || slide.body || (Array.isArray(slide.bullets) && slide.bullets.length > 0)))
+        .map((slide, index) => this.normalizeSliderSlide(slide, sourceRow, index))
+        .filter((slide) => slide.title || slide.body || slide.bullets.length > 0)
+      : [];
+
+    const fallbackQueue = this.buildSliderFallbackSlides(sourceRow);
+
+    const slides = normalized.map((slide, index) => {
+        const fallback = fallbackQueue[index] ?? {};
+        const useFallbackTitle = this.isWeakSliderSlideTitle(slide.title);
+        const useFallbackBody = this.isWeakSliderSlideBody(slide.body);
+        const useFallbackBullets = !Array.isArray(slide.bullets) || slide.bullets.length < 2;
+        const title = useFallbackTitle ? (fallback.title ?? slide.title) : slide.title;
+        const body = useFallbackBody ? fallback.body ?? slide.body : slide.body;
+        const bullets = useFallbackBullets ? (fallback.bullets ?? slide.bullets ?? []) : slide.bullets;
+        return {
+          ...slide,
+          title,
+          body,
+          bullets,
+          footer: this.mergeOverlayFooter(slide.footer ?? fallback.footer ?? '', title, body, bullets),
+        };
+      });
+
+      for (const candidate of fallbackQueue) {
+        if (slides.length >= 5) {
+          break;
+        }
+        const duplicate = slides.some((slide) => slide.title === candidate.title && slide.body === candidate.body);
+        if (!duplicate) {
+          slides.push(candidate);
+        }
+      }
+
+      return slides
+        .slice(0, 5)
+        .map((slide, index) => ({
+            ...slide,
+            eyebrow: slide.eyebrow || `Шаг ${index + 1}`,
+          }))
+          .slice(0, Math.max(2, Math.min(5, slides.length)));
+    }
+
+  normalizeTopicLikeManifest(jobType, manifest, sourceRow) {
+    if (jobType === 'stories') {
+      return this.normalizeStoryManifest(manifest, sourceRow);
+    }
+
+    if (jobType === 'creative') {
+      return this.normalizeCreativeManifest(manifest, sourceRow);
+    }
+
+      if (jobType === 'slider') {
+        const coverSubtitleRaw = String(manifest.coverSubtitle ?? manifest.subtitle ?? manifest.description ?? sourceRow.brief ?? '').trim();
+        const coverBullets = this.normalizeCreativeBullets(manifest.coverBullets ?? manifest.points ?? []);
+        const slides = this.buildSliderContentSlides(sourceRow, manifest.slides);
+        const fallbackCoverBullets = this.buildSliderCoverBullets(sourceRow, slides);
+        const finalCoverBullets = fallbackCoverBullets.slice(0, 4);
+        const rawCoverTitle = manifest.coverTitle ?? manifest.title ?? sourceRow.title;
+        const coverTitle = this.alignSliderCoverCount(rawCoverTitle, slides.length);
+        const coverSubtitle = this.isWeakSliderCopy(coverSubtitleRaw) ? this.buildSliderCoverSubtitle(sourceRow) : this.normalizeSliderText(coverSubtitleRaw);
+          return {
+            eyebrow: '',
+            coverTitle,
+            coverSubtitle,
+            coverBullets: finalCoverBullets,
+            slides,
+            footer: this.mergeOverlayFooter(manifest.footer ?? '', coverTitle, coverSubtitle, finalCoverBullets),
+          };
+        }
+
+    return manifest;
+  }
+
+  async generateTopicLikeVisualAssets({ jobType, prompts, manifest, sourceRow, revision, jobId }) {
+    const config = this.getTopicLikeModeConfig(jobType);
+
+    if (jobType === 'topic') {
+      const imageResult = await this.openrouter.generateImages({
+        prompt: this.buildTopicImagePrompt(sourceRow, prompts),
+        imageUrls: this.getTopicImageReferenceUrls(),
+        metadata: { source_type: 'topic', topic_id: sourceRow.topic_id, job_id: jobId, revision },
+      });
+      const previewAssets = await Promise.all(imageResult.images.slice(0, 1).map((source) => this.resolveRemoteImage(source)));
+      return {
+        assets: previewAssets,
+        finalRenderMode: 'single',
+        captionText: manifest.captionText,
+      };
+    }
+
+    const visualPrompt = [
+      prompts[config.promptKeys.visual],
+      `Title: ${sourceRow.title ?? ''}`,
+      `Brief: ${sourceRow.brief ?? ''}`,
+      `Tags: ${Array.isArray(sourceRow.tags) ? sourceRow.tags.join(', ') : sourceRow.tags ?? ''}`,
+      `Manifest summary: ${JSON.stringify(manifest)}`,
+    ].join('\n');
+
+    const imageResult = await this.openrouter.generateImages({
+      prompt: visualPrompt,
+      imageConfig: { aspect_ratio: '9:16' },
+      metadata: {
+        source_type: jobType,
+        topic_id: sourceRow.topic_id,
+        job_id: jobId,
+        revision,
+        model: this.env.imageModelId,
+      },
+    });
+      const backgroundSource = imageResult.images[0];
+      const backgroundAsset = backgroundSource ? await this.resolveRemoteImage(backgroundSource) : null;
+      const backgroundStyle = this.pickStoryBackgroundStyle(`${jobType}|${sourceRow.title}|${revision}`);
+
+      if (jobType === 'stories') {
+        const slide = await composeStorySlide({ backgroundAsset, manifest, backgroundStyle });
+        return {
+          assets: [slide],
+          finalRenderMode: 'single',
+          captionText: [manifest.title ?? sourceRow.title, manifest.body ?? sourceRow.brief].filter(Boolean).join('\n\n'),
+        };
+      }
+
+      if (jobType === 'creative') {
+        const slide = await composeCreativeSlide({ backgroundAsset, manifest, backgroundStyle });
+        return {
+          assets: [slide],
+          finalRenderMode: 'single',
+          captionText: [manifest.headline ?? sourceRow.title, manifest.subhead ?? sourceRow.brief].filter(Boolean).join('\n\n'),
+        };
+      }
+
+      const slides = await composeSliderSlides({ backgroundAsset, manifest, backgroundStyle });
+    return {
+      assets: slides,
+      finalRenderMode: slides.length > 1 ? 'separate' : 'single',
+      captionText: [manifest.coverTitle ?? sourceRow.title, manifest.coverSubtitle ?? sourceRow.brief].filter(Boolean).join('\n\n'),
+    };
+  }
+
+  async generateTopicLikeManifest({ jobType, prompts, sourceRow, jobId, revision }) {
+    if (jobType === 'topic') {
+      const { result, durationMs } = await measureDuration(() => this.openrouter.generateText({
+        systemPrompt: prompts.topic_post_generation,
+        userPrompt: this.buildTopicUserPrompt(sourceRow),
+        metadata: { source_type: 'topic', topic_id: sourceRow.topic_id, job_id: jobId, revision },
+      }));
+      return {
+        manifest: {
+          captionText: this.formatTopicCaption(result.text, prompts.contact_block),
+        },
+        durationMs,
+      };
+    }
+
+    const config = this.getTopicLikeModeConfig(jobType);
+    const { result, durationMs } = await measureDuration(() => this.openrouter.generateText({
+      systemPrompt: prompts[config.promptKeys.manifest],
+      userPrompt: this.buildTopicUserPrompt(sourceRow),
+      temperature: 0.7,
+      metadata: { source_type: jobType, topic_id: sourceRow.topic_id, job_id: jobId, revision },
+    }));
+
+    const parsed = this.parseJsonModelOutput(result.text, {});
+    const fallbackManifest = {
+      stories: {
+        eyebrow: 'Stories',
+        title: sourceRow.title,
+        body: sourceRow.brief,
+        bullets: parseTags(sourceRow.tags).slice(0, 4),
+        footer: '',
+      },
+      creative: {
+        eyebrow: '',
+        headline: sourceRow.title,
+        subhead: this.buildCreativeFallbackSubhead(sourceRow),
+        bullets: [],
+        footer: '',
+      },
+      slider: {
+        eyebrow: '',
+        coverTitle: sourceRow.title,
+        coverSubtitle: this.buildSliderCoverSubtitle(sourceRow),
+        slides: this.buildSliderFallbackSlides(sourceRow),
+        footer: '',
+      },
+    };
+
+    return {
+      manifest: this.normalizeTopicLikeManifest(jobType, { ...fallbackManifest[jobType], ...parsed }, sourceRow),
+      durationMs,
+    };
+  }
+
+  async startTopicLikeJob(normalized, sourceRow, jobType) {
+    const config = this.getTopicLikeModeConfig(jobType);
+    const jobId = stableId('JOB', `${jobType}:${sourceRow.topic_id}:${Date.now()}`);
+    const queueId = stableId('QUE', jobId);
+    const prompts = await this.promptConfig.refresh();
+    const tags = parseTags(sourceRow.tags);
+
+    await this.logEvent({
+      event: 'topic_like_reserved',
+      stage: 'command',
+      chatId: normalized.chatId,
+      userId: normalized.userId,
+      jobId,
+      queueId,
+      sourceType: jobType,
+      status: 'reserved',
+      message: sourceRow.title,
+    });
+
+    await this.sendProgress(normalized.chatId, USER_MESSAGES.topicTaken);
+    await this.sendProgress(normalized.chatId, USER_MESSAGES.topicGeneratingText);
+    const { manifest, durationMs: manifestDurationMs } = await this.generateTopicLikeManifest({
+      jobType,
+      prompts,
+      sourceRow: { ...sourceRow, tags },
+      jobId,
+      revision: 1,
+    });
+    await this.logEvent({
+      event: 'topic_like_manifest_ready',
+      stage: 'processing',
+      chatId: normalized.chatId,
+      userId: normalized.userId,
+      jobId,
+      queueId,
+      sourceType: jobType,
+      status: 'ok',
+      durationMs: manifestDurationMs,
+      message: sourceRow.title,
+    });
+
+    await this.sendProgress(normalized.chatId, USER_MESSAGES.topicGeneratingImages);
+    const { assets: previewAssets, finalRenderMode, captionText } = await this.generateTopicLikeVisualAssets({
+      jobType,
+      prompts,
+      manifest,
+      sourceRow: { ...sourceRow, tags },
+      revision: 1,
+      jobId,
+    });
+
+    const revision = 1;
+    const basePayload = {
+      jobId,
+      queueId,
+      jobType,
+      revision,
+      viewRevision: revision,
+      chatId: normalized.chatId,
+      userId: normalized.userId,
+      topicId: sourceRow.topic_id,
+      title: sourceRow.title,
+      brief: sourceRow.brief,
+      tags,
+      captionText,
+      manifest,
+      originalTelegramFileIds: [],
+      previewTelegramFileIds: [],
+      renderMode: finalRenderMode,
+      finalRenderMode,
+      sourceAssetCount: previewAssets.length,
+      createdAt: nowIso(),
+    };
+    const revisionEntry = this.buildRevisionEntry({
+      revision,
+      captionText,
+      previewTelegramFileIds: [],
+      finalRenderMode,
+      sourceAssetCount: previewAssets.length,
+    });
+    const draftPayload = {
+      ...basePayload,
+      revisionHistory: [revisionEntry],
+    };
+
+    const { tokenRows, tokensByAction, tokenSetId } = this.createCallbackSet({
+      jobId,
+      revision,
+      chatId: normalized.chatId,
+      actions: ['version_prev', 'version_next', 'regenerate_images', 'regenerate_text', 'regenerate_all', 'publish_confirm', 'cancel'],
+    });
+    await this.repos.createCallbackTokens(tokenRows);
+
+    await this.sendProgress(normalized.chatId, USER_MESSAGES.assemblingPreview);
+    const previewMessages = await this.presentPreviewRevision({
+      chatId: normalized.chatId,
+      payload: draftPayload,
+      revisionEntry,
+      tokensByAction,
+      runtime: null,
+      assets: previewAssets,
+    });
+    revisionEntry.previewTelegramFileIds = previewMessages.previewTelegramFileIds;
+
+    const previewPayload = {
+      ...draftPayload,
+      previewTelegramFileIds: previewMessages.previewTelegramFileIds,
+      revisionHistory: [{ ...revisionEntry }],
+    };
+
+    await this.store.upsertRowByColumn(
+      SHEET_NAMES.contentQueue,
+      'queue_id',
+      queueId,
+      buildQueueRow({
+        queueId,
+        jobId,
+        jobType,
+        revision,
+        status: 'preview_ready',
+        captionText,
+        assetDriveFileIds: previewMessages.previewTelegramFileIds,
+        manifestDriveFileId: '',
+        topicId: sourceRow.topic_id,
+      }),
+      SHEET_HEADERS[SHEET_NAMES.contentQueue],
+    );
+
+    await this.repos.upsertRuntime({
+      job_id: jobId,
+      job_type: jobType,
+      chat_id: normalized.chatId,
+      user_id: normalized.userId,
+      topic_id: sourceRow.topic_id,
+      collection_id: '',
+      active_revision: revision,
+      runtime_status: 'preview_ready',
+      collage_message_id: toStoredText(previewMessages.collageMessageId),
+      assets_message_ids_json: JSON.stringify(previewMessages.assetsMessageIds),
+      text_message_id: toStoredText(previewMessages.textMessageId),
+      active_callback_set_id: toStoredText(tokenSetId),
+      schedule_input_pending: 0,
+      lock_flags_json: JSON.stringify({ source_type: jobType, source_sheet: config.sourceSheetName }),
+      preview_payload_json: JSON.stringify(previewPayload),
+      draft_payload_json: JSON.stringify(previewPayload),
+      updated_at: nowIso(),
+    });
+
+    await this.store.upsertRowByColumn(
+      config.sourceSheetName,
+      'topic_id',
+      sourceRow.topic_id,
+      {
+        ...sourceRow,
+        status: 'reserved',
+        reserved_by: jobId,
+        reserved_at: sourceRow.reserved_at ?? nowIso(),
+        reservation_expires_at: sourceRow.reservation_expires_at ?? addMinutes(new Date(), TOPIC_RESERVATION_MINUTES),
+        last_job_id: jobId,
+      },
+      SHEET_HEADERS[config.sourceSheetName],
+    );
+    await this.ensureSourceRowReserved(config.sourceSheetName, sourceRow.topic_id, jobId);
+
+    return { ok: true, command: config.command, jobId, queueId };
+  }
+  async handlePhoto(normalized) {
+    const workSession = await this.repos.getSessionByChatAndMode(normalized.chatId, 'work');
+    if (!workSession || workSession.state !== 'awaiting_assets') {
+      await this.sendMessage(normalized.chatId, USER_MESSAGES.workBeforePhoto);
+      return { ok: true, ignored: true };
+    }
+
+    const asset = {
+      ...normalized.photos[0],
+      messageId: normalized.messageId,
+      mediaGroupId: normalized.mediaGroupId,
+      receivedAt: nowIso(),
+    };
+
+    const collectionLockKey = normalized.mediaGroupId
+      ? `collection:${normalized.chatId}:${normalized.mediaGroupId}`
+      : `collection:${normalized.chatId}:single`;
+    const { collection, created } = await this.withLocalLock(
+      collectionLockKey,
+      () => this.getOrCreateWorkCollection(normalized, asset),
+    );
+    await this.logEvent({
+      event: created ? 'work_album_started' : 'collection_debounce_extended',
+      stage: 'collection',
+      chatId: normalized.chatId,
+      userId: normalized.userId,
+      collectionId: collection.collection_id,
+      sourceType: 'work',
+      status: 'collecting',
+      message: `count=${collection.count}`,
+      payload: {
+        mediaGroupId: normalized.mediaGroupId ?? '',
+        count: collection.count,
+      },
+    });
+    await this.logEvent({
+      event: 'photo_accepted',
+      stage: 'collection',
+      chatId: normalized.chatId,
+      userId: normalized.userId,
+      collectionId: collection.collection_id,
+      sourceType: 'work',
+      status: 'collecting',
+      message: USER_MESSAGES.progressPhotoAccepted(collection.count),
+      payload: {
+        mediaGroupId: normalized.mediaGroupId ?? '',
+        count: collection.count,
+        messageId: normalized.messageId,
+      },
+    });
+    try {
+      // Vercel can freeze the invocation immediately after the webhook response,
+      // so finalization must complete inside a live request instead of a detached timer.
+      await this.scheduleCollectionFinalize(collection.collection_id);
+    } catch (error) {
+      this.logEventBestEffort({
+        level: 'ERROR',
+        event: 'collection_finalize_schedule_failed',
+        stage: 'error',
+        chatId: normalized.chatId,
+        userId: normalized.userId,
+        collectionId: collection.collection_id,
+        sourceType: 'work',
+        status: 'failed',
+        message: error.message,
+        node: error.step ?? 'schedule_collection_finalize',
+      });
+    }
+    return { ok: true, collectionId: collection.collection_id };
+  }
+
+  async handleText(normalized) {
+    return { ok: true, ignored: true };
+  }
+
+  async handleCallback(normalized) {
+    const [action, token] = String(normalized.callbackData ?? '').split(':');
+    if (!action || !token) {
+      return { ok: false, error: 'invalid_callback' };
+    }
+    await this.logEvent({
+      event: 'callback_received',
+      stage: 'callback',
+      chatId: normalized.chatId,
+      userId: normalized.userId,
+      status: action,
+      message: normalized.callbackData,
+    });
+    const tokenRow = await this.repos.getCallbackToken(token);
+    if (!tokenRow) {
+      await this.answerCallback(normalized.callbackQueryId, USER_MESSAGES.callbackStale);
+      await this.logEvent({
+        event: 'callback_rejected',
+        stage: 'callback',
+        chatId: normalized.chatId,
+        userId: normalized.userId,
+        status: 'missing_token',
+        message: action,
+      });
+      return { ok: false, missing: true };
+    }
+
+    const normalizedAction = action.startsWith('pick_source_')
+      ? 'pick_source'
+      : action.startsWith('picker_prev_')
+        ? 'picker_prev'
+        : action.startsWith('picker_next_')
+          ? 'picker_next'
+          : action.startsWith('picker_cancel_')
+            ? 'picker_cancel'
+            : action;
+
+    if (['pick_source', 'picker_prev', 'picker_next', 'picker_cancel'].includes(normalizedAction)) {
+      await this.repos.markCallbackUsed(token, nowIso());
+      return this.handleTopicPickerCallback({
+        normalized,
+        action: normalizedAction,
+        tokenRow,
+      });
+    }
+
+    const runtime = await this.repos.getRuntime(tokenRow.job_id);
+    const validation = validateCallbackToken({
+      tokenRow: {
+        ...tokenRow,
+        jobId: tokenRow.job_id,
+        expiresAt: tokenRow.expires_at,
+      },
+      expectedJobId: tokenRow.job_id,
+      expectedRevision: runtime?.active_revision ?? tokenRow.revision,
+    });
+
+    if (!runtime || !validation.ok || runtime.active_callback_set_id !== tokenRow.token_set_id) {
+      await this.answerCallback(normalized.callbackQueryId, USER_MESSAGES.callbackUseLatestPreview);
+      await this.logEvent({
+        event: 'callback_rejected',
+        stage: 'callback',
+        chatId: normalized.chatId,
+        userId: normalized.userId,
+        jobId: tokenRow.job_id,
+        collectionId: runtime?.collection_id ?? '',
+        status: validation.reason ?? 'stale',
+        message: action,
+      });
+      return { ok: false, reason: validation.reason };
+    }
+
+    const isNavigationAction = normalizedAction === 'version_prev' || normalizedAction === 'version_next';
+    if (!isNavigationAction) {
+      await this.repos.markCallbackUsed(token, nowIso());
+    }
+
+    const progressByAction = {
+      ...USER_MESSAGES.actionMessages,
+      cancel: '',
+    };
+    const callbackByAction = USER_MESSAGES.actionCallbackAnswers;
+
+    if (!callbackByAction[normalizedAction]) {
+      await this.answerCallback(normalized.callbackQueryId, USER_MESSAGES.callbackUnknown);
+      return { ok: false, unknownAction: true };
+    }
+
+    await this.answerCallback(normalized.callbackQueryId, callbackByAction[normalizedAction]);
+    if (progressByAction[normalizedAction] && ![
+      'render_mode_collage',
+      'render_mode_separate',
+      'regenerate_images',
+      'regenerate_text',
+      'regenerate_all',
+    ].includes(normalizedAction)) {
+      await this.sendProgress(runtime.chat_id, progressByAction[normalizedAction]);
+    }
+
+    let result;
+    switch (normalizedAction) {
+      case 'render_mode_collage':
+      case 'render_mode_separate':
+        result = await this.startWorkGenerationFromMode(runtime, action === 'render_mode_collage' ? 'collage' : 'separate');
+        break;
+      case 'version_prev':
+        result = await this.changeViewedRevision(runtime, -1);
+        break;
+      case 'version_next':
+        result = await this.changeViewedRevision(runtime, 1);
+        break;
+      case 'regenerate_images':
+      case 'regenerate_text':
+      case 'regenerate_all':
+        result = await this.queueRuntimeGeneration(runtime, { action });
+        break;
+      case 'publish_confirm':
+        result = await this.markDraftPublished(runtime);
+        break;
+      case 'cancel':
+        result = await this.cancelDraft(runtime.job_id);
+        break;
+      default:
+        result = { ok: false, unknownAction: true };
+        break;
+    }
+
+    await this.logEvent({
+      event: 'callback_handled',
+      stage: 'callback',
+      chatId: normalized.chatId,
+      userId: normalized.userId,
+      jobId: runtime.job_id,
+      queueId: runtime.preview_payload?.queueId ?? runtime.draft_payload?.queueId ?? '',
+      collectionId: runtime.collection_id ?? '',
+      status: normalizedAction,
+      message: result?.ok === false ? 'not_ok' : 'ok',
+    });
+    return result;
+  }
+
+  async handleTopicPickerCallback({ normalized, action, tokenRow }) {
+    const pickerJobType = tokenRow.payload?.pickerJobType;
+    const sessionId = this.getPickerSessionId(normalized.chatId, pickerJobType);
+    const session = await this.repos.getSessionById(sessionId);
+    const sessionPayload = safeJsonParse(session?.pending_payload_json, {});
+
+    if (!session || sessionPayload.tokenSetId !== tokenRow.token_set_id) {
+      await this.answerCallback(normalized.callbackQueryId, USER_MESSAGES.callbackUseLatestPreview);
+      return { ok: false, stalePicker: true };
+    }
+
+    if (action === 'picker_cancel') {
+      await this.repos.supersedeTokenSet(tokenRow.token_set_id, nowIso());
+      await this.repos.deleteSession(sessionId);
+      await this.answerCallback(normalized.callbackQueryId, USER_MESSAGES.draftCancelled);
+      await this.deleteMessageSafe(normalized.chatId, sessionPayload.messageId);
+      return { ok: true, cancelled: true };
+    }
+
+    if (action === 'picker_prev' || action === 'picker_next') {
+      await this.answerCallback(normalized.callbackQueryId, 'Открываю другую страницу.');
+      const snapshotRows = Array.isArray(sessionPayload.readyRows) && sessionPayload.readyRows.length > 0
+        ? sessionPayload.readyRows
+        : await this.listReadySourceRows(this.getTopicLikeModeConfig(pickerJobType)?.sourceSheetName);
+      const picker = await this.presentTopicLikePicker({
+        chatId: normalized.chatId,
+        userId: normalized.userId,
+        jobType: pickerJobType,
+        page: Number(tokenRow.payload?.page ?? 0),
+        existingMessageId: sessionPayload.messageId ?? normalized.messageId,
+        readyRows: snapshotRows,
+      });
+      await this.repos.supersedeTokenSet(tokenRow.token_set_id, nowIso());
+      await this.repos.upsertSession({
+        session_id: sessionId,
+        chat_id: normalized.chatId,
+        user_id: normalized.userId,
+        mode: `${pickerJobType}_picker`,
+        state: 'choosing_source',
+        active_job_id: picker.jobId,
+        pending_payload_json: JSON.stringify({
+          page: picker.page,
+          tokenSetId: picker.tokenSetId,
+          messageId: picker.messageId,
+          jobType: pickerJobType,
+          readyRows: this.toPickerSnapshotRows(snapshotRows),
+        }),
+        expires_at: addMinutes(new Date(), TOPIC_LIKE_PICKER_TTL_MINUTES),
+        updated_at: nowIso(),
+      });
+      return { ok: true, pickerPage: picker.page };
+    }
+
+    const config = this.getTopicLikeModeConfig(pickerJobType);
+    await this.answerCallback(normalized.callbackQueryId, 'Беру эту тему.');
+    const sourceRow = await this.reserveSourceRow(config.sourceSheetName, tokenRow.payload?.topicId, `telegram:${normalized.chatId}`);
+    if (!sourceRow) {
+      await this.answerCallback(normalized.callbackQueryId, 'Эта тема уже занята. Выбери другую.');
+      const refreshedRows = await this.listReadySourceRows(config.sourceSheetName);
+      const picker = await this.presentTopicLikePicker({
+        chatId: normalized.chatId,
+        userId: normalized.userId,
+        jobType: pickerJobType,
+        page: Number(sessionPayload.page ?? 0),
+        existingMessageId: sessionPayload.messageId ?? normalized.messageId,
+        readyRows: refreshedRows,
+      });
+      await this.repos.supersedeTokenSet(tokenRow.token_set_id, nowIso());
+      await this.repos.upsertSession({
+        session_id: sessionId,
+        chat_id: normalized.chatId,
+        user_id: normalized.userId,
+        mode: `${pickerJobType}_picker`,
+        state: 'choosing_source',
+        active_job_id: picker.jobId,
+        pending_payload_json: JSON.stringify({
+          page: picker.page,
+          tokenSetId: picker.tokenSetId,
+          messageId: picker.messageId,
+          jobType: pickerJobType,
+          readyRows: this.toPickerSnapshotRows(refreshedRows),
+        }),
+        expires_at: addMinutes(new Date(), TOPIC_LIKE_PICKER_TTL_MINUTES),
+        updated_at: nowIso(),
+      });
+      return { ok: false, alreadyReserved: true };
+    }
+
+    await this.repos.supersedeTokenSet(tokenRow.token_set_id, nowIso());
+    await this.repos.deleteSession(sessionId);
+    await this.deleteMessageSafe(normalized.chatId, sessionPayload.messageId ?? normalized.messageId);
+    return this.startTopicLikeJob(normalized, sourceRow, pickerJobType);
+  }
+
+  async answerCallback(callbackQueryId, text) {
+    if (!callbackQueryId) {
+      return;
+    }
+    await this.callTelegram('answerCallbackQuery', callbackQueryId, { text });
+  }
+
+  async getOrCreateWorkCollection(normalized, asset) {
+    const currentTime = nowIso();
+    const collectionKey = normalized.mediaGroupId
+      ? `group:${normalized.chatId}:${normalized.mediaGroupId}`
+      : null;
+
+    let collection = null;
+    if (collectionKey) {
+      const collectionId = stableId('COL', collectionKey);
+      collection = await this.repos.mergeAlbumCollection({
+        collectionId,
+        collectionKey,
+        chatId: normalized.chatId,
+        userId: normalized.userId,
+        messageId: normalized.messageId,
+        mediaGroupId: normalized.mediaGroupId,
+        asset,
+        currentTime,
+        debounceDeadlineAt: this.getCollectionDeadlineAt(currentTime, {
+          mediaGroupId: normalized.mediaGroupId,
+          assetCount: 1,
+        }),
+        buildDeadlineAt: (assetCount) => this.getCollectionDeadlineAt(currentTime, {
+          mediaGroupId: normalized.mediaGroupId,
+          assetCount,
+        }),
+      });
+    } else {
+      const openCollection = await this.repos.getOpenCollectionForChat(normalized.chatId);
+      if (
+        openCollection
+        && !openCollection.media_group_id
+        && new Date(openCollection.deadline_at).getTime() > Date.now()
+        && openCollection.count < 3
+      ) {
+        const assets = [...openCollection.assets, asset];
+        collection = {
+          ...openCollection,
+          asset_refs_json: JSON.stringify(assets),
+          count: assets.length,
+          deadline_at: this.getCollectionDeadlineAt(currentTime, {
+            mediaGroupId: normalized.mediaGroupId,
+            assetCount: assets.length,
+          }),
+          last_message_at: currentTime,
+          updated_at: currentTime,
+        };
+        await this.repos.updateCollection(collection);
+      } else {
+        const singleCollectionKey = `single:${normalized.chatId}:${normalized.messageId ?? currentTime}`;
+        const collectionId = stableId('COL', singleCollectionKey);
+        collection = this.createWorkCollectionRecord(normalized, asset, collectionId, singleCollectionKey, currentTime);
+        await this.repos.createCollection(collection);
+      }
+    }
+
+    await this.repos.upsertSession({
+      session_id: `work:${normalized.chatId}`,
+      chat_id: normalized.chatId,
+      user_id: normalized.userId,
+      mode: 'work',
+      state: 'awaiting_assets',
+      active_job_id: '',
+      pending_payload_json: JSON.stringify({ collectionId: collection.collection_id }),
+      expires_at: addMinutes(currentTime, WORK_SESSION_TTL_MINUTES),
+      updated_at: currentTime,
+    });
+    return {
+      collection: {
+        ...collection,
+        assets: safeJsonParse(collection.asset_refs_json, [asset]),
+      },
+      created: collection.count === 1,
+    };
+  }
+
+  createWorkCollectionRecord(normalized, asset, collectionId, collectionKey, currentTime) {
+    return {
+      collection_id: collectionId,
+      collection_key: collectionKey,
+      chat_id: normalized.chatId,
+      user_id: normalized.userId,
+      first_message_id: normalized.messageId,
+      media_group_id: normalized.mediaGroupId ?? '',
+      status: 'collecting',
+      asset_refs_json: JSON.stringify([asset]),
+      count: 1,
+      deadline_at: this.getCollectionDeadlineAt(currentTime, {
+        mediaGroupId: normalized.mediaGroupId,
+        assetCount: 1,
+      }),
+      last_message_at: currentTime,
+      closed_by_job_id: '',
+      created_at: currentTime,
+      updated_at: currentTime,
+    };
+  }
+
+  async promptWorkRenderMode(collection) {
+    const jobId = stableId('JOB', `work:${collection.collection_id}`);
+    const queueId = stableId('QUE', jobId);
+    const existingRuntime = await this.repos.getRuntime(jobId);
+
+    if (existingRuntime && !['awaiting_render_mode', 'collecting'].includes(existingRuntime.runtime_status)) {
+      return { ok: true, skipped: true, jobId, queueId };
+    }
+
+    await this.repos.closeCollection({
+      collection_id: collection.collection_id,
+      status: 'awaiting_render_mode',
+      closed_by_job_id: jobId,
+      updated_at: nowIso(),
+    });
+
+    const { tokenRows, tokensByAction, tokenSetId } = this.createCallbackSet({
+      jobId,
+      revision: 0,
+      chatId: collection.chat_id,
+      actions: ['render_mode_collage', 'render_mode_separate', 'cancel'],
+    });
+    await this.repos.createCallbackTokens(tokenRows);
+
+    const draftPayload = {
+      jobId,
+      queueId,
+      jobType: 'work',
+      revision: 0,
+      viewRevision: 0,
+      chatId: collection.chat_id,
+      userId: collection.user_id,
+      topicId: '',
+      collectionId: collection.collection_id,
+      captionText: '',
+      renderMode: '',
+      finalRenderMode: '',
+      sourceAssetCount: collection.assets.length,
+      originalTelegramFileIds: collection.assets.map((asset) => asset.fileId),
+      previewTelegramFileIds: [],
+      revisionHistory: [],
+      createdAt: nowIso(),
+    };
+
+    const promptMessage = await this.sendRenderModePrompt({
+      chatId: collection.chat_id,
+      tokensByAction,
+      existingMessageId: existingRuntime?.text_message_id ?? null,
+    });
+
+    await this.repos.upsertRuntime({
+      job_id: jobId,
+      job_type: 'work',
+      chat_id: collection.chat_id,
+      user_id: collection.user_id,
+      topic_id: '',
+      collection_id: collection.collection_id,
+      active_revision: 0,
+      runtime_status: 'awaiting_render_mode',
+      collage_message_id: toStoredText(existingRuntime?.collage_message_id),
+      assets_message_ids_json: JSON.stringify(existingRuntime?.assets_message_ids ?? []),
+      text_message_id: toStoredText(promptMessage.textMessageId),
+      active_callback_set_id: toStoredText(tokenSetId),
+      schedule_input_pending: 0,
+      lock_flags_json: JSON.stringify({ source_type: 'work' }),
+      preview_payload_json: JSON.stringify(draftPayload),
+      draft_payload_json: JSON.stringify(draftPayload),
+      updated_at: nowIso(),
+    });
+    await this.repos.deleteSession(`work:${collection.chat_id}`);
+
+    await this.logEvent({
+      event: 'render_mode_requested',
+      stage: 'collection',
+      chatId: collection.chat_id,
+      userId: collection.user_id,
+      jobId,
+      queueId,
+      collectionId: collection.collection_id,
+      sourceType: 'work',
+      status: 'awaiting_render_mode',
+      message: `count=${collection.assets.length}`,
+      payload: {
+        mediaGroupId: collection.media_group_id ?? '',
+        sourceAssetCount: collection.assets.length,
+      },
+    });
+
+    return { ok: true, jobId, queueId };
+  }
+
+  async startWorkGenerationFromMode(runtime, renderMode) {
+    const collection = await this.repos.getCollectionById(runtime.collection_id);
+    if (!collection) {
+      throw new Error(`Collection not found for ${runtime.job_id}`);
+    }
+    await this.logEvent({
+      event: 'render_mode_selected',
+      stage: 'collection',
+      chatId: runtime.chat_id,
+      userId: runtime.user_id,
+      jobId: runtime.job_id,
+      queueId: runtime.preview_payload?.queueId ?? runtime.draft_payload?.queueId ?? '',
+      collectionId: runtime.collection_id,
+      sourceType: 'work',
+      status: renderMode,
+      message: renderMode,
+      payload: {
+        sourceAssetCount: collection.assets.length,
+        mediaGroupId: collection.media_group_id ?? '',
+      },
+    });
+    return this.queueRuntimeGeneration(runtime, {
+      action: 'generate_initial',
+      renderMode,
+    });
+  }
+
+  async changeViewedRevision(runtime, direction) {
+    const payload = runtime.draft_payload ?? runtime.preview_payload;
+    const history = this.getRevisionHistory(payload);
+    if (history.length === 0) {
+      return { ok: false, empty: true };
+    }
+    const currentRevision = Number(payload?.viewRevision ?? payload?.revision ?? history.at(-1).revision);
+    const currentIndex = history.findIndex((entry) => entry.revision === currentRevision);
+    const nextIndex = Math.max(0, Math.min(history.length - 1, currentIndex + direction));
+    const nextRevision = history[nextIndex];
+    if (!nextRevision || nextRevision.revision === currentRevision) {
+      return { ok: true, unchanged: true };
+    }
+
+    const tokenRows = await this.repos.listCallbackTokensByTokenSet(runtime.active_callback_set_id);
+    const tokensByAction = Object.fromEntries(tokenRows.map((row) => [row.action, row.token]));
+
+    const nextPayload = {
+      ...payload,
+      viewRevision: nextRevision.revision,
+    };
+    const currentRevisionEntry = history[currentIndex] ?? null;
+    const shouldSwapMedia = (
+      JSON.stringify(nextRevision.previewTelegramFileIds ?? [])
+      !== JSON.stringify(currentRevisionEntry?.previewTelegramFileIds ?? [])
+    );
+    const presentation = shouldSwapMedia
+      ? await this.presentPreviewRevision({
+        chatId: runtime.chat_id,
+        payload: nextPayload,
+        revisionEntry: nextRevision,
+        tokensByAction,
+        runtime,
+      })
+      : await this.presentRevisionTextOnly({
+        chatId: runtime.chat_id,
+        payload: nextPayload,
+        revisionEntry: nextRevision,
+        tokensByAction,
+        runtime,
+      });
+
+    await this.repos.upsertRuntime({
+      job_id: runtime.job_id,
+      job_type: runtime.job_type,
+      chat_id: runtime.chat_id,
+      user_id: runtime.user_id,
+      topic_id: runtime.topic_id ?? '',
+      collection_id: runtime.collection_id ?? '',
+      active_revision: runtime.active_revision,
+      runtime_status: runtime.runtime_status,
+      collage_message_id: toStoredText(presentation.collageMessageId),
+      assets_message_ids_json: JSON.stringify(presentation.assetsMessageIds),
+      text_message_id: toStoredText(presentation.textMessageId),
+      active_callback_set_id: toStoredText(runtime.active_callback_set_id),
+      schedule_input_pending: 0,
+      lock_flags_json: JSON.stringify(runtime.lock_flags),
+      preview_payload_json: JSON.stringify(nextPayload),
+      draft_payload_json: JSON.stringify(nextPayload),
+      updated_at: nowIso(),
+    });
+    if (runtime.job_type !== 'work' && runtime.topic_id) {
+      const sourceSheet = runtime.lock_flags?.source_sheet ?? this.getTopicLikeSourceSheet(runtime.job_type);
+      await this.ensureSourceRowReserved(sourceSheet, runtime.topic_id, runtime.job_id);
+    }
+
+    await this.logEvent({
+      event: 'revision_changed',
+      stage: 'preview',
+      chatId: runtime.chat_id,
+      userId: runtime.user_id,
+      jobId: runtime.job_id,
+      queueId: nextPayload.queueId ?? '',
+      collectionId: runtime.collection_id ?? '',
+      sourceType: runtime.job_type,
+      status: 'ok',
+      message: `view=${nextRevision.revision}/${history.length}`,
+    });
+    return { ok: true, revision: nextRevision.revision };
+  }
+
+  createCallbackSet({ jobId, revision, chatId, actions }) {
+    const { tokenRows, entries, tokenSetId } = this.createCallbackRows({
+      jobId,
+      revision,
+      chatId,
+      definitions: actions.map((action) => ({ action })),
+    });
+    const tokensByAction = Object.fromEntries(entries.map((entry) => [entry.action, entry.token]));
+
+    return {
+      tokenRows,
+      tokensByAction,
+      tokenSetId,
+    };
+  }
+
+  async sendRenderModePrompt({ chatId, tokensByAction, existingMessageId = null }) {
+    const text = [USER_MESSAGES.workModeChoice, USER_MESSAGES.workModeChoiceHint].join('\n');
+    if (existingMessageId) {
+      const message = await this.callTelegram('editMessageText', chatId, existingMessageId, text, {
+        reply_markup: buildRenderModeKeyboard(tokensByAction),
+      });
+      return { textMessageId: message.message_id ?? existingMessageId };
+    }
+    const message = await this.sendMessage(chatId, text, {
+      reply_markup: buildRenderModeKeyboard(tokensByAction),
+    });
+    return { textMessageId: message.message_id };
+  }
+
+  async sendPreviewAlbum({ chatId, assets, jobId, revision }) {
+    const files = assets.map((asset, index) => this.buildTelegramMediaAsset(asset, jobId, index));
+    const sent = await this.callTelegram(
+      'sendMediaGroup',
+      chatId,
+      files.map((file) => ({ type: 'photo', media: file })),
+    );
+    return {
+      assetsMessageIds: sent.map((message) => message.message_id),
+      previewTelegramFileIds: this.extractPreviewTelegramFileIds(sent, `preview:${jobId}:${revision}`),
+    };
+  }
+
+  async presentRevisionTextOnly({
+    chatId,
+    payload,
+    revisionEntry,
+    tokensByAction,
+    runtime,
+  }) {
+    const history = this.getRevisionHistory(payload);
+    const totalRevisions = history.length;
+    const canPrev = history.some((entry) => entry.revision < revisionEntry.revision);
+    const canNext = history.some((entry) => entry.revision > revisionEntry.revision);
+    const keyboard = this.buildPreviewKeyboardForRuntime(tokensByAction, { canPrev, canNext }, payload.jobType ?? runtime?.job_type ?? 'work');
+
+    if (revisionEntry.finalRenderMode === 'separate') {
+      const controlText = buildControlMessageText({
+        caption: revisionEntry.captionText,
+        revision: revisionEntry.revision,
+        totalRevisions,
+        renderMode: revisionEntry.finalRenderMode,
+      });
+      const edited = await this.callTelegram('editMessageText', chatId, runtime.text_message_id, controlText, {
+        reply_markup: keyboard,
+      });
+      return {
+        collageMessageId: runtime.collage_message_id ?? null,
+        textMessageId: edited?.message_id ?? runtime.text_message_id,
+        assetsMessageIds: runtime.assets_message_ids ?? [],
+        previewTelegramFileIds: revisionEntry.previewTelegramFileIds,
+      };
+    }
+
+    const fullCaption = buildPreviewCaption({
+      caption: revisionEntry.captionText,
+      revision: revisionEntry.revision,
+      totalRevisions,
+      renderMode: revisionEntry.finalRenderMode,
+    });
+    if (shouldDetachPreviewText(fullCaption, runtime)) {
+      const textEdited = await this.callTelegram(
+        'editMessageText',
+        chatId,
+        runtime.text_message_id,
+        revisionEntry.captionText,
+      );
+      const photoEdited = await this.callTelegram(
+        'editMessageCaption',
+        chatId,
+        runtime.collage_message_id,
+        {
+          caption: buildPreviewMetaCaption({
+            revision: revisionEntry.revision,
+            totalRevisions,
+            renderMode: revisionEntry.finalRenderMode,
+          }),
+          reply_markup: keyboard,
+        },
+      );
+      return {
+        collageMessageId: photoEdited?.message_id ?? runtime.collage_message_id,
+        textMessageId: textEdited?.message_id ?? runtime.text_message_id,
+        assetsMessageIds: runtime.assets_message_ids ?? [runtime.collage_message_id],
+        previewTelegramFileIds: revisionEntry.previewTelegramFileIds,
+      };
+    }
+
+    const caption = buildPreviewCaption({
+      caption: revisionEntry.captionText,
+      revision: revisionEntry.revision,
+      totalRevisions,
+      renderMode: revisionEntry.finalRenderMode,
+    });
+    const targetMessageId = runtime.collage_message_id ?? runtime.text_message_id;
+    const edited = await this.callTelegram('editMessageCaption', chatId, targetMessageId, {
+      caption,
+      reply_markup: keyboard,
+    });
+    return {
+      collageMessageId: runtime.collage_message_id ?? targetMessageId,
+      textMessageId: edited?.message_id ?? targetMessageId,
+      assetsMessageIds: runtime.assets_message_ids ?? [targetMessageId],
+      previewTelegramFileIds: revisionEntry.previewTelegramFileIds,
+    };
+  }
+
+  async presentPreviewRevision({
+    chatId,
+    payload,
+    revisionEntry,
+    tokensByAction,
+    runtime = null,
+    assets = null,
+    replaceModePrompt = false,
+  }) {
+    const history = this.getRevisionHistory(payload);
+    const totalRevisions = history.length;
+    const canPrev = history.some((entry) => entry.revision < revisionEntry.revision);
+    const canNext = history.some((entry) => entry.revision > revisionEntry.revision);
+    const keyboard = this.buildPreviewKeyboardForRuntime(tokensByAction, { canPrev, canNext }, payload.jobType ?? runtime?.job_type ?? 'work');
+
+    if (revisionEntry.finalRenderMode === 'separate') {
+      const controlText = buildControlMessageText({
+        caption: revisionEntry.captionText,
+        revision: revisionEntry.revision,
+        totalRevisions,
+        renderMode: revisionEntry.finalRenderMode,
+      });
+      let controlMessageId = runtime?.text_message_id ?? null;
+      if (controlMessageId) {
+        const edited = await this.callTelegram('editMessageText', chatId, controlMessageId, controlText, {
+          reply_markup: keyboard,
+        });
+        controlMessageId = edited.message_id ?? controlMessageId;
+      } else {
+        const message = await this.sendMessage(chatId, controlText, {
+          reply_markup: keyboard,
+        });
+        controlMessageId = message.message_id;
+      }
+
+      const albumAssets = assets?.length
+        ? assets
+        : this.assertReusableTelegramFileIds(
+          revisionEntry.previewTelegramFileIds,
+          `present_preview_revision:${payload.jobId}:${revisionEntry.revision}`,
+        ).map((telegramFileId) => ({ telegramFileId }));
+      for (const messageId of runtime?.assets_message_ids ?? []) {
+        await this.deleteMessageSafe(chatId, messageId);
+      }
+      const album = await this.sendPreviewAlbum({
+        chatId,
+        assets: albumAssets,
+        jobId: payload.jobId,
+        revision: revisionEntry.revision,
+      });
+      return {
+        collageMessageId: null,
+        textMessageId: controlMessageId,
+        assetsMessageIds: album.assetsMessageIds,
+        previewTelegramFileIds: album.previewTelegramFileIds,
+      };
+    }
+
+    const caption = buildPreviewCaption({
+      caption: revisionEntry.captionText,
+      revision: revisionEntry.revision,
+      totalRevisions,
+      renderMode: revisionEntry.finalRenderMode,
+    });
+    const previewAsset = assets?.[0]
+      ?? { telegramFileId: this.assertReusableTelegramFileIds(
+        revisionEntry.previewTelegramFileIds,
+        `present_preview_revision:${payload.jobId}:${revisionEntry.revision}`,
+      )[0] };
+
+    if (shouldDetachPreviewText(caption, runtime)) {
+      let controlMessageId = runtime?.text_message_id ?? null;
+      if (controlMessageId && controlMessageId !== runtime?.collage_message_id) {
+        const edited = await this.callTelegram('editMessageText', chatId, controlMessageId, revisionEntry.captionText);
+        controlMessageId = edited.message_id ?? controlMessageId;
+      } else {
+        const message = await this.sendMessage(chatId, revisionEntry.captionText);
+        controlMessageId = message.message_id;
+      }
+
+      const photoCaption = buildPreviewMetaCaption({
+        revision: revisionEntry.revision,
+        totalRevisions,
+        renderMode: revisionEntry.finalRenderMode,
+      });
+
+      let messageId = runtime?.collage_message_id ?? null;
+      let sentMessage = null;
+      if (messageId) {
+        const edited = await this.callTelegram('editMessageMedia', chatId, messageId, {
+          type: 'photo',
+          media: this.buildTelegramMediaAsset(previewAsset, payload.jobId, 0),
+          caption: photoCaption,
+        }, {
+          reply_markup: keyboard,
+        });
+        sentMessage = edited;
+        messageId = edited.message_id ?? messageId;
+      } else {
+        const message = await this.callTelegram('sendPhoto', chatId, this.buildTelegramMediaAsset(previewAsset, payload.jobId, 0), {
+          caption: photoCaption,
+          reply_markup: keyboard,
+        });
+        sentMessage = message;
+        messageId = message.message_id;
+      }
+
+      if (replaceModePrompt && runtime?.text_message_id && runtime.text_message_id !== messageId && runtime.text_message_id !== controlMessageId) {
+        await this.deleteMessageSafe(chatId, runtime.text_message_id);
+      }
+
+      return {
+        collageMessageId: messageId,
+        textMessageId: controlMessageId,
+        assetsMessageIds: [messageId],
+        previewTelegramFileIds: this.extractPreviewTelegramFileIds(
+          [sentMessage],
+          `present_preview_revision:${payload.jobId}:${revisionEntry.revision}`,
+        ),
+      };
+    }
+
+    let messageId = runtime?.collage_message_id ?? null;
+    let sentMessage = null;
+    if (messageId) {
+      const edited = await this.callTelegram('editMessageMedia', chatId, messageId, {
+        type: 'photo',
+        media: this.buildTelegramMediaAsset(previewAsset, payload.jobId, 0),
+        caption,
+      }, {
+        reply_markup: keyboard,
+      });
+      sentMessage = edited;
+      messageId = edited.message_id ?? messageId;
+    } else {
+      const message = await this.callTelegram('sendPhoto', chatId, this.buildTelegramMediaAsset(previewAsset, payload.jobId, 0), {
+        caption,
+        reply_markup: keyboard,
+      });
+      sentMessage = message;
+      messageId = message.message_id;
+    }
+
+    if (replaceModePrompt && runtime?.text_message_id && runtime.text_message_id !== messageId) {
+      await this.deleteMessageSafe(chatId, runtime.text_message_id);
+    }
+
+    return {
+      collageMessageId: messageId,
+      textMessageId: messageId,
+      assetsMessageIds: [messageId],
+      previewTelegramFileIds: this.extractPreviewTelegramFileIds(
+        [sentMessage],
+        `present_preview_revision:${payload.jobId}:${revisionEntry.revision}`,
+      ),
+    };
+  }
+  async downloadTelegramFile(fileId) {
+    const file = await this.callTelegram('getFile', fileId);
+    if (!file.file_path) {
+      throw new Error(`Telegram file path missing for ${fileId}`);
+    }
+    const fileUrl = `https://api.telegram.org/file/bot${this.env.tgBotToken}/${file.file_path}`;
+    const response = await withRetry(
+      () => withTimeout(
+        (signal) => fetch(fileUrl, { signal }),
+        30_000,
+        'Telegram file download timed out',
+      ),
+      { retries: 2, delayMs: 400, shouldRetry: isRetryableHttpError },
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to download Telegram file ${fileId}: ${response.status}`);
+    }
+    const buffer = Buffer.from(await response.arrayBuffer());
+    return {
+      buffer,
+      mimeType: file.file_path.endsWith('.png') ? 'image/png' : 'image/jpeg',
+      filePath: file.file_path,
+    };
+  }
+
+  async resolveRemoteImage(source) {
+    if (String(source).startsWith('data:')) {
+      const [prefix, base64] = String(source).split(',', 2);
+      const mimeType = prefix.match(/^data:([^;]+)/u)?.[1] ?? 'image/jpeg';
+      return { buffer: Buffer.from(base64, 'base64'), mimeType };
+    }
+    const response = await fetch(source);
+    if (!response.ok) {
+      throw new Error(`Failed to download generated image: ${response.status}`);
+    }
+    const mimeType = response.headers.get('content-type') ?? 'image/jpeg';
+    return {
+      buffer: Buffer.from(await response.arrayBuffer()),
+      mimeType,
+    };
+  }
+
+  async processWorkCollection(collection, { runtime = null, renderMode = 'collage' } = {}) {
+    const jobId = runtime?.job_id ?? stableId('JOB', `work:${collection.collection_id}`);
+    const queueId = runtime?.draft_payload?.queueId ?? runtime?.preview_payload?.queueId ?? stableId('QUE', jobId);
+    const prompts = await this.promptConfig.refresh();
+    const previousPayload = runtime?.draft_payload ?? runtime?.preview_payload ?? null;
+    const previousHistory = this.getRevisionHistory(previousPayload);
+    const revision = Math.max(1, Number(runtime?.active_revision ?? 0) + 1);
+
+    await this.repos.closeCollection({
+      collection_id: collection.collection_id,
+      status: 'generating',
+      closed_by_job_id: jobId,
+      updated_at: nowIso(),
+    });
+    if (runtime) {
+      await this.repos.upsertRuntime({
+        job_id: runtime.job_id,
+        job_type: runtime.job_type,
+        chat_id: runtime.chat_id,
+        user_id: runtime.user_id,
+        topic_id: runtime.topic_id ?? '',
+        collection_id: runtime.collection_id ?? '',
+        active_revision: runtime.active_revision,
+        runtime_status: 'generating',
+        collage_message_id: toStoredText(runtime.collage_message_id),
+        assets_message_ids_json: JSON.stringify(runtime.assets_message_ids ?? []),
+        text_message_id: toStoredText(runtime.text_message_id),
+        active_callback_set_id: toStoredText(runtime.active_callback_set_id),
+        schedule_input_pending: 0,
+        lock_flags_json: JSON.stringify(runtime.lock_flags ?? {}),
+        preview_payload_json: JSON.stringify(previousPayload),
+        draft_payload_json: JSON.stringify(previousPayload),
+        updated_at: nowIso(),
+      });
+    }
+    await this.logEvent({
+      event: 'processing_started',
+      stage: 'processing',
+      chatId: collection.chat_id,
+      userId: collection.user_id,
+      jobId,
+      queueId,
+      collectionId: collection.collection_id,
+      sourceType: 'work',
+      status: renderMode,
+      message: `assets=${collection.assets.length}`,
+      payload: {
+        mediaGroupId: collection.media_group_id ?? '',
+        sourceAssetCount: collection.assets.length,
+        renderMode,
+      },
+    });
+    let workingRuntime = runtime;
+    if (workingRuntime) {
+      const controlMessageId = await this.updateRuntimeStatusMessage(workingRuntime, USER_MESSAGES.workEnhancingImages);
+      workingRuntime = {
+        ...workingRuntime,
+        text_message_id: controlMessageId,
+      };
+    } else {
+      await this.sendProgress(collection.chat_id, USER_MESSAGES.workEnhancingImages);
+    }
+
+    const downloadStartedAt = Date.now();
+    const imageStartedAt = Date.now();
+    const consistencyInputs = await Promise.all(
+      collection.assets.map(async (asset) => {
+        const original = await this.downloadTelegramFile(asset.fileId);
+        return { buffer: original.buffer, mimeType: original.mimeType };
+      }),
+    );
+    const consistencyNotes = await this.extractAlbumConsistencyNotes({
+      assets: consistencyInputs,
+      prompts,
+      jobId,
+      revision,
+    });
+    const processedAssets = await Promise.all(
+      collection.assets.map((asset, index) => this.processSingleWorkAsset({
+        fileId: asset.fileId,
+        prompts,
+        jobId,
+        index,
+        revision,
+        consistencyNotes,
+        originalAsset: consistencyInputs[index] ?? null,
+      })),
+    );
+    const originalTelegramFileIds = processedAssets.map((item) => item.originalTelegramFileId);
+    const enhancedAssets = processedAssets.map((item) => item.asset);
+    await this.logEvent({
+      event: 'original_download_completed',
+      stage: 'processing',
+      chatId: collection.chat_id,
+      userId: collection.user_id,
+      jobId,
+      queueId,
+      collectionId: collection.collection_id,
+      sourceType: 'work',
+      status: 'ok',
+      durationMs: Date.now() - downloadStartedAt,
+      message: `files=${originalTelegramFileIds.length}`,
+      payload: { sourceAssetCount: originalTelegramFileIds.length },
+    });
+    await this.logEvent({
+      event: 'image_enhancement_completed',
+      stage: 'processing',
+      chatId: collection.chat_id,
+      userId: collection.user_id,
+      jobId,
+      queueId,
+      collectionId: collection.collection_id,
+      sourceType: 'work',
+      status: 'ok',
+      durationMs: Date.now() - imageStartedAt,
+      message: `files=${enhancedAssets.length}`,
+      payload: {
+        model: this.env.imageModelId,
+        passes: ['enhance', 'reframe'],
+        sourceAssetCount: enhancedAssets.length,
+        renderMode,
+        consistencyNotes,
+      },
+    });
+
+    let previewAssets = enhancedAssets;
+    let finalRenderMode = renderMode === 'separate' && enhancedAssets.length > 1 ? 'separate' : 'single';
+    if (renderMode === 'collage' && enhancedAssets.length > 1) {
+      const finalPreviewRender = await this.buildFinalWorkPreviewAsset(
+        enhancedAssets,
+        `${jobId}-${revision}`,
+        prompts,
+        consistencyNotes,
+      );
+      previewAssets = [finalPreviewRender.asset];
+      finalRenderMode = finalPreviewRender.finalRenderMode;
+      await this.logEvent({
+        event: 'collage_built',
+        stage: 'preview',
+        chatId: collection.chat_id,
+        userId: collection.user_id,
+        jobId,
+        queueId,
+        collectionId: collection.collection_id,
+        sourceType: 'work',
+        status: 'ok',
+        message: `assets=${enhancedAssets.length}`,
+        payload: {
+          finalRenderMode,
+          sourceAssetCount: enhancedAssets.length,
+        },
+      });
+    }
+
+    if (workingRuntime) {
+      const controlMessageId = await this.updateRuntimeStatusMessage(workingRuntime, USER_MESSAGES.workPreparingText);
+      workingRuntime = {
+        ...workingRuntime,
+        text_message_id: controlMessageId,
+      };
+    } else {
+      await this.sendProgress(collection.chat_id, USER_MESSAGES.workPreparingText);
+    }
+    const captionStartedAt = Date.now();
+    const captionImageUrls = this.buildWorkCaptionImageUrls(enhancedAssets);
+    const caption = this.formatCaptionWithContact((await this.openrouter.generateText({
+      systemPrompt: prompts.work_caption_generation,
+      userPrompt: this.buildWorkCaptionUserPrompt(enhancedAssets.length),
+      imageUrls: captionImageUrls,
+      temperature: 0.9,
+      model: this.getWorkTextModelId(),
+      metadata: {
+        source_type: 'work',
+        job_id: jobId,
+        model: this.getWorkTextModelId(),
+        source_asset_count: enhancedAssets.length,
+        render_mode: renderMode,
+      },
+    })).text, prompts.contact_block);
+    await this.logEvent({
+      event: 'caption_generated',
+      stage: 'processing',
+      chatId: collection.chat_id,
+      userId: collection.user_id,
+      jobId,
+      queueId,
+      collectionId: collection.collection_id,
+      sourceType: 'work',
+      status: 'ok',
+      durationMs: Date.now() - captionStartedAt,
+      message: `chars=${caption.length}`,
+      payload: {
+        model: this.getWorkTextModelId(),
+        sourceAssetCount: enhancedAssets.length,
+        renderMode,
+      },
+    });
+    if (workingRuntime) {
+      const controlMessageId = await this.updateRuntimeStatusMessage(workingRuntime, USER_MESSAGES.assemblingPreview);
+      workingRuntime = {
+        ...workingRuntime,
+        text_message_id: controlMessageId,
+      };
+    } else {
+      await this.sendProgress(collection.chat_id, USER_MESSAGES.assemblingPreview);
+    }
+
+    const basePayload = {
+      ...previousPayload,
+      jobId,
+      queueId,
+      jobType: 'work',
+      revision,
+      viewRevision: revision,
+      chatId: collection.chat_id,
+      userId: collection.user_id,
+      topicId: '',
+      collectionId: collection.collection_id,
+      captionText: caption,
+      renderMode,
+      finalRenderMode,
+      sourceAssetCount: enhancedAssets.length,
+      originalTelegramFileIds,
+      previewTelegramFileIds: [],
+      createdAt: previousPayload?.createdAt ?? nowIso(),
+    };
+
+    const revisionEntry = this.buildRevisionEntry({
+      revision,
+      captionText: caption,
+      previewTelegramFileIds: [],
+      finalRenderMode,
+      sourceAssetCount: enhancedAssets.length,
+    });
+    const nextHistory = [...previousHistory.filter((entry) => entry.revision !== revision), revisionEntry];
+    const draftPayload = {
+      ...basePayload,
+      revisionHistory: nextHistory,
+    };
+
+    const { tokenRows, tokensByAction, tokenSetId } = this.createCallbackSet({
+      jobId,
+      revision,
+      chatId: collection.chat_id,
+      actions: ['version_prev', 'version_next', 'regenerate_images', 'regenerate_text', 'regenerate_all', 'cancel'],
+    });
+    if (runtime?.active_callback_set_id) {
+      await this.repos.supersedeTokenSet(runtime.active_callback_set_id, nowIso());
+    }
+    await this.repos.createCallbackTokens(tokenRows);
+
+    const previewStartedAt = Date.now();
+    const presentation = await this.presentPreviewRevision({
+      chatId: collection.chat_id,
+      payload: draftPayload,
+      revisionEntry,
+      tokensByAction,
+      runtime: workingRuntime,
+      assets: previewAssets,
+      replaceModePrompt: true,
+    });
+    revisionEntry.previewTelegramFileIds = presentation.previewTelegramFileIds;
+
+    const finalPayload = {
+      ...draftPayload,
+      previewTelegramFileIds: presentation.previewTelegramFileIds,
+      revisionHistory: nextHistory.map((entry) => (
+        entry.revision === revision
+          ? { ...revisionEntry }
+          : entry
+      )),
+    };
+
+    await this.store.upsertRowByColumn(
+      SHEET_NAMES.contentQueue,
+      'queue_id',
+      queueId,
+      buildQueueRow({
+        queueId,
+        jobId,
+        jobType: 'work',
+        revision,
+        status: 'preview_ready',
+        captionText: caption,
+        assetDriveFileIds: presentation.previewTelegramFileIds,
+        manifestDriveFileId: '',
+      }),
+      SHEET_HEADERS[SHEET_NAMES.contentQueue],
+    );
+
+    await this.repos.upsertRuntime({
+      job_id: jobId,
+      job_type: 'work',
+      chat_id: collection.chat_id,
+      user_id: collection.user_id,
+      topic_id: '',
+      collection_id: collection.collection_id,
+      active_revision: revision,
+      runtime_status: 'preview_ready',
+      collage_message_id: toStoredText(presentation.collageMessageId),
+      assets_message_ids_json: JSON.stringify(presentation.assetsMessageIds),
+      text_message_id: toStoredText(presentation.textMessageId),
+      active_callback_set_id: toStoredText(tokenSetId),
+      schedule_input_pending: 0,
+      lock_flags_json: JSON.stringify({ source_type: 'work' }),
+      preview_payload_json: JSON.stringify(finalPayload),
+      draft_payload_json: JSON.stringify(finalPayload),
+      updated_at: nowIso(),
+    });
+
+    await this.logEvent({
+      event: 'preview_sent',
+      stage: 'preview',
+      chatId: collection.chat_id,
+      userId: collection.user_id,
+      jobId,
+      queueId,
+      collectionId: collection.collection_id,
+      sourceType: 'work',
+      status: 'sent',
+      durationMs: Date.now() - previewStartedAt,
+      message: `messages=${presentation.assetsMessageIds.length}`,
+      payload: {
+        finalRenderMode,
+        renderMode,
+        sourceAssetCount: enhancedAssets.length,
+        revision,
+      },
+    });
+    return { ok: true, jobId, queueId, revision };
+  }
+  async reserveNextTopic() {
+    const rows = await this.store.getRows(SHEET_NAMES.expertTopics);
+    for (const row of rows) {
+      const reclaimed = reclaimExpiredTopic({
+        ...row,
+        reserved_until: row.reservation_expires_at,
+        reserved_by_job_id: row.reserved_by,
+      });
+      if (reclaimed.status !== row.status) {
+        await this.store.updateRowByNumber(
+          SHEET_NAMES.expertTopics,
+          row.__rowNumber,
+          { ...row, status: 'ready', reserved_by: '', reserved_at: '', reservation_expires_at: '' },
+          SHEET_HEADERS[SHEET_NAMES.expertTopics],
+        );
+      }
+    }
+
+    const freshRows = await this.store.getRows(SHEET_NAMES.expertTopics);
+    const nextTopic = freshRows.find((row) => String(row.status).toLowerCase() === 'ready');
+    if (!nextTopic) {
+      return null;
+    }
+
+    const reservedAt = nowIso();
+    await this.store.updateRowByNumber(
+      SHEET_NAMES.expertTopics,
+      nextTopic.__rowNumber,
+      {
+        ...nextTopic,
+        status: 'reserved',
+        reserved_by: 'telegram-bot',
+        reserved_at: reservedAt,
+        reservation_expires_at: addMinutes(reservedAt, TOPIC_RESERVATION_MINUTES),
+      },
+      SHEET_HEADERS[SHEET_NAMES.expertTopics],
+    );
+    return nextTopic;
+  }
+
+  async regenerateDraft(jobId, action) {
+    const runtime = await this.repos.getRuntime(jobId);
+    if (!runtime?.draft_payload) {
+      throw new Error(`Runtime payload missing for ${jobId}`);
+    }
+
+    const prompts = await this.promptConfig.refresh();
+    const previousPayload = runtime.draft_payload;
+    const revision = Number(runtime.active_revision) + 1;
+    const payload = {
+      ...previousPayload,
+      revision,
+      viewRevision: revision,
+    };
+    const previousHistory = this.getRevisionHistory(previousPayload);
+    let previewAssets = [];
+    let regeneratedFinalRenderMode = payload.finalRenderMode ?? payload.renderMode ?? 'single';
+
+    const shouldRegenerateImages = action === 'regenerate_images' || action === 'regenerate_all';
+    const shouldRegenerateText = action === 'regenerate_text' || action === 'regenerate_all';
+    const shouldRecomposeTopicLike = runtime.job_type !== 'work' && (
+      shouldRegenerateImages
+      || (runtime.job_type !== 'topic' && shouldRegenerateText)
+    );
+
+    if (shouldRegenerateText) {
+      let workCaptionImageUrls = [];
+      if (runtime.job_type === 'work') {
+        const captionAssets = previewAssets.length > 0
+          ? previewAssets
+          : await Promise.all(
+            (payload.originalTelegramFileIds ?? []).slice(0, 3).map(async (fileId) => {
+              const original = await this.downloadTelegramFile(fileId);
+              return { buffer: original.buffer, mimeType: original.mimeType };
+            }),
+          );
+        workCaptionImageUrls = this.buildWorkCaptionImageUrls(captionAssets);
+      }
+      if (runtime.job_type === 'work') {
+        const nextCaption = await this.openrouter.generateText({
+          systemPrompt: prompts.work_caption_generation,
+          userPrompt: this.buildWorkCaptionUserPrompt(
+            payload.sourceAssetCount || payload.originalTelegramFileIds?.length || payload.previewTelegramFileIds?.length || 1,
+          ),
+          imageUrls: workCaptionImageUrls,
+          temperature: 0.9,
+          model: this.getWorkTextModelId(),
+          metadata: {
+            source_type: runtime.job_type,
+            job_id: jobId,
+            revision,
+            model: this.getWorkTextModelId(),
+          },
+        });
+        payload.captionText = this.formatCaptionWithContact(nextCaption.text, prompts.contact_block);
+      } else {
+        const { manifest } = await this.generateTopicLikeManifest({
+          jobType: runtime.job_type,
+          prompts,
+          sourceRow: {
+            topic_id: payload.topicId ?? runtime.topic_id,
+            title: payload.title ?? '',
+            brief: payload.brief ?? '',
+            tags: payload.tags ?? [],
+          },
+          jobId,
+          revision,
+        });
+        payload.manifest = manifest;
+        if (runtime.job_type === 'topic') {
+          payload.captionText = manifest.captionText;
+        }
+      }
+    }
+
+    if (shouldRegenerateImages && runtime.job_type === 'work') {
+      const regeneratedAssets = await Promise.all(
+        (payload.originalTelegramFileIds ?? []).map((fileId, index) => this.processSingleWorkAsset({
+          fileId,
+          prompts,
+          jobId,
+          index,
+          revision,
+        })),
+      );
+      const regeneratedBuffers = regeneratedAssets.map((item) => item.asset);
+      if ((payload.renderMode ?? payload.finalRenderMode) === 'separate' && regeneratedBuffers.length > 1) {
+        regeneratedFinalRenderMode = 'separate';
+        previewAssets = regeneratedBuffers;
+      } else if (regeneratedBuffers.length > 1) {
+        const finalPreviewRender = await this.buildFinalWorkPreviewAsset(regeneratedBuffers, `${jobId}-${revision}`, prompts);
+        regeneratedFinalRenderMode = finalPreviewRender.finalRenderMode;
+        previewAssets = [finalPreviewRender.asset];
+      } else {
+        regeneratedFinalRenderMode = 'single';
+        previewAssets = regeneratedBuffers;
+      }
+    } else if (shouldRecomposeTopicLike) {
+      const topicLikeVisual = await this.generateTopicLikeVisualAssets({
+        jobType: runtime.job_type,
+        prompts,
+        manifest: payload.manifest ?? { captionText: payload.captionText },
+        sourceRow: {
+          topic_id: payload.topicId ?? runtime.topic_id,
+          title: payload.title ?? '',
+          brief: payload.brief ?? '',
+          tags: payload.tags ?? [],
+        },
+        revision,
+        jobId,
+      });
+      previewAssets = topicLikeVisual.assets;
+      regeneratedFinalRenderMode = topicLikeVisual.finalRenderMode;
+      payload.finalRenderMode = topicLikeVisual.finalRenderMode;
+      payload.renderMode = topicLikeVisual.finalRenderMode;
+      payload.captionText = topicLikeVisual.captionText;
+    }
+
+    const queueRows = await this.store.getRows(SHEET_NAMES.contentQueue);
+    const queueRow = queueRows.find((row) => row.job_id === jobId);
+    if (!queueRow) {
+      throw new Error(`Queue row not found for ${jobId}`);
+    }
+
+    const finalRenderMode = runtime.job_type === 'work'
+      ? regeneratedFinalRenderMode
+      : (payload.finalRenderMode ?? 'single');
+    const revisionEntry = this.buildRevisionEntry({
+      revision,
+      captionText: payload.captionText,
+      previewTelegramFileIds: [],
+      finalRenderMode,
+      sourceAssetCount: runtime.job_type === 'work'
+        ? (payload.originalTelegramFileIds?.length || payload.sourceAssetCount || 1)
+        : (payload.sourceAssetCount || 1),
+    });
+    const nextPayload = {
+      ...payload,
+      finalRenderMode,
+      sourceAssetCount: revisionEntry.sourceAssetCount,
+      revisionHistory: [...previousHistory.filter((entry) => entry.revision !== revision), revisionEntry],
+    };
+
+    const { tokenRows, tokensByAction, tokenSetId } = this.createCallbackSet({
+      jobId,
+      revision,
+      chatId: runtime.chat_id,
+      actions: ['version_prev', 'version_next', 'regenerate_images', 'regenerate_text', 'regenerate_all', 'cancel'],
+    });
+    await this.repos.supersedeTokenSet(runtime.active_callback_set_id, nowIso());
+    await this.repos.createCallbackTokens(tokenRows);
+
+    const previewMessages = await this.presentPreviewRevision({
+      chatId: runtime.chat_id,
+      payload: nextPayload,
+      revisionEntry,
+      tokensByAction,
+      runtime,
+      assets: previewAssets.length > 0
+        ? previewAssets
+        : this.assertReusableTelegramFileIds(payload.previewTelegramFileIds ?? [], 'regenerate_draft')
+          .map((telegramFileId) => ({ telegramFileId })),
+    });
+    revisionEntry.previewTelegramFileIds = previewMessages.previewTelegramFileIds;
+
+    const finalPayload = {
+      ...nextPayload,
+      previewTelegramFileIds: previewMessages.previewTelegramFileIds,
+      revisionHistory: nextPayload.revisionHistory.map((entry) => (
+        entry.revision === revision
+          ? { ...revisionEntry }
+          : entry
+      )),
+    };
+
+    await this.store.updateRowByNumber(
+      SHEET_NAMES.contentQueue,
+      queueRow.__rowNumber,
+      buildQueueRow({
+        queueId: queueRow.queue_id,
+        jobId,
+        jobType: runtime.job_type,
+        revision,
+        status: 'preview_ready',
+        captionText: finalPayload.captionText,
+        assetDriveFileIds: finalPayload.previewTelegramFileIds,
+        manifestDriveFileId: '',
+        topicId: finalPayload.topicId ?? '',
+        createdAt: queueRow.created_at || nowIso(),
+      }),
+      SHEET_HEADERS[SHEET_NAMES.contentQueue],
+    );
+
+    await this.repos.upsertRuntime({
+      job_id: runtime.job_id,
+      job_type: runtime.job_type,
+      chat_id: runtime.chat_id,
+      user_id: runtime.user_id,
+      topic_id: runtime.topic_id ?? '',
+      collection_id: runtime.collection_id ?? '',
+      active_revision: revision,
+      runtime_status: 'preview_ready',
+      collage_message_id: toStoredText(previewMessages.collageMessageId),
+      assets_message_ids_json: JSON.stringify(previewMessages.assetsMessageIds),
+      text_message_id: toStoredText(previewMessages.textMessageId),
+      active_callback_set_id: toStoredText(tokenSetId),
+      schedule_input_pending: 0,
+      lock_flags_json: JSON.stringify(runtime.lock_flags),
+      preview_payload_json: JSON.stringify(finalPayload),
+      draft_payload_json: JSON.stringify(finalPayload),
+      updated_at: nowIso(),
+    });
+    if (runtime.job_type !== 'work' && runtime.topic_id) {
+      const sourceSheet = runtime.lock_flags?.source_sheet ?? this.getTopicLikeSourceSheet(runtime.job_type);
+      await this.ensureSourceRowReserved(sourceSheet, runtime.topic_id, runtime.job_id);
+    }
+    await this.logEvent({
+      event: 'revision_changed',
+      stage: 'preview',
+      chatId: runtime.chat_id,
+      userId: runtime.user_id,
+      jobId,
+      queueId: queueRow.queue_id,
+      collectionId: runtime.collection_id ?? '',
+      sourceType: runtime.job_type,
+      status: action,
+      message: `revision=${revision}`,
+    });
+    return { ok: true, revision };
+  }
+
+  async markDraftPublished(runtime) {
+    const queueRows = await this.store.getRows(SHEET_NAMES.contentQueue);
+    const queueRow = queueRows.find((row) => row.job_id === runtime.job_id);
+    if (queueRow) {
+      await this.store.updateRowByNumber(
+        SHEET_NAMES.contentQueue,
+        queueRow.__rowNumber,
+        {
+          ...queueRow,
+          status: 'published',
+          updated_at: nowIso(),
+        },
+        SHEET_HEADERS[SHEET_NAMES.contentQueue],
+      );
+    }
+
+    const sourceSheet = runtime.lock_flags?.source_sheet ?? this.getTopicLikeSourceSheet(runtime.job_type);
+    if (sourceSheet && runtime.topic_id) {
+      await this.markSourceRowPublished(sourceSheet, runtime.topic_id, runtime.job_id);
+    }
+
+    await this.repos.upsertRuntime({
+      job_id: runtime.job_id,
+      job_type: runtime.job_type,
+      chat_id: runtime.chat_id,
+      user_id: runtime.user_id,
+      topic_id: runtime.topic_id ?? '',
+      collection_id: runtime.collection_id ?? '',
+      active_revision: runtime.active_revision,
+      runtime_status: 'published',
+      collage_message_id: toStoredText(runtime.collage_message_id),
+      assets_message_ids_json: JSON.stringify(runtime.assets_message_ids ?? []),
+      text_message_id: toStoredText(runtime.text_message_id),
+      active_callback_set_id: toStoredText(runtime.active_callback_set_id),
+      schedule_input_pending: 0,
+      lock_flags_json: JSON.stringify(runtime.lock_flags ?? {}),
+      preview_payload_json: JSON.stringify(runtime.preview_payload),
+      draft_payload_json: JSON.stringify(runtime.draft_payload),
+      updated_at: nowIso(),
+    });
+
+    await this.sendMessage(runtime.chat_id, 'Отметила материал как опубликованный.');
+    return { ok: true, published: true };
+  }
+
+  async cancelDraft(jobId) {
+    const runtime = await this.repos.getRuntime(jobId);
+    const queueRows = await this.store.getRows(SHEET_NAMES.contentQueue);
+    const queueRow = queueRows.find((row) => row.job_id === jobId);
+    if (queueRow) {
+      await this.store.updateRowByNumber(
+        SHEET_NAMES.contentQueue,
+        queueRow.__rowNumber,
+        { ...queueRow, status: 'cancelled', updated_at: nowIso() },
+        SHEET_HEADERS[SHEET_NAMES.contentQueue],
+      );
+    }
+
+    if (runtime?.topic_id) {
+      const sourceSheet = runtime.lock_flags?.source_sheet ?? this.getTopicLikeSourceSheet(runtime.job_type);
+      if (sourceSheet) {
+        await this.releaseSourceRow(sourceSheet, runtime.topic_id);
+      }
+    }
+
+    if (runtime) {
+      await this.repos.supersedeTokenSet(runtime.active_callback_set_id, nowIso());
+      await this.repos.upsertRuntime({
+        job_id: runtime.job_id,
+        job_type: runtime.job_type,
+        chat_id: runtime.chat_id,
+        user_id: runtime.user_id,
+        topic_id: runtime.topic_id ?? '',
+        collection_id: runtime.collection_id ?? '',
+        active_revision: runtime.active_revision,
+        runtime_status: 'cancelled',
+        collage_message_id: toStoredText(runtime.collage_message_id),
+        assets_message_ids_json: JSON.stringify(runtime.assets_message_ids),
+        text_message_id: toStoredText(runtime.text_message_id),
+        active_callback_set_id: toStoredText(runtime.active_callback_set_id),
+        schedule_input_pending: 0,
+        lock_flags_json: JSON.stringify(runtime.lock_flags),
+        preview_payload_json: JSON.stringify(runtime.preview_payload),
+        draft_payload_json: JSON.stringify(runtime.draft_payload),
+        updated_at: nowIso(),
+      });
+      await this.sendMessage(runtime.chat_id, USER_MESSAGES.actionMessages.cancel);
+    }
+    return { ok: true };
+  }
+
+  async handleQueuedRuntimeAction(payload = {}) {
+    const jobId = String(payload.jobId ?? '').trim();
+    const action = String(payload.action ?? '').trim();
+    if (!jobId || !action) {
+      return { ok: false, error: 'invalid_worker_payload' };
+    }
+    return this.runQueuedGenerationJob(jobId, action);
+  }
+
+  async runQueuedGenerationJob(jobId, action) {
+    const runtime = await this.repos.getRuntime(jobId);
+    if (!runtime) {
+      return { ok: false, missing: true };
+    }
+
+    const lockKey = `generation:${jobId}`;
+    const acquired = await this.repos.acquirePublishLock({
+      lockKey,
+      jobId,
+      queueId: runtime.preview_payload?.queueId ?? runtime.draft_payload?.queueId ?? '',
+      createdAt: nowIso(),
+      expiresAt: addMinutes(new Date(), 10),
+    });
+    if (!acquired) {
+      return { ok: true, locked: true };
+    }
+
+    try {
+      const freshRuntime = await this.repos.getRuntime(jobId);
+      if (!freshRuntime) {
+        return { ok: false, missing: true };
+      }
+      await this.logEvent({
+        event: 'generation_started',
+        stage: 'processing',
+        chatId: freshRuntime.chat_id,
+        userId: freshRuntime.user_id,
+        jobId,
+        queueId: freshRuntime.preview_payload?.queueId ?? freshRuntime.draft_payload?.queueId ?? '',
+        collectionId: freshRuntime.collection_id ?? '',
+        sourceType: freshRuntime.job_type,
+        status: action,
+        message: action,
+      });
+
+      if (action === 'generate_initial') {
+        const collection = await this.repos.getCollectionById(freshRuntime.collection_id);
+        if (!collection) {
+          throw new Error(`Collection not found for ${jobId}`);
+        }
+        const renderMode = freshRuntime.draft_payload?.renderMode
+          ?? freshRuntime.preview_payload?.renderMode
+          ?? 'collage';
+        return await this.processWorkCollection(collection, { runtime: freshRuntime, renderMode });
+      }
+
+      return await this.regenerateDraft(jobId, action);
+    } catch (error) {
+      await this.repos.upsertRuntime({
+        job_id: runtime.job_id,
+        job_type: runtime.job_type,
+        chat_id: runtime.chat_id,
+        user_id: runtime.user_id,
+        topic_id: runtime.topic_id ?? '',
+        collection_id: runtime.collection_id ?? '',
+        active_revision: runtime.active_revision,
+        runtime_status: 'generation_failed',
+        collage_message_id: toStoredText(runtime.collage_message_id),
+        assets_message_ids_json: JSON.stringify(runtime.assets_message_ids ?? []),
+        text_message_id: toStoredText(runtime.text_message_id),
+        active_callback_set_id: toStoredText(runtime.active_callback_set_id),
+        schedule_input_pending: 0,
+        lock_flags_json: JSON.stringify(runtime.lock_flags ?? {}),
+        preview_payload_json: JSON.stringify(runtime.preview_payload),
+        draft_payload_json: JSON.stringify(runtime.draft_payload),
+        updated_at: nowIso(),
+      });
+      await this.logEvent({
+        level: 'ERROR',
+        event: 'generation_failed',
+        stage: 'error',
+        chatId: runtime.chat_id,
+        userId: runtime.user_id,
+        jobId,
+        queueId: runtime.preview_payload?.queueId ?? runtime.draft_payload?.queueId ?? '',
+        collectionId: runtime.collection_id ?? '',
+        sourceType: runtime.job_type,
+        status: action,
+        message: error.message,
+        node: error.step ?? action,
+      });
+      const userMessage = this.buildUserErrorMessage(error, 'Не получилось собрать результат. Попробуй ещё раз.');
+      if (runtime.text_message_id) {
+        try {
+          await this.updateRuntimeStatusMessage(runtime, userMessage);
+        } catch {
+          await this.sendMessage(runtime.chat_id, userMessage);
+        }
+      } else {
+        await this.sendMessage(runtime.chat_id, userMessage);
+      }
+      return { ok: false, error: error.message };
+    } finally {
+      await this.repos.releasePublishLock(lockKey);
+    }
+  }
+
+  async runCollectionFinalizer() {
+    const dueCollections = await this.repos.listDueCollections(nowIso());
+    for (const collection of dueCollections) {
+      try {
+        await this.promptWorkRenderMode(collection);
+      } catch (error) {
+        await this.botLogger.log({
+          level: 'ERROR',
+          event: 'work_collection_failed',
+          chatId: collection.chat_id,
+          userId: collection.user_id,
+          sourceType: 'work',
+          status: 'failed',
+          message: error.message,
+          payload: { collectionId: collection.collection_id },
+        });
+      }
+    }
+    const queuedRuntimes = await this.repos.listRuntimesByStatus('queued_for_generation');
+    for (const runtime of queuedRuntimes) {
+      try {
+        const action = runtime.lock_flags?.queued_action || 'generate_initial';
+        await this.runQueuedGenerationJob(runtime.job_id, action);
+      } catch (error) {
+        await this.botLogger.log({
+          level: 'ERROR',
+          event: 'queued_generation_failed',
+          chatId: runtime.chat_id,
+          userId: runtime.user_id,
+          jobId: runtime.job_id,
+          queueId: runtime.preview_payload?.queueId ?? runtime.draft_payload?.queueId ?? '',
+          collectionId: runtime.collection_id ?? '',
+          sourceType: runtime.job_type,
+          status: 'failed',
+          message: error.message,
+          payload: { action: runtime.lock_flags?.queued_action || 'generate_initial' },
+        });
+      }
+    }
+  }
+
+  async runCleanup() {
+    const now = nowIso();
+    const sessions = await this.repos.cleanupSessions(now);
+    const callbackTokens = await this.repos.cleanupCallbackTokens(now);
+    const idempotency = await this.repos.cleanupIdempotency(now);
+    const publishLocks = await this.repos.cleanupPublishLocks(now);
+    await this.logEvent({
+      event: 'cleanup_completed',
+      stage: 'cleanup',
+      status: 'ok',
+      message: `sessions=${sessions} callback_tokens=${callbackTokens} idempotency=${idempotency} publish_locks=${publishLocks}`
+    });
+  }
+
+  async scheduleCollectionFinalize(collectionId) {
+    await delay(this.getCollectionDebounceWaitMs());
+    const collection = await this.repos.getCollectionById(collectionId);
+    if (!collection || collection.status !== 'collecting') {
+      return { ok: true, skipped: true };
+    }
+    if (new Date(collection.deadline_at).getTime() > Date.now()) {
+      return { ok: true, waiting: true };
+    }
+    const lockKey = `collection-finalize:${collection.collection_id}`;
+    const acquired = await this.repos.acquirePublishLock({
+      lockKey,
+      jobId: collection.collection_id,
+      queueId: '',
+      createdAt: nowIso(),
+      expiresAt: addMinutes(new Date(), 10),
+    });
+    if (!acquired) {
+      return { ok: true, locked: true };
+    }
+    try {
+      const latest = await this.repos.getCollectionById(collectionId);
+      if (!latest || latest.status !== 'collecting') {
+        return { ok: true, skipped: true };
+      }
+      if (new Date(latest.deadline_at).getTime() > Date.now()) {
+        return { ok: true, waiting: true };
+      }
+      await this.logEvent({
+        event: 'collection_stable',
+        stage: 'collection',
+        chatId: latest.chat_id,
+        userId: latest.user_id,
+        collectionId: latest.collection_id,
+        sourceType: 'work',
+        status: 'ready',
+        message: `count=${latest.count}`,
+        payload: {
+          mediaGroupId: latest.media_group_id ?? '',
+          count: latest.count,
+        },
+      });
+      await this.promptWorkRenderMode(latest);
+      return { ok: true };
+    } finally {
+      await this.repos.releasePublishLock(lockKey);
+    }
+  }
+
+  getCollectionDebounceWaitMs() {
+    return (WORK_COLLECTION_DEBOUNCE_SECONDS * 1000) + 250;
+  }
+
+  buildTelegramMediaAsset(asset, jobId, index) {
+    if (asset?.telegramFileId) {
+      return asset.telegramFileId;
+    }
+    return new InputFile(
+      asset.buffer,
+      asset.fileName ?? basenameForMime(asset.mimeType, `preview-${jobId}-${index + 1}.jpg`),
+    );
+  }
+
+  assertReusableTelegramFileIds(fileIds, contextLabel) {
+    const normalized = [...(fileIds ?? [])].filter(Boolean);
+    if (normalized.length === 0) {
+      const error = new Error(`Telegram preview file ids are missing for ${contextLabel}`);
+      error.step = contextLabel;
+      error.userMessage = 'Не удалось подготовить preview для повторной отправки.';
+      throw error;
+    }
+    const invalid = normalized.find((fileId) => String(fileId).startsWith('preview:'));
+    if (invalid) {
+      const error = new Error(`Synthetic Telegram preview id detected for ${contextLabel}: ${invalid}`);
+      error.step = contextLabel;
+      error.userMessage = 'Не удалось использовать сохранённый preview. Нужна новая генерация.';
+      throw error;
+    }
+    return normalized;
+  }
+
+  async deleteMessageSafe(chatId, messageId) {
+    if (!chatId || !messageId) {
+      return;
+    }
+    try {
+      await this.callTelegram('deleteMessage', chatId, messageId);
+    } catch {
+      // Best effort cleanup only.
+    }
+  }
+
+  extractPreviewTelegramFileIds(messages, contextLabel) {
+    return messages.map((message, index) => {
+      const fileId = message?.photo?.at?.(-1)?.file_id
+        ?? message?.photo?.[message.photo.length - 1]?.file_id
+        ?? message?.document?.file_id
+        ?? null;
+      if (!fileId) {
+        const error = new Error(`Telegram preview file_id missing for ${contextLabel} item ${index + 1}`);
+        error.step = 'extract_preview_file_ids';
+        error.userMessage = 'Не удалось подготовить preview для повторной отправки.';
+        throw error;
+      }
+      return fileId;
+    });
+  }
+
+  async withLocalLock(key, action) {
+    const current = this.localLocks.get(key) ?? Promise.resolve();
+    let release;
+    const next = new Promise((resolve) => {
+      release = resolve;
+    });
+    const chained = current.then(() => next);
+    this.localLocks.set(key, chained);
+    await current;
+    try {
+      return await action();
+    } finally {
+      release();
+      if (this.localLocks.get(key) === chained) {
+        this.localLocks.delete(key);
+      }
+    }
+  }
+
+  async sendMessage(chatId, text, extra = {}) {
+    return this.callTelegram('sendMessage', chatId, text, extra);
+  }
+
+  async callTelegram(method, ...args) {
+    return withRetry(
+      () => this.bot.api[method](...args),
+      {
+        retries: 2,
+        delayMs: 400,
+        shouldRetry: isRetryableHttpError,
+      },
+    );
+  }
+}
+
+export default SalonBotService;
+

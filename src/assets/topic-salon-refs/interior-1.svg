@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 1600">
+  <rect width="1200" height="1600" fill="#efefed"/>
+  <rect x="0" y="0" width="1200" height="1180" fill="#ece9e5"/>
+  <rect x="0" y="1180" width="1200" height="420" fill="#d7d4cf"/>
+  <path d="M0 1180h1200v420H0z" fill="url(#floor)"/>
+  <rect x="70" y="240" width="390" height="780" rx="10" fill="#f7f7f6" stroke="#d6d3ce" stroke-width="10"/>
+  <path d="M470 210c110 130 175 310 195 535H470z" fill="#ded9d2"/>
+  <rect x="120" y="820" width="250" height="250" rx="40" fill="#191919"/>
+  <rect x="70" y="860" width="110" height="220" rx="26" fill="#f7f7f5" stroke="#d9d7d2" stroke-width="8"/>
+  <rect x="760" y="980" width="250" height="70" rx="8" fill="#fbfbfa"/>
+  <rect x="740" y="1040" width="320" height="35" rx="6" fill="#fdfdfc"/>
+  <rect x="825" y="1075" width="155" height="290" rx="10" fill="#1c1c1c"/>
+  <rect x="710" y="980" width="36" height="90" rx="12" fill="#d5d5d5"/>
+  <rect x="1010" y="980" width="36" height="90" rx="12" fill="#d5d5d5"/>
+  <rect x="870" y="968" width="110" height="22" rx="11" fill="#f2f2f1"/>
+  <rect x="560" y="1040" width="86" height="250" rx="6" fill="#ffffff" stroke="#d9d9d9" stroke-width="6"/>
+  <rect x="575" y="1080" width="54" height="18" rx="6" fill="#c9c9c9"/>
+  <rect x="575" y="1180" width="54" height="18" rx="6" fill="#c9c9c9"/>
+  <rect x="575" y="1280" width="54" height="18" rx="6" fill="#c9c9c9"/>
+  <polygon points="603,960 655,1080 545,1080" fill="#2f5d39"/>
+  <polygon points="603,980 647,1070 559,1070" fill="#3f7a49"/>
+  <rect x="586" y="1070" width="34" height="18" rx="4" fill="#866548"/>
+  <rect x="1085" y="1100" width="80" height="150" rx="10" fill="#202020"/>
+  <circle cx="940" cy="140" r="28" fill="#ffffff"/>
+  <circle cx="1035" cy="230" r="24" fill="#ffffff"/>
+  <circle cx="170" cy="260" r="22" fill="#ffffff"/>
+  <rect x="825" y="415" width="155" height="200" rx="8" fill="#84746d"/>
+  <rect x="840" y="430" width="55" height="170" fill="#51616c"/>
+  <rect x="900" y="430" width="65" height="170" fill="#8a7a56"/>
+  <rect x="65" y="0" width="32" height="1600" fill="#ded9d2"/>
+  <defs>
+    <pattern id="floor" width="130" height="130" patternUnits="userSpaceOnUse">
+      <rect width="130" height="130" fill="#e9e7e3"/>
+      <rect width="65" height="65" fill="#808387"/>
+      <rect x="65" y="65" width="65" height="65" fill="#808387"/>
+    </pattern>
+  </defs>
+</svg>

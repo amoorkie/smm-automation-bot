@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 1600">
+  <rect width="1200" height="1600" fill="#f1f0ee"/>
+  <rect x="0" y="0" width="1200" height="1140" fill="#eceae6"/>
+  <path d="M0 1140h1200v460H0z" fill="url(#floor)"/>
+  <rect x="160" y="220" width="360" height="500" rx="12" fill="#f9f9f8"/>
+  <rect x="180" y="250" width="145" height="435" fill="#d8e2ea"/>
+  <rect x="350" y="250" width="145" height="435" fill="#d7e0e7"/>
+  <path d="M338 250h14v435h-14z" fill="#fbfbfa"/>
+  <path d="M190 330c25-55 40-105 65-170M220 340c35-70 60-125 85-195M390 330c40-75 70-135 102-210M420 350c55-90 85-155 120-235" stroke="#bac8d1" stroke-width="8" opacity=".55"/>
+  <rect x="95" y="870" width="90" height="260" rx="10" fill="#141414"/>
+  <rect x="160" y="820" width="40" height="360" rx="10" fill="#d9dad8"/>
+  <rect x="930" y="280" width="180" height="870" rx="16" fill="#f8f8f7" stroke="#d7d4cf" stroke-width="10"/>
+  <rect x="900" y="280" width="32" height="870" fill="#dedbd6"/>
+  <rect x="740" y="360" width="170" height="280" rx="18" fill="#191919"/>
+  <rect x="720" y="600" width="210" height="110" rx="40" fill="#161616"/>
+  <ellipse cx="825" cy="780" rx="90" ry="38" fill="#d8d8d8"/>
+  <rect x="495" y="410" width="170" height="280" rx="18" fill="#181818"/>
+  <rect x="470" y="648" width="220" height="118" rx="45" fill="#151515"/>
+  <ellipse cx="580" cy="836" rx="94" ry="40" fill="#d8d8d8"/>
+  <rect x="570" y="410" width="10" height="430" fill="#cacaca"/>
+  <rect x="810" y="360" width="10" height="420" fill="#cacaca"/>
+  <rect x="580" y="670" width="80" height="18" rx="8" fill="#f4f4f3"/>
+  <rect x="812" y="616" width="74" height="18" rx="8" fill="#f4f4f3"/>
+  <rect x="580" y="998" width="190" height="26" rx="6" fill="#1d1d1d"/>
+  <rect x="540" y="1024" width="250" height="36" rx="8" fill="#fefefd"/>
+  <rect x="965" y="1000" width="115" height="22" rx="6" fill="#1e1e1e"/>
+  <ellipse cx="1022" cy="690" rx="70" ry="60" fill="#2a2a2a"/>
+  <rect x="1010" y="760" width="24" height="90" rx="12" fill="#515151"/>
+  <rect x="316" y="710" width="30" height="180" fill="#ffffff"/>
+  <rect x="280" y="880" width="100" height="26" rx="6" fill="#f1f1ef"/>
+  <path d="M235 210c10 55 10 540 0 590M260 210c15 45 15 540 0 590M285 210c15 45 15 540 0 590M310 210c15 45 15 540 0 590M335 210c15 45 15 540 0 590M360 210c15 45 15 540 0 590M385 210c15 45 15 540 0 590M410 210c15 45 15 540 0 590M435 210c15 45 15 540 0 590" stroke="#f6f5f3" stroke-width="4" opacity=".72"/>
+  <circle cx="190" cy="100" r="24" fill="#ffffff"/>
+  <circle cx="420" cy="86" r="22" fill="#ffffff"/>
+  <circle cx="825" cy="115" r="24" fill="#ffffff"/>
+  <defs>
+    <pattern id="floor" width="120" height="120" patternUnits="userSpaceOnUse">
+      <rect width="120" height="120" fill="#ebe8e3"/>
+      <rect width="60" height="60" fill="#8f9296"/>
+      <rect x="60" y="60" width="60" height="60" fill="#8f9296"/>
+    </pattern>
+  </defs>
+</svg>

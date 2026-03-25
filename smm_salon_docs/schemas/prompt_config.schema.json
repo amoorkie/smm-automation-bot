@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PromptConfig",
+  "type": "object",
+  "required": [
+    "prompt_key",
+    "version",
+    "status",
+    "content"
+  ],
+  "properties": {
+    "prompt_key": {
+      "type": "string",
+      "enum": [
+        "work_image_enhancement_master",
+        "work_image_enhancement_short",
+        "work_image_reframe_master",
+        "work_collage_generation",
+        "work_image_enhancement_negative",
+        "work_caption_generation",
+        "topic_post_generation",
+        "topic_image_generation",
+        "help_message",
+        "contact_block"
+      ]
+    },
+    "version": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "active",
+        "inactive",
+        "draft"
+      ]
+    },
+    "model_id_override": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "temperature": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "content": {
+      "type": "string"
+    },
+    "notes": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false
+}

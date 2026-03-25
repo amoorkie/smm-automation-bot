@@ -1,0 +1,174 @@
+# Bot Service Bootstrap
+
+## 1. Required services
+
+- Telegram bot token
+- OpenRouter API key
+- Supabase project
+- Vercel project
+- внешний scheduler, если нужны вызовы cron endpoints вне ручного запуска
+
+## 2. Supabase setup
+
+1. Открой проект в Supabase.
+2. Перейди в `SQL Editor`.
+3. Создай новый query.
+4. Вставь содержимое [schema.sql](/A:/ANITA-BOT/supabase/schema.sql).
+5. Нажми `Run`.
+
+После этого должны существовать таблицы:
+
+- `expert_topics`
+- `story_topics`
+- `creative_ideas`
+- `slider_topics`
+- `content_queue`
+- `prompt_templates`
+- `publish_log`
+- `bot_logs`
+- `tg_sessions`
+- `work_collections`
+- `callback_tokens`
+- `idempotency_keys`
+- `publish_locks`
+- `job_runtime_cache`
+
+## 3. Prompt templates
+
+Бот умеет стартовать без заполненной `prompt_templates`, потому что в коде есть embedded defaults.
+Рекомендуемый current seed покрывает такие ключи:
+
+- `help_message`
+- `contact_block`
+- `work_album_consistency_extraction`
+- `work_image_enhancement_master`
+- `work_image_enhancement_short`
+- `work_image_enhancement_negative`
+- `work_image_reframe_master`
+- `work_collage_generation`
+- `work_caption_generation`
+- `topic_post_generation`
+- `topic_image_generation`
+- `story_manifest_generation`
+- `story_visual_generation`
+- `creative_manifest_generation`
+- `creative_visual_generation`
+- `slider_manifest_generation`
+- `slider_visual_generation`
+
+Reference seed лежит в [prompt_config_seed_sample.csv](/A:/ANITA-BOT/smm_salon_docs/samples/prompt_config_seed_sample.csv).
+
+## 4. Local env
+
+Используй [`.env`](/A:/ANITA-BOT/.env) или [`.env.example`](/A:/ANITA-BOT/smm_salon_docs/config/.env.example).
+
+Обязательные значения:
+
+- `TG_BOT_TOKEN`
+- `OPENROUTER_API_KEY`
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
+- `IMAGE_MODEL_ID`
+- `TEXT_MODEL_ID`
+
+Опциональные:
+
+- `APP_TIMEZONE`
+- `OWNER_CHAT_ID`
+- `BOT_DISABLED`
+- `WEBHOOK_BASE_URL`
+- `PORT`
+
+Примечания:
+
+- `APP_TIMEZONE` по умолчанию: `Europe/Moscow`
+- `PORT` по умолчанию: `3000`
+- на Vercel `WEBHOOK_BASE_URL` можно не задавать вручную, если доступен `VERCEL_URL`
+- contact block задается через `prompt_templates.contact_block`, а не через env
+
+## 5. Vercel env
+
+В Vercel Project Settings -> Environment Variables добавь:
+
+- `TG_BOT_TOKEN`
+- `OPENROUTER_API_KEY`
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
+- `IMAGE_MODEL_ID`
+- `TEXT_MODEL_ID`
+
+При необходимости:
+
+- `APP_TIMEZONE`
+- `OWNER_CHAT_ID`
+- `BOT_DISABLED`
+- `WEBHOOK_BASE_URL`
+
+## 6. Deploy
+
+После настройки env:
+
+1. Задеплой сервис на Vercel.
+2. Проверь `GET /api/readyz`.
+3. Проверь `GET /api/healthz`.
+4. Выставь Telegram webhook на:
+   - `/api/telegram/webhook`
+
+## 7. HTTP endpoints
+
+### Public
+
+- `GET /api/healthz`
+- `GET /api/readyz`
+- `POST /api/telegram/webhook`
+
+### Internal/worker
+
+- `GET /api/cron/finalize`
+- `GET /api/cron/cleanup`
+- `POST /api/worker/telegram-update`
+- `POST /api/worker/runtime-action`
+
+Worker endpoints требуют `x-anita-worker-token`.
+
+## 8. Scheduler notes
+
+Текущий runtime не использует `/api/cron/deliver`.
+Если нужен автоматический finalize/cleanup вне ручного запуска, внешний scheduler может дергать:
+
+- `/api/cron/finalize`
+- `/api/cron/cleanup`
+
+## 9. Smoke test
+
+Проверь:
+
+1. `/help`
+2. `/work` + 1 фото
+3. `/work` + 2-3 фото одним альбомом
+4. выбор `collage` и `separate` после `/work`
+5. `/topic`
+6. `/stories`
+7. `/creative`
+8. `/slider`
+9. revision actions:
+   - `version_prev`
+   - `version_next`
+   - `regenerate_images`
+   - `regenerate_text`
+   - `regenerate_all`
+   - `cancel`
+10. `publish_confirm` для topic-like preview
+
+## 10. Logs
+
+Пользовательских `/logs` команд больше нет.
+
+Операционные логи:
+
+- primary sink:
+  - structured stdout/stderr logs на Vercel
+- secondary sink:
+  - `bot_logs` в Supabase
+
+Reference columns лежат в [bot_logs_header.csv](/A:/ANITA-BOT/smm_salon_docs/samples/bot_logs_header.csv).

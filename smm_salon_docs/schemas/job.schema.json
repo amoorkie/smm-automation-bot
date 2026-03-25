@@ -1,0 +1,130 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Job",
+  "type": "object",
+  "required": [
+    "job_id",
+    "job_type",
+    "status",
+    "revision",
+    "created_at",
+    "source_channel",
+    "chat_id",
+    "user_id"
+  ],
+  "properties": {
+    "job_id": {
+      "type": "string"
+    },
+    "job_type": {
+      "type": "string",
+      "enum": [
+        "work",
+        "topic"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "collecting",
+        "generating",
+        "preview_ready",
+        "cancelled",
+        "failed"
+      ]
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "source_channel": {
+      "type": "string",
+      "enum": [
+        "telegram"
+      ]
+    },
+    "chat_id": {
+      "type": "string"
+    },
+    "user_id": {
+      "type": "string"
+    },
+    "collection_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "topic_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "caption_text": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "collage_asset_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "asset_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 0,
+      "maxItems": 10
+    },
+    "preview_message_ids": {
+      "type": "object",
+      "properties": {
+        "collage_message_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "assets_message_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "text_message_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "last_error_code": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "last_error_message": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false
+}

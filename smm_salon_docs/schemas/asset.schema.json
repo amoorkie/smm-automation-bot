@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Asset",
+  "type": "object",
+  "required": [
+    "asset_id",
+    "job_id",
+    "revision",
+    "asset_type",
+    "storage",
+    "created_at"
+  ],
+  "properties": {
+    "asset_id": {
+      "type": "string"
+    },
+    "job_id": {
+      "type": "string"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "asset_type": {
+      "type": "string",
+      "enum": [
+        "original",
+        "enhanced",
+        "collage",
+        "topic_image",
+        "preview_thumb",
+        "failed_source"
+      ]
+    },
+    "source_index": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 3
+    },
+    "mime_type": {
+      "type": "string"
+    },
+    "storage": {
+      "type": "object",
+      "required": [
+        "provider",
+        "telegram_file_id"
+      ],
+      "properties": {
+        "provider": {
+          "type": "string",
+          "enum": [
+            "telegram"
+          ]
+        },
+        "telegram_file_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "width": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "height": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "superseded": {
+      "type": "boolean",
+      "default": false
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false
+}

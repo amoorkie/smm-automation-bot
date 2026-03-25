@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PublishResult",
+  "type": "object",
+  "required": [
+    "publish_id",
+    "job_id",
+    "channel",
+    "status",
+    "attempt_no",
+    "created_at"
+  ],
+  "properties": {
+    "publish_id": {
+      "type": "string"
+    },
+    "job_id": {
+      "type": "string"
+    },
+    "queue_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "channel": {
+      "type": "string",
+      "enum": [
+        "vk"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "success",
+        "failed",
+        "skipped"
+      ]
+    },
+    "attempt_no": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "vk_owner_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "vk_post_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "vk_attachment_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "provider_error_code": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "provider_error_message": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "raw_response_ref": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false
+}

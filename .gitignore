@@ -1,0 +1,16 @@
+node_modules/
+.env
+data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+coverage/
+dist/
+*.log
+generated/
+
+.vercel
+.serena/
+memory_bank/
+.tmp_topics.xlsx
+tmp_story_manifest_prompt.txt
