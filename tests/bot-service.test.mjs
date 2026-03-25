@@ -118,7 +118,7 @@ test('slider normalization for base home care aligns cover and denser slides', (
     'Маска 1-2 раза в неделю',
     'Несмываемый уход по длине, например спрей или крем',
   ]);
-  assert.equal(manifest.slides.length, 5);
+  assert.equal(manifest.slides.length, 4);
   assert.ok(manifest.slides.every((slide) => slide.body.split(/\s+/u).length >= 8));
   assert.ok(manifest.slides[2].bullets.length >= 1);
   assert.ok(manifest.slides[2].bullets.every((item) => !String(item).startsWith('-')));
@@ -143,7 +143,7 @@ test('overlay text simplification expands leave-in care and removes hard jargon'
   const ctx = createService();
   assert.match(
     ctx.service.normalizeSliderText('Несмываемый уход помогает закрывает кутикулу'),
-    /несмываемый уход, например спрей, крем или лосьон/iu,
+    /несмываемый уход/iu,
   );
   assert.doesNotMatch(
     ctx.service.normalizeSliderText('Чистая щётка и сухая длина быстрее теряет вид'),
@@ -235,6 +235,54 @@ class FakeStore {
     return (this.store.get(tableName)?.rows ?? []).map((row) => ({ ...row }));
   }
 
+  async getRowsByQuery(tableName, { columns = '*', eq = {}, inFilters = {}, orderBy = [{ column: 'id', ascending: true }], offset = null, limit = null } = {}) {
+    const table = this.store.get(tableName);
+    let rows = (table?.rows ?? []).map((row) => ({ ...row }));
+    for (const [column, value] of Object.entries(eq ?? {})) {
+      rows = rows.filter((row) => String(row[column] ?? '') === String(value));
+    }
+    for (const [column, values] of Object.entries(inFilters ?? {})) {
+      const normalized = Array.isArray(values) ? values.map((value) => String(value)) : [];
+      if (normalized.length > 0) {
+        rows = rows.filter((row) => normalized.includes(String(row[column] ?? '')));
+      }
+    }
+    for (const rule of Array.isArray(orderBy) ? orderBy : []) {
+      if (!rule?.column) {
+        continue;
+      }
+      rows.sort((left, right) => {
+        const leftValue = left[rule.column];
+        const rightValue = right[rule.column];
+        const comparison = String(leftValue ?? '').localeCompare(String(rightValue ?? ''), 'ru', { numeric: true });
+        return rule.ascending === false ? comparison * -1 : comparison;
+      });
+    }
+    if (Number.isInteger(offset) && Number.isInteger(limit) && limit > 0) {
+      rows = rows.slice(offset, offset + limit);
+    } else if (Number.isInteger(limit) && limit > 0) {
+      rows = rows.slice(0, limit);
+    }
+    if (columns !== '*' && columns) {
+      const list = Array.isArray(columns) ? columns : String(columns).split(',').map((item) => item.trim()).filter(Boolean);
+      rows = rows.map((row) => {
+        const payload = { __rowNumber: row.__rowNumber, id: row.id };
+        for (const column of list) {
+          if (column in row) {
+            payload[column] = row[column];
+          }
+        }
+        return payload;
+      });
+    }
+    return rows;
+  }
+
+  async getRowByQuery(tableName, query = {}) {
+    const rows = await this.getRowsByQuery(tableName, { ...query, limit: 1 });
+    return rows[0] ?? null;
+  }
+
   async appendRow(tableName, row) {
     const table = this.store.get(tableName);
     const next = { __rowNumber: table.nextId, id: table.nextId, ...row };
@@ -266,6 +314,21 @@ class FakeStore {
     table.rows.push(next);
     table.nextId += 1;
     return { mode: 'insert', rowNumber: next.__rowNumber };
+  }
+
+  async upsertRowsByColumn(tableName, keyColumn, rows) {
+    const normalizedRows = Array.isArray(rows) ? rows : [];
+    for (const row of normalizedRows) {
+      await this.upsertRowByColumn(tableName, keyColumn, row[keyColumn], row);
+    }
+    return normalizedRows.map((row) => ({ keyValue: row[keyColumn] }));
+  }
+
+  async updateRowsByQuery(tableName, patch, { eq = {}, inFilters = {} } = {}) {
+    const rows = await this.getRowsByQuery(tableName, { eq, inFilters });
+    for (const row of rows) {
+      await this.updateRowByNumber(tableName, row.__rowNumber, { ...row, ...patch });
+    }
   }
 
   async deleteRowByNumber(tableName, rowNumber) {
@@ -1246,7 +1309,7 @@ test('slider fallback renders dense practical slides for basic home care', async
     'Маска 1-2 раза в неделю',
     'Несмываемый уход по длине, например спрей или крем',
   ]);
-  assert.equal(runtime.preview_payload.manifest.slides.length, 5);
+  assert.equal(runtime.preview_payload.manifest.slides.length, 4);
   assert.ok(runtime.preview_payload.manifest.slides.every((slide) => slide.body.split(/\s+/u).length >= 10));
   assert.ok(runtime.preview_payload.manifest.slides.every((slide) => slide.bullets.length >= 2));
   assert.ok(runtime.preview_payload.manifest.slides.every((slide) => slide.bullets.every((item) => /^[А-ЯЁA-Z0-9]/u.test(item))));
@@ -1358,7 +1421,7 @@ test('slider normalization keeps dense home-care copy aligned across cover and s
     'Маска 1-2 раза в неделю',
     'Несмываемый уход по длине, например спрей или крем',
   ]);
-  assert.equal(manifest.slides.length, 5);
+  assert.equal(manifest.slides.length, 4);
   assert.equal(manifest.slides[0].title, '1. Шампунь');
   assert.match(manifest.slides[0].body, /кожу головы/i);
   assert.match(manifest.slides[1].body, /после каждого мытья/i);

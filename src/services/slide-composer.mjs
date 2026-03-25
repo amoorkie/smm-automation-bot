@@ -448,9 +448,9 @@ function buildSlideTree({ mode, backgroundUrl, eyebrow = '', title = '', bodyPar
   ].filter(Boolean));
 }
 
-async function renderSlide({ mode, backgroundAsset, backgroundStyle = 'light_blur', eyebrow, title, body = '', bullets = [], footer = '', page = null }) {
+async function renderSlide({ mode, backgroundAsset, preparedBackground = null, backgroundStyle = 'light_blur', eyebrow, title, body = '', bullets = [], footer = '', page = null }) {
   const style = getModeStyle(mode);
-  const background = await buildBackground(backgroundAsset, mode, backgroundStyle);
+  const background = preparedBackground ?? await buildBackground(backgroundAsset, mode, backgroundStyle);
   const bodyParagraphs = String(body ?? '')
     .split(/\n{2,}|\r\n\r\n/gu)
     .map((item) => item.trim())
@@ -519,9 +519,11 @@ export async function composeCreativeSlide({ backgroundAsset = null, manifest = 
 export async function composeSliderSlides({ backgroundAsset = null, manifest = {}, backgroundStyle = 'light_blur' } = {}) {
   const slides = [];
   const coverTitle = manifest.coverTitle ?? manifest.title ?? '';
+  const preparedBackground = await buildBackground(backgroundAsset, 'slider', backgroundStyle);
   slides.push(await renderSlide({
     mode: 'slider',
     backgroundAsset,
+    preparedBackground,
     backgroundStyle,
     eyebrow: manifest.eyebrow ?? '',
     title: coverTitle,
@@ -536,6 +538,7 @@ export async function composeSliderSlides({ backgroundAsset = null, manifest = {
     slides.push(await renderSlide({
       mode: 'slider',
       backgroundAsset,
+      preparedBackground,
       backgroundStyle,
       eyebrow: slide.eyebrow ?? `Шаг ${index + 1}`,
       title: slide.title ?? '',

@@ -322,13 +322,49 @@ export class SalonBotService {
     return this.getTopicLikeModeConfig(jobType)?.sourceSheetName ?? null;
   }
 
+  async getSourceRowByTopicId(sheetName, topicId) {
+    if (!sheetName || !topicId) {
+      return null;
+    }
+    if (typeof this.store.getRowByQuery === 'function') {
+      return this.store.getRowByQuery(sheetName, {
+        eq: { topic_id: topicId },
+      });
+    }
+    const rows = await this.store.getRows(sheetName);
+    return rows.find((item) => item.topic_id === topicId) ?? null;
+  }
+
+  async getQueueRowByJobId(jobId) {
+    if (!jobId) {
+      return null;
+    }
+    if (typeof this.repos.getQueueRowByJobId === 'function') {
+      return this.repos.getQueueRowByJobId(jobId);
+    }
+    if (typeof this.store.getRowByQuery === 'function') {
+      return this.store.getRowByQuery(SHEET_NAMES.contentQueue, {
+        eq: { job_id: jobId },
+      });
+    }
+    const rows = await this.store.getRows(SHEET_NAMES.contentQueue);
+    return rows.find((row) => row.job_id === jobId) ?? null;
+  }
+
+  logDurationBestEffort(entry, startedAt, payload = null) {
+    this.logEventBestEffort({
+      ...entry,
+      durationMs: Math.max(0, Date.now() - startedAt),
+      ...(payload ? { payload } : {}),
+    });
+  }
+
   async ensureSourceRowReserved(sheetName, topicId, jobId) {
     if (!sheetName || !topicId || !jobId) {
       return;
     }
 
-    const rows = await this.store.getRows(sheetName);
-    const row = rows.find((item) => item.topic_id === topicId);
+    const row = await this.getSourceRowByTopicId(sheetName, topicId);
     if (!row || String(row.status ?? '').toLowerCase() === 'published') {
       return;
     }
@@ -537,7 +573,7 @@ export class SalonBotService {
       }
 
       const words = value.split(/\s+/u);
-      const titleCaseWords = words.filter((word) => /^[А-ЯЁ][а-яё-]+$/u.test(word)).length;
+      const titleCaseWords = words.filter((word) => /^[«"(\[]*[А-ЯЁ][а-яё-]+[.,!?)]*$/u.test(word)).length;
       const looksLikeTitleCase = words.length >= 2 && titleCaseWords >= Math.max(2, Math.ceil(words.length * 0.6));
 
       if (!looksLikeTitleCase) {
@@ -552,7 +588,7 @@ export class SalonBotService {
           return index === 0 ? this.capitalizeOverlayText(word) : word;
         }
 
-        const lower = word.toLocaleLowerCase('ru-RU');
+        const lower = word.replace(/[А-ЯЁа-яё-]+/gu, (chunk) => chunk.toLocaleLowerCase('ru-RU'));
         return index === 0
           ? lower.replace(/^([«"(\[]*\s*)([а-яё])/u, (_, prefix, letter) => `${prefix}${letter.toUpperCase()}`)
           : lower;
@@ -582,11 +618,6 @@ export class SalonBotService {
       .replace(/длиной/giu, 'волосами')
       .replace(/щётка/giu, 'расчёска')
       .replace(/щетк/giu, 'расческ')
-      .replace(/несмываемый уход/giu, 'несмываемый уход, например спрей, крем или лосьон')
-      .replace(/несмываемого ухода/giu, 'несмываемого ухода, например спрея, крема или лосьона')
-      .replace(/несмываемому уходу/giu, 'несмываемому уходу, например спрею, крему или лосьону')
-      .replace(/несмываемым уходом/giu, 'несмываемым уходом, например спреем, кремом или лосьоном')
-      .replace(/несмываемом уходе/giu, 'несмываемом уходе, например спрее, креме или лосьоне')
         .replace(/закрывает кутикулу/giu, 'сглаживает внешний слой волоса')
         .replace(/закрыть кутикулу/giu, 'сгладить внешний слой волоса')
         .replace(/кутикулу/giu, 'внешний слой волоса')
@@ -599,6 +630,7 @@ export class SalonBotService {
         ['кутикул', 'Кутикула — это внешний слой волоса, который отвечает за гладкость и блеск.'],
         ['полотно', 'Полотно — это основная длина волос, без акцента на корни и концы.'],
         ['детокс-шампун', 'Детокс-шампунь — это более глубоко очищающий шампунь для снятия накоплений ухода и себума.'],
+        ['несмываем', 'Несмываемый уход — это спрей, крем, лосьон или флюид, который оставляют на волосах после мытья.'],
         ['термозащит', 'Термозащита — это средство, которое снижает пересушивание волос от фена и горячих инструментов.'],
       ];
   }
@@ -639,10 +671,7 @@ export class SalonBotService {
         .filter((line) => {
           const lower = line.toLowerCase();
           const glossaryEntry = glossary.find(([needle, explanation]) => lower.includes(needle) || lower === explanation.toLowerCase());
-          if (!glossaryEntry) {
-            return true;
-          }
-          return haystack.includes(glossaryEntry[0]);
+          return glossaryEntry ? haystack.includes(glossaryEntry[0]) : false;
         });
 
       return [...new Set(lines)].join('\n');
@@ -678,12 +707,7 @@ export class SalonBotService {
         return '';
       }
 
-      const filtered = sentences.filter((sentence, index) => {
-        if (!this.looksLikeInlineTermDefinition(sentence)) {
-          return true;
-        }
-        return sentences.length === 1 && index === 0;
-      });
+      const filtered = sentences.filter((sentence) => !this.looksLikeInlineTermDefinition(sentence));
 
       return filtered.join(' ').trim();
   }
@@ -716,8 +740,41 @@ export class SalonBotService {
   normalizeDisplayBody(text = '', { title = '' } = {}) {
       const simplified = this.normalizeSliderText(text);
       const withoutDefinitions = this.removeInlineTermDefinition(simplified);
-      const deduped = this.dedupeRepeatedPhrase(title, withoutDefinitions || simplified);
-      return this.capitalizeOverlayText(deduped || simplified);
+      const base = withoutDefinitions || (this.looksLikeInlineTermDefinition(simplified) ? '' : simplified);
+      const deduped = this.dedupeRepeatedPhrase(title, base);
+      return this.capitalizeOverlayText(deduped || base || '');
+  }
+
+  getSliderSemanticKey(...parts) {
+    const value = this.normalizeCompareText(parts.filter(Boolean).join(' '));
+    if (!value) {
+      return '';
+    }
+    if (/несмываем|спрей|лосьон|флюид|крем\b/u.test(value)) {
+      return 'leave_in';
+    }
+    if (/кондиционер/u.test(value)) {
+      return 'conditioner';
+    }
+    if (/маск/u.test(value)) {
+      return 'mask';
+    }
+    if (/шампун/u.test(value)) {
+      return 'shampoo';
+    }
+    if (/термозащит|фен|утюж|горяч/u.test(value)) {
+      return 'heat_protect';
+    }
+    if (/расчес|расч[eё]сыван/u.test(value)) {
+      return 'combing';
+    }
+    if (/рук|касан|лиц/u.test(value)) {
+      return 'hands_off';
+    }
+    if (/свеж|жирн|чист/u.test(value)) {
+      return 'freshness';
+    }
+    return value.split(/\s+/u).slice(0, 4).join(' ');
   }
 
   normalizeCreativeManifest(manifest, sourceRow) {
@@ -1134,6 +1191,25 @@ export class SalonBotService {
         bullets,
         footer: this.mergeOverlayFooter(this.normalizeSliderText(slide.footer ?? ''), title, body, bullets),
       };
+  }
+
+  normalizeSliderDeckConsistency(sourceRow, deck = {}) {
+    const slides = Array.isArray(deck.slides) ? deck.slides.filter(Boolean) : [];
+    const coverTitle = this.alignSliderCoverCount(deck.coverTitle ?? sourceRow?.title ?? '', slides.length);
+    const coverSubtitle = this.isWeakSliderCopy(deck.coverSubtitle ?? '')
+      ? this.buildSliderCoverSubtitle(sourceRow)
+      : this.normalizeSliderText(deck.coverSubtitle ?? '');
+    const coverBullets = this.buildSliderCoverBullets(sourceRow, slides).slice(0, 4);
+    const footer = this.mergeOverlayFooter(deck.footer ?? '', coverTitle, coverSubtitle, coverBullets);
+
+    return {
+      eyebrow: '',
+      coverTitle,
+      coverSubtitle,
+      coverBullets,
+      slides,
+      footer,
+    };
   }
 
   isWeakSliderSlideTitle(text = '') {
@@ -1798,8 +1874,7 @@ export class SalonBotService {
 
   async reserveSourceRow(sheetName, topicId, reservedBy) {
     await this.reclaimExpiredSourceRows(sheetName);
-    const rows = await this.store.getRows(sheetName);
-    const sourceRow = rows.find((row) => row.topic_id === topicId);
+    const sourceRow = await this.getSourceRowByTopicId(sheetName, topicId);
     if (!sourceRow || String(sourceRow.status).toLowerCase() !== 'ready') {
       return null;
     }
@@ -1821,8 +1896,7 @@ export class SalonBotService {
   }
 
   async releaseSourceRow(sheetName, topicId) {
-    const rows = await this.store.getRows(sheetName);
-    const row = rows.find((item) => item.topic_id === topicId);
+    const row = await this.getSourceRowByTopicId(sheetName, topicId);
     if (!row) {
       return;
     }
@@ -1841,8 +1915,7 @@ export class SalonBotService {
   }
 
   async markSourceRowPublished(sheetName, topicId, jobId) {
-    const rows = await this.store.getRows(sheetName);
-    const row = rows.find((item) => item.topic_id === topicId);
+    const row = await this.getSourceRowByTopicId(sheetName, topicId);
     if (!row) {
       return;
     }
@@ -1863,6 +1936,7 @@ export class SalonBotService {
   }
 
   async openTopicLikePicker(normalized, jobType) {
+    const startedAt = Date.now();
     const config = this.getTopicLikeModeConfig(jobType);
     if (!config) {
       return { ok: false, unknownMode: true };
@@ -1901,6 +1975,16 @@ export class SalonBotService {
       updated_at: nowIso(),
     });
 
+    this.logDurationBestEffort({
+      event: 'picker_opened',
+      stage: 'picker',
+      chatId: normalized.chatId,
+      userId: normalized.userId,
+      sourceType: jobType,
+      status: 'ok',
+      message: `page=1 rows=${readyRows.length}`,
+    }, startedAt, { rowCount: readyRows.length });
+
     return { ok: true, command: config.command, picker: true };
   }
 
@@ -1912,6 +1996,7 @@ export class SalonBotService {
     existingMessageId = null,
     readyRows = null,
   }) {
+    const startedAt = Date.now();
     const config = this.getTopicLikeModeConfig(jobType);
     const rows = Array.isArray(readyRows) ? readyRows : await this.listReadySourceRows(config.sourceSheetName);
     if (rows.length === 0) {
@@ -2015,6 +2100,17 @@ export class SalonBotService {
       messageId = message.message_id;
     }
 
+    this.logDurationBestEffort({
+      event: existingMessageId ? 'picker_page_switched' : 'picker_rendered',
+      stage: 'picker',
+      chatId,
+      userId,
+      jobId: pickerJobId,
+      sourceType: jobType,
+      status: 'ok',
+      message: `page=${safePage + 1}/${totalPages}`,
+    }, startedAt, { rowCount: rows.length, pageRows: pageRows.length });
+
     return {
       messageId,
       tokenSetId,
@@ -2072,14 +2168,32 @@ export class SalonBotService {
     const normalized = Array.isArray(candidateSlides)
       ? candidateSlides
         .filter((slide) => slide && (slide.title || slide.body || (Array.isArray(slide.bullets) && slide.bullets.length > 0)))
-        .map((slide, index) => this.normalizeSliderSlide(slide, sourceRow, index))
+        .map((slide, index) => {
+          const normalizedSlide = this.normalizeSliderSlide(slide, sourceRow, index);
+          return {
+            ...normalizedSlide,
+            _semanticKey: this.getSliderSemanticKey(
+              normalizedSlide.title,
+              normalizedSlide.body,
+              ...(normalizedSlide.bullets ?? []),
+            ),
+          };
+        })
         .filter((slide) => slide.title || slide.body || slide.bullets.length > 0)
       : [];
 
-    const fallbackQueue = this.buildSliderFallbackSlides(sourceRow);
+    const fallbackQueue = this.buildSliderFallbackSlides(sourceRow).map((slide) => ({
+      ...slide,
+      _semanticKey: this.getSliderSemanticKey(slide.title, slide.body, ...(slide.bullets ?? [])),
+    }));
+    const fallbackByKey = new Map(
+      fallbackQueue
+        .filter((slide) => slide._semanticKey)
+        .map((slide) => [slide._semanticKey, slide]),
+    );
 
     const slides = normalized.map((slide, index) => {
-        const fallback = fallbackQueue[index] ?? {};
+        const fallback = fallbackByKey.get(slide._semanticKey) ?? fallbackQueue[index] ?? {};
         const useFallbackTitle = this.isWeakSliderSlideTitle(slide.title);
         const useFallbackBody = this.isWeakSliderSlideBody(slide.body);
         const useFallbackBullets = !Array.isArray(slide.bullets) || slide.bullets.length < 2;
@@ -2091,6 +2205,7 @@ export class SalonBotService {
           title,
           body,
           bullets,
+          _semanticKey: this.getSliderSemanticKey(title, body, ...(bullets ?? [])),
           footer: this.mergeOverlayFooter(slide.footer ?? fallback.footer ?? '', title, body, bullets),
         };
       });
@@ -2099,7 +2214,10 @@ export class SalonBotService {
         if (slides.length >= 5) {
           break;
         }
-        const duplicate = slides.some((slide) => slide.title === candidate.title && slide.body === candidate.body);
+        const duplicate = slides.some((slide) => (
+          (slide._semanticKey && candidate._semanticKey && slide._semanticKey === candidate._semanticKey)
+          || (slide.title === candidate.title && slide.body === candidate.body)
+        ));
         if (!duplicate) {
           slides.push(candidate);
         }
@@ -2111,6 +2229,7 @@ export class SalonBotService {
             ...slide,
             eyebrow: slide.eyebrow || `Шаг ${index + 1}`,
           }))
+          .map(({ _semanticKey, ...slide }) => slide)
           .slice(0, Math.max(2, Math.min(5, slides.length)));
     }
 
@@ -2125,21 +2244,15 @@ export class SalonBotService {
 
       if (jobType === 'slider') {
         const coverSubtitleRaw = String(manifest.coverSubtitle ?? manifest.subtitle ?? manifest.description ?? sourceRow.brief ?? '').trim();
-        const coverBullets = this.normalizeCreativeBullets(manifest.coverBullets ?? manifest.points ?? []);
         const slides = this.buildSliderContentSlides(sourceRow, manifest.slides);
-        const fallbackCoverBullets = this.buildSliderCoverBullets(sourceRow, slides);
-        const finalCoverBullets = fallbackCoverBullets.slice(0, 4);
-        const rawCoverTitle = manifest.coverTitle ?? manifest.title ?? sourceRow.title;
-        const coverTitle = this.alignSliderCoverCount(rawCoverTitle, slides.length);
-        const coverSubtitle = this.isWeakSliderCopy(coverSubtitleRaw) ? this.buildSliderCoverSubtitle(sourceRow) : this.normalizeSliderText(coverSubtitleRaw);
-          return {
-            eyebrow: '',
-            coverTitle,
-            coverSubtitle,
-            coverBullets: finalCoverBullets,
-            slides,
-            footer: this.mergeOverlayFooter(manifest.footer ?? '', coverTitle, coverSubtitle, finalCoverBullets),
-          };
+        return this.normalizeSliderDeckConsistency(sourceRow, {
+          eyebrow: '',
+          coverTitle: manifest.coverTitle ?? manifest.title ?? sourceRow.title,
+          coverSubtitle: coverSubtitleRaw,
+          coverBullets: this.normalizeCreativeBullets(manifest.coverBullets ?? manifest.points ?? []),
+          slides,
+          footer: manifest.footer ?? '',
+        });
         }
 
     return manifest;
@@ -2162,12 +2275,31 @@ export class SalonBotService {
       };
     }
 
+    const visualSummary = jobType === 'creative'
+      ? JSON.stringify({
+        headline: manifest.headline ?? '',
+        subhead: manifest.subhead ?? '',
+        bullets: manifest.bullets ?? [],
+      })
+      : jobType === 'stories'
+        ? JSON.stringify({
+          title: manifest.title ?? '',
+          body: manifest.body ?? '',
+          bullets: manifest.bullets ?? [],
+        })
+        : JSON.stringify({
+          coverTitle: manifest.coverTitle ?? '',
+          coverSubtitle: manifest.coverSubtitle ?? '',
+          coverBullets: manifest.coverBullets ?? [],
+          slideTitles: Array.isArray(manifest.slides) ? manifest.slides.map((slide) => slide?.title ?? '').filter(Boolean) : [],
+        });
+
     const visualPrompt = [
       prompts[config.promptKeys.visual],
       `Title: ${sourceRow.title ?? ''}`,
       `Brief: ${sourceRow.brief ?? ''}`,
       `Tags: ${Array.isArray(sourceRow.tags) ? sourceRow.tags.join(', ') : sourceRow.tags ?? ''}`,
-      `Manifest summary: ${JSON.stringify(manifest)}`,
+      `Manifest summary: ${visualSummary}`,
     ].join('\n');
 
     const imageResult = await this.openrouter.generateImages({
@@ -2307,6 +2439,7 @@ export class SalonBotService {
     });
 
     await this.sendProgress(normalized.chatId, USER_MESSAGES.topicGeneratingImages);
+    const visualStartedAt = Date.now();
     const { assets: previewAssets, finalRenderMode, captionText } = await this.generateTopicLikeVisualAssets({
       jobType,
       prompts,
@@ -2315,6 +2448,17 @@ export class SalonBotService {
       revision: 1,
       jobId,
     });
+    this.logDurationBestEffort({
+      event: 'topic_like_visual_ready',
+      stage: 'processing',
+      chatId: normalized.chatId,
+      userId: normalized.userId,
+      jobId,
+      queueId,
+      sourceType: jobType,
+      status: 'ok',
+      message: sourceRow.title,
+    }, visualStartedAt, { assetCount: previewAssets.length, renderMode: finalRenderMode });
 
     const revision = 1;
     const basePayload = {
@@ -2648,6 +2792,7 @@ export class SalonBotService {
   }
 
   async handleTopicPickerCallback({ normalized, action, tokenRow }) {
+    const callbackStartedAt = Date.now();
     const pickerJobType = tokenRow.payload?.pickerJobType;
     const sessionId = this.getPickerSessionId(normalized.chatId, pickerJobType);
     const session = await this.repos.getSessionById(sessionId);
@@ -2697,11 +2842,22 @@ export class SalonBotService {
         expires_at: addMinutes(new Date(), TOPIC_LIKE_PICKER_TTL_MINUTES),
         updated_at: nowIso(),
       });
+      this.logDurationBestEffort({
+        event: 'picker_page_switched',
+        stage: 'picker',
+        chatId: normalized.chatId,
+        userId: normalized.userId,
+        jobId: picker.jobId,
+        sourceType: pickerJobType,
+        status: 'ok',
+        message: `page=${picker.page + 1}`,
+      }, callbackStartedAt, { page: picker.page, rowCount: snapshotRows.length });
       return { ok: true, pickerPage: picker.page };
     }
 
     const config = this.getTopicLikeModeConfig(pickerJobType);
     await this.answerCallback(normalized.callbackQueryId, 'Беру эту тему.');
+    const reserveStartedAt = Date.now();
     const sourceRow = await this.reserveSourceRow(config.sourceSheetName, tokenRow.payload?.topicId, `telegram:${normalized.chatId}`);
     if (!sourceRow) {
       await this.answerCallback(normalized.callbackQueryId, 'Эта тема уже занята. Выбери другую.');
@@ -2732,8 +2888,27 @@ export class SalonBotService {
         expires_at: addMinutes(new Date(), TOPIC_LIKE_PICKER_TTL_MINUTES),
         updated_at: nowIso(),
       });
+      this.logDurationBestEffort({
+        event: 'source_reserve_conflict',
+        stage: 'picker',
+        chatId: normalized.chatId,
+        userId: normalized.userId,
+        sourceType: pickerJobType,
+        status: 'conflict',
+        message: tokenRow.payload?.topicId ?? '',
+      }, reserveStartedAt, { rowCount: refreshedRows.length });
       return { ok: false, alreadyReserved: true };
     }
+
+    this.logDurationBestEffort({
+      event: 'source_reserved',
+      stage: 'picker',
+      chatId: normalized.chatId,
+      userId: normalized.userId,
+      sourceType: pickerJobType,
+      status: 'ok',
+      message: sourceRow.topic_id,
+    }, reserveStartedAt);
 
     await this.repos.supersedeTokenSet(tokenRow.token_set_id, nowIso());
     await this.repos.deleteSession(sessionId);
@@ -2965,6 +3140,7 @@ export class SalonBotService {
   }
 
   async changeViewedRevision(runtime, direction) {
+    const startedAt = Date.now();
     const payload = runtime.draft_payload ?? runtime.preview_payload;
     const history = this.getRevisionHistory(payload);
     if (history.length === 0) {
@@ -3041,6 +3217,7 @@ export class SalonBotService {
       sourceType: runtime.job_type,
       status: 'ok',
       message: `view=${nextRevision.revision}/${history.length}`,
+      durationMs: Date.now() - startedAt,
     });
     return { ok: true, revision: nextRevision.revision };
   }
@@ -3860,8 +4037,7 @@ export class SalonBotService {
       payload.captionText = topicLikeVisual.captionText;
     }
 
-    const queueRows = await this.store.getRows(SHEET_NAMES.contentQueue);
-    const queueRow = queueRows.find((row) => row.job_id === jobId);
+    const queueRow = await this.getQueueRowByJobId(jobId);
     if (!queueRow) {
       throw new Error(`Queue row not found for ${jobId}`);
     }
@@ -3974,8 +4150,8 @@ export class SalonBotService {
   }
 
   async markDraftPublished(runtime) {
-    const queueRows = await this.store.getRows(SHEET_NAMES.contentQueue);
-    const queueRow = queueRows.find((row) => row.job_id === runtime.job_id);
+    const startedAt = Date.now();
+    const queueRow = await this.getQueueRowByJobId(runtime.job_id);
     if (queueRow) {
       await this.store.updateRowByNumber(
         SHEET_NAMES.contentQueue,
@@ -4014,14 +4190,25 @@ export class SalonBotService {
       updated_at: nowIso(),
     });
 
+    this.logDurationBestEffort({
+      event: 'publish_confirmed',
+      stage: 'publish',
+      chatId: runtime.chat_id,
+      userId: runtime.user_id,
+      jobId: runtime.job_id,
+      queueId: queueRow?.queue_id ?? '',
+      collectionId: runtime.collection_id ?? '',
+      sourceType: runtime.job_type,
+      status: 'ok',
+      message: runtime.topic_id ?? runtime.job_id,
+    }, startedAt);
     await this.sendMessage(runtime.chat_id, 'Отметила материал как опубликованный.');
     return { ok: true, published: true };
   }
 
   async cancelDraft(jobId) {
     const runtime = await this.repos.getRuntime(jobId);
-    const queueRows = await this.store.getRows(SHEET_NAMES.contentQueue);
-    const queueRow = queueRows.find((row) => row.job_id === jobId);
+    const queueRow = await this.getQueueRowByJobId(jobId);
     if (queueRow) {
       await this.store.updateRowByNumber(
         SHEET_NAMES.contentQueue,

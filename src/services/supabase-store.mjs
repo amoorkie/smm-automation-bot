@@ -18,6 +18,10 @@ function normalizeColumns(columns = '*') {
   return list.includes('id') ? list.join(',') : ['id', ...list].join(',');
 }
 
+function normalizeOrderBy(orderBy) {
+  return Array.isArray(orderBy) ? orderBy : [];
+}
+
 function selectPayload(row, columns = []) {
   if (!columns || columns.length === 0) {
     const { __rowNumber, id, ...rest } = row ?? {};
@@ -100,7 +104,7 @@ export class SupabaseStoreService {
       }
     }
 
-    for (const rule of Array.isArray(orderBy) ? orderBy : []) {
+    for (const rule of normalizeOrderBy(orderBy)) {
       if (rule?.column) {
         query = query.order(rule.column, { ascending: rule.ascending !== false });
       }
@@ -115,6 +119,14 @@ export class SupabaseStoreService {
     const { data, error } = await query;
     assertNoError(error, `Failed to query rows from ${tableName}`);
     return (data ?? []).map(normalizeRow);
+  }
+
+  async getRowByQuery(tableName, queryOptions = {}) {
+    const rows = await this.getRowsByQuery(tableName, {
+      ...queryOptions,
+      limit: 1,
+    });
+    return rows[0] ?? null;
   }
 
   async appendRow(tableName, row, columns) {
@@ -164,6 +176,39 @@ export class SupabaseStoreService {
       .single();
     assertNoError(error, `Failed to insert row in ${tableName}`);
     return { mode: 'insert', rowNumber: data.id };
+  }
+
+  async upsertRowsByColumn(tableName, keyColumn, rows, columns) {
+    const normalizedRows = Array.isArray(rows) ? rows.filter(Boolean) : [];
+    if (normalizedRows.length === 0) {
+      return [];
+    }
+    const payload = normalizedRows.map((row) => selectPayload(row, columns));
+    const { error } = await this.client
+      .from(tableName)
+      .upsert(payload, { onConflict: keyColumn });
+    assertNoError(error, `Failed to bulk upsert rows in ${tableName}`);
+    return normalizedRows.map((row) => ({ keyValue: row[keyColumn] }));
+  }
+
+  async updateRowsByQuery(tableName, patch, { eq = {}, inFilters = {} } = {}) {
+    let query = this.client
+      .from(tableName)
+      .update(patch);
+
+    for (const [column, value] of Object.entries(eq ?? {})) {
+      query = query.eq(column, value);
+    }
+
+    for (const [column, values] of Object.entries(inFilters ?? {})) {
+      const normalizedValues = Array.isArray(values) ? values.filter((value) => value !== undefined && value !== null) : [];
+      if (normalizedValues.length > 0) {
+        query = query.in(column, normalizedValues);
+      }
+    }
+
+    const { error } = await query;
+    assertNoError(error, `Failed to update rows in ${tableName}`);
   }
 
   async deleteRowByNumber(tableName, rowNumber) {

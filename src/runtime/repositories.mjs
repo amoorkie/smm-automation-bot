@@ -94,6 +94,19 @@ function mergeAssets(rowsOrAssets = [], extraAssets = []) {
 }
 
 export function createRepositories(sheets) {
+  const queryMany = async (tableName, options = {}) => (
+    typeof sheets.getRowsByQuery === 'function'
+      ? sheets.getRowsByQuery(tableName, options)
+      : sheets.getRows(tableName)
+  );
+  const queryOne = async (tableName, options = {}) => {
+    if (typeof sheets.getRowByQuery === 'function') {
+      return sheets.getRowByQuery(tableName, options);
+    }
+    const rows = await queryMany(tableName, options);
+    return rows[0] ?? null;
+  };
+
   return {
     async upsertSession(record) {
       await sheets.upsertRowByColumn(
@@ -105,22 +118,23 @@ export function createRepositories(sheets) {
       );
     },
     async getSessionById(sessionId) {
-      const rows = await sheets.getRows(SHEET_NAMES.tgSessions);
-      return rows.find((row) => row.session_id === sessionId) ?? null;
+      return queryOne(SHEET_NAMES.tgSessions, {
+        eq: { session_id: sessionId },
+      });
     },
     async getSessionByChatAndMode(chatId, mode) {
-      const rows = await sheets.getRows(SHEET_NAMES.tgSessions);
-      return rows.find((row) => String(row.chat_id) === String(chatId) && row.mode === mode) ?? null;
+      return queryOne(SHEET_NAMES.tgSessions, {
+        eq: { chat_id: String(chatId), mode },
+      });
     },
     async deleteSession(sessionId) {
-      const rows = await sheets.getRows(SHEET_NAMES.tgSessions);
-      const row = rows.find((item) => item.session_id === sessionId);
+      const row = await this.getSessionById(sessionId);
       if (row) {
         await sheets.deleteRowByNumber(SHEET_NAMES.tgSessions, row.__rowNumber);
       }
     },
     async cleanupSessions(nowIso) {
-      const rows = await sheets.getRows(SHEET_NAMES.tgSessions);
+      const rows = await queryMany(SHEET_NAMES.tgSessions);
       const expired = rows.filter((row) => row.expires_at && row.expires_at <= nowIso);
       await sheets.deleteRowsByNumbers(SHEET_NAMES.tgSessions, expired.map((row) => row.__rowNumber));
       return expired.length;
@@ -136,8 +150,10 @@ export function createRepositories(sheets) {
       );
     },
     async updateCollection(record) {
-      const rows = await sheets.getRows(SHEET_NAMES.workCollections);
-      const existing = rows.filter((row) => row.collection_id === record.collection_id).at(-1);
+      const existing = await queryOne(SHEET_NAMES.workCollections, {
+        eq: { collection_id: record.collection_id },
+        orderBy: [{ column: 'id', ascending: false }],
+      });
       if (!existing) {
         throw new Error(`Collection not found: ${record.collection_id}`);
       }
@@ -149,8 +165,10 @@ export function createRepositories(sheets) {
       );
     },
     async getCollectionById(collectionId) {
-      const rows = await sheets.getRows(SHEET_NAMES.workCollections);
-      return mergeCollectionRecords(rows.filter((row) => row.collection_id === collectionId));
+      const rows = await queryMany(SHEET_NAMES.workCollections, {
+        eq: { collection_id: collectionId },
+      });
+      return mergeCollectionRecords(rows);
     },
     async mergeAlbumCollection({
       collectionId,
@@ -164,8 +182,9 @@ export function createRepositories(sheets) {
       debounceDeadlineAt,
       buildDeadlineAt,
     }) {
-      const allRows = await sheets.getRows(SHEET_NAMES.workCollections);
-      const matching = allRows.filter((row) => row.collection_id === collectionId);
+      const matching = await queryMany(SHEET_NAMES.workCollections, {
+        eq: { collection_id: collectionId },
+      });
       const newest = matching.at(-1) ?? null;
       const mergedAssets = mergeAssets(matching, [asset]);
       const deadlineAt = typeof buildDeadlineAt === 'function'
@@ -204,8 +223,9 @@ export function createRepositories(sheets) {
         );
       }
 
-      const refreshed = (await sheets.getRows(SHEET_NAMES.workCollections))
-        .filter((row) => row.collection_id === collectionId);
+      const refreshed = await queryMany(SHEET_NAMES.workCollections, {
+        eq: { collection_id: collectionId },
+      });
       if (refreshed.length > 1) {
         const latest = refreshed.at(-1);
         const dedupedAssets = mergeAssets(refreshed, []);
@@ -229,11 +249,11 @@ export function createRepositories(sheets) {
       return this.getCollectionById(collectionId);
     },
     async getOpenCollectionForChat(chatId) {
-      const rows = await sheets.getRows(SHEET_NAMES.workCollections);
-      const filtered = rows
-        .filter((row) => String(row.chat_id) === String(chatId) && row.status === 'collecting')
-        .sort((left, right) => String(right.updated_at).localeCompare(String(left.updated_at)));
-      return rowToCollection(filtered[0] ?? null);
+      const row = await queryOne(SHEET_NAMES.workCollections, {
+        eq: { chat_id: String(chatId), status: 'collecting' },
+        orderBy: [{ column: 'updated_at', ascending: false }],
+      });
+      return rowToCollection(row);
     },
     async listDueCollections(nowIso) {
       const rows = await sheets.getRows(SHEET_NAMES.workCollections);
@@ -264,6 +284,15 @@ export function createRepositories(sheets) {
     },
 
     async createCallbackTokens(tokenRows) {
+      if (typeof sheets.upsertRowsByColumn === 'function') {
+        await sheets.upsertRowsByColumn(
+          SHEET_NAMES.callbackTokens,
+          'token',
+          tokenRows,
+          SHEET_HEADERS[SHEET_NAMES.callbackTokens],
+        );
+        return;
+      }
       for (const row of tokenRows) {
         await sheets.upsertRowByColumn(
           SHEET_NAMES.callbackTokens,
@@ -275,18 +304,21 @@ export function createRepositories(sheets) {
       }
     },
     async getCallbackToken(token) {
-      const rows = await sheets.getRows(SHEET_NAMES.callbackTokens);
-      return rowToToken(rows.find((row) => row.token === token));
+      return rowToToken(await queryOne(SHEET_NAMES.callbackTokens, {
+        eq: { token },
+      }));
     },
     async listCallbackTokensByTokenSet(tokenSetId) {
-      const rows = await sheets.getRows(SHEET_NAMES.callbackTokens);
+      const rows = await queryMany(SHEET_NAMES.callbackTokens, {
+        eq: { token_set_id: tokenSetId },
+      });
       return rows
-        .filter((row) => row.token_set_id === tokenSetId)
         .map(rowToToken);
     },
     async markCallbackUsed(token, updatedAt) {
-      const rows = await sheets.getRows(SHEET_NAMES.callbackTokens);
-      const row = rows.find((item) => item.token === token);
+      const row = await queryOne(SHEET_NAMES.callbackTokens, {
+        eq: { token },
+      });
       if (!row) {
         return;
       }
@@ -301,9 +333,18 @@ export function createRepositories(sheets) {
       if (!tokenSetId) {
         return;
       }
-      const rows = await sheets.getRows(SHEET_NAMES.callbackTokens);
-      const affected = rows.filter((row) => row.token_set_id === tokenSetId);
-      for (const row of affected) {
+      if (typeof sheets.updateRowsByQuery === 'function') {
+        await sheets.updateRowsByQuery(
+          SHEET_NAMES.callbackTokens,
+          { superseded: 1, updated_at: updatedAt },
+          { eq: { token_set_id: tokenSetId } },
+        );
+        return;
+      }
+      const rows = await queryMany(SHEET_NAMES.callbackTokens, {
+        eq: { token_set_id: tokenSetId },
+      });
+      for (const row of rows) {
         await sheets.updateRowByNumber(
           SHEET_NAMES.callbackTokens,
           row.__rowNumber,
@@ -313,7 +354,7 @@ export function createRepositories(sheets) {
       }
     },
     async cleanupCallbackTokens(nowIso) {
-      const rows = await sheets.getRows(SHEET_NAMES.callbackTokens);
+      const rows = await queryMany(SHEET_NAMES.callbackTokens);
       const expired = rows.filter((row) => row.expires_at <= nowIso);
       await sheets.deleteRowsByNumbers(SHEET_NAMES.callbackTokens, expired.map((row) => row.__rowNumber));
       return expired.length;
@@ -321,8 +362,10 @@ export function createRepositories(sheets) {
 
     async recordIdempotency(scope, payload, nowIso, expiresAt) {
       const idemKey = computeIdempotencyKey(scope, payload);
-      const rows = await sheets.getRows(SHEET_NAMES.idempotencyKeys);
-      if (rows.some((row) => row.idem_key === idemKey)) {
+      const existing = await queryOne(SHEET_NAMES.idempotencyKeys, {
+        eq: { idem_key: idemKey },
+      });
+      if (existing) {
         return { idemKey, inserted: false };
       }
       await sheets.appendRow(
@@ -339,8 +382,9 @@ export function createRepositories(sheets) {
       return { idemKey, inserted: true };
     },
     async hasIdempotency(idemKey) {
-      const rows = await sheets.getRows(SHEET_NAMES.idempotencyKeys);
-      return rows.some((row) => row.idem_key === idemKey);
+      return Boolean(await queryOne(SHEET_NAMES.idempotencyKeys, {
+        eq: { idem_key: idemKey },
+      }));
     },
     async cleanupIdempotency(nowIso) {
       const rows = await sheets.getRows(SHEET_NAMES.idempotencyKeys);
@@ -350,8 +394,9 @@ export function createRepositories(sheets) {
     },
 
     async acquirePublishLock({ lockKey, jobId, queueId, createdAt, expiresAt }) {
-      const rows = await sheets.getRows(SHEET_NAMES.publishLocks);
-      const existing = rows.find((row) => row.lock_key === lockKey);
+      const existing = await queryOne(SHEET_NAMES.publishLocks, {
+        eq: { lock_key: lockKey },
+      });
       if (existing && (!existing.expires_at || existing.expires_at > createdAt)) {
         return false;
       }
@@ -372,14 +417,15 @@ export function createRepositories(sheets) {
       return true;
     },
     async releasePublishLock(lockKey) {
-      const rows = await sheets.getRows(SHEET_NAMES.publishLocks);
-      const row = rows.find((item) => item.lock_key === lockKey);
+      const row = await queryOne(SHEET_NAMES.publishLocks, {
+        eq: { lock_key: lockKey },
+      });
       if (row) {
         await sheets.deleteRowByNumber(SHEET_NAMES.publishLocks, row.__rowNumber);
       }
     },
     async cleanupPublishLocks(nowIso) {
-      const rows = await sheets.getRows(SHEET_NAMES.publishLocks);
+      const rows = await queryMany(SHEET_NAMES.publishLocks);
       const expired = rows.filter((row) => row.expires_at && row.expires_at <= nowIso);
       await sheets.deleteRowsByNumbers(SHEET_NAMES.publishLocks, expired.map((row) => row.__rowNumber));
       return expired.length;
@@ -395,14 +441,27 @@ export function createRepositories(sheets) {
       );
     },
     async getRuntime(jobId) {
-      const rows = await sheets.getRows(SHEET_NAMES.jobRuntimeCache);
-      return rowToRuntime(rows.find((row) => row.job_id === jobId));
+      return rowToRuntime(await queryOne(SHEET_NAMES.jobRuntimeCache, {
+        eq: { job_id: jobId },
+      }));
     },
     async listRuntimesByStatus(status) {
-      const rows = await sheets.getRows(SHEET_NAMES.jobRuntimeCache);
+      const rows = await queryMany(SHEET_NAMES.jobRuntimeCache, {
+        eq: { runtime_status: String(status) },
+      });
       return rows
-        .filter((row) => String(row.runtime_status ?? '') === String(status))
         .map(rowToRuntime);
+    },
+    async getQueueRowByJobId(jobId) {
+      return queryOne(SHEET_NAMES.contentQueue, {
+        eq: { job_id: jobId },
+        orderBy: [{ column: 'id', ascending: false }],
+      });
+    },
+    async getQueueRowByQueueId(queueId) {
+      return queryOne(SHEET_NAMES.contentQueue, {
+        eq: { queue_id: queueId },
+      });
     },
   };
 }

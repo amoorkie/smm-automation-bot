@@ -57,8 +57,12 @@ export class OpenRouterService {
       temperature,
       metadata,
     });
+    const startedAt = Date.now();
     const data = await this.request(payload);
-    return parseOpenRouterTextResponse(data);
+    return {
+      ...parseOpenRouterTextResponse(data),
+      durationMs: Date.now() - startedAt,
+    };
   }
 
   async generateImages({
@@ -75,8 +79,12 @@ export class OpenRouterService {
       imageConfig,
       metadata,
     });
+    const startedAt = Date.now();
     const data = await this.request(payload);
-    return parseOpenRouterImageResponse(data);
+    return {
+      ...parseOpenRouterImageResponse(data),
+      durationMs: Date.now() - startedAt,
+    };
   }
 }
 
