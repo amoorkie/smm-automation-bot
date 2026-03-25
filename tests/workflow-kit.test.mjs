@@ -79,6 +79,18 @@ test('telegram updates normalize commands and callback payloads', () => {
   assert.equal(commandWithBotName.kind, 'command');
   assert.equal(commandWithBotName.command, '/help');
 
+  const startWithPayload = normalizeTelegramUpdate({
+    update_id: 5,
+    message: {
+      message_id: 13,
+      text: '/start@anita_salon_bot deeplink-payload',
+      chat: { id: 100 },
+      from: { id: 200 },
+    },
+  });
+  assert.equal(startWithPayload.kind, 'command');
+  assert.equal(startWithPayload.command, '/start');
+
   const callback = normalizeTelegramUpdate({
     update_id: 2,
     callback_query: {

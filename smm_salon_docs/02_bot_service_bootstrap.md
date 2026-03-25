@@ -144,14 +144,15 @@ Worker endpoints требуют `x-anita-worker-token`.
 Проверь:
 
 1. `/help`
-2. `/work` + 1 фото
-3. `/work` + 2-3 фото одним альбомом
-4. выбор `collage` и `separate` после `/work`
-5. `/topic`
-6. `/stories`
-7. `/creative`
-8. `/slider`
-9. revision actions:
+2. `/start`
+3. `/work` + 1 фото
+4. `/work` + 2-3 фото одним альбомом
+5. выбор `collage` и `separate` после `/work`
+6. `/topic`
+7. `/stories`
+8. `/creative`
+9. `/slider`
+10. revision actions:
    - `version_prev`
    - `version_next`
    - `regenerate_images`

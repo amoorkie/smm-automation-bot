@@ -8,7 +8,8 @@
     "start": "node ./src/index.mjs",
     "dev": "node ./src/index.mjs",
     "test": "node --test",
-    "check": "node --test"
+    "check": "node --test",
+    "sync:creative-ideas": "node ./scripts/sync-creative-ideas.mjs"
   },
   "dependencies": {
     "@resvg/resvg-js": "^2.6.2",

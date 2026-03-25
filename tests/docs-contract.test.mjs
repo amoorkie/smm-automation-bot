@@ -51,6 +51,7 @@ test('env example stays aligned with current env contract', async () => {
   const optionalKeys = [
     'OWNER_CHAT_ID',
     'BOT_DISABLED',
+    'TOPIC_SOURCE_STATUS_MUTATIONS_ENABLED',
     'APP_TIMEZONE',
     'WEBHOOK_BASE_URL',
     'PORT',
@@ -107,7 +108,7 @@ test('core docs reflect the active command and action surface', async () => {
   const spec = await readRepoFile('smm_salon_docs', '01_system_spec.md');
   const bootstrap = await readRepoFile('smm_salon_docs', '02_bot_service_bootstrap.md');
 
-  for (const command of ['/help', '/work', '/topic', '/stories', '/creative', '/slider']) {
+  for (const command of ['/help', '/start', '/work', '/topic', '/stories', '/creative', '/slider']) {
     assert.match(spec, new RegExp(command.replace('/', '\\/'), 'u'));
   }
 

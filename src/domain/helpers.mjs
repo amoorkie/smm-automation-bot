@@ -14,6 +14,16 @@ export function buildHelpMessage(promptText = null) {
   return escapeTelegramText(promptText || DEFAULT_PROMPTS.help_message);
 }
 
+export function buildStartMessage(promptText = null) {
+  const helpMessage = buildHelpMessage(promptText);
+  return [
+    'Выберите задачу.',
+    'Отправьте нужную команду в любой момент.',
+    '',
+    helpMessage,
+  ].join('\n');
+}
+
 export function buildRenderModeKeyboard(tokensByAction = {}) {
   const keyboard = new InlineKeyboard();
   if (tokensByAction.render_mode_collage) {

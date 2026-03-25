@@ -19,6 +19,7 @@ import {
   buildCallbackTokenPayload,
   buildControlMessageText,
   buildHelpMessage,
+  buildStartMessage,
   buildPreviewKeyboard,
   buildPreviewCaption,
   buildQueueRow,
@@ -268,6 +269,10 @@ export class SalonBotService {
       .slice(0, 3);
   }
 
+  isTopicSourceStatusMutationsEnabled() {
+    return Boolean(this.env?.topicSourceStatusMutationsEnabled);
+  }
+
   buildTopicUserPrompt(topic) {
     return [
       `Title: ${topic?.title ?? ''}`,
@@ -308,16 +313,6 @@ export class SalonBotService {
       return value;
     }
     return `${value.slice(0, Math.max(0, limit - 1)).trim()}…`;
-  }
-
-  toPickerSnapshotRows(rows = []) {
-    return (Array.isArray(rows) ? rows : [])
-      .map((row) => ({
-        topic_id: row.topic_id,
-        title: row.title,
-        priority: row.priority,
-      }))
-      .filter((row) => row.topic_id && row.title);
   }
 
   getTopicLikeSourceSheet(jobType) {
@@ -391,6 +386,9 @@ export class SalonBotService {
   }
 
   async ensureSourceRowReserved(sheetName, topicId, jobId) {
+    if (!this.isTopicSourceStatusMutationsEnabled()) {
+      return;
+    }
     if (!sheetName || !topicId || !jobId) {
       return;
     }
@@ -1826,6 +1824,8 @@ export class SalonBotService {
 
   async handleCommand(normalized) {
     switch (normalized.command) {
+      case '/start':
+        return this.handleStart(normalized);
       case '/help':
         return this.handleHelp(normalized);
       case '/work':
@@ -1850,7 +1850,16 @@ export class SalonBotService {
     return { ok: true, command: '/help' };
   }
 
+  async handleStart(normalized) {
+    const startMessage = buildStartMessage(await this.promptConfig.get('help_message', DEFAULT_PROMPTS.help_message));
+    await this.sendMessage(normalized.chatId, startMessage);
+    return { ok: true, command: '/start' };
+  }
+
   async reclaimExpiredSourceRows(sheetName) {
+    if (!this.isTopicSourceStatusMutationsEnabled()) {
+      return 0;
+    }
     const state = this.sourceReclaimState.get(sheetName) ?? {};
     const now = Date.now();
     if (state.promise) {
@@ -1918,7 +1927,56 @@ export class SalonBotService {
       });
   }
 
+  async countReadySourceRows(sheetName) {
+    await this.reclaimExpiredSourceRows(sheetName);
+    if (typeof this.store.countRowsByQuery === 'function') {
+      return this.store.countRowsByQuery(sheetName, {
+        eq: { status: 'ready' },
+      });
+    }
+    const rows = await this.listReadySourceRows(sheetName);
+    return rows.length;
+  }
+
+  async listReadySourceRowsPage(sheetName, page = 0, pageSize = TOPIC_LIKE_PAGE_SIZE) {
+    const totalRows = await this.countReadySourceRows(sheetName);
+    if (totalRows === 0) {
+      return { rows: [], totalRows: 0, totalPages: 0, page: 0 };
+    }
+
+    const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
+    const safePage = Math.max(0, Math.min(totalPages - 1, Number(page) || 0));
+
+    if (typeof this.store.getRowsByQuery === 'function') {
+      const rows = await this.store.getRowsByQuery(sheetName, {
+        eq: { status: 'ready' },
+        columns: ['id', 'topic_id', 'title', 'priority', 'status'],
+        orderBy: [
+          { column: 'priority', ascending: true },
+          { column: 'title', ascending: true },
+        ],
+        offset: safePage * pageSize,
+        limit: pageSize,
+      });
+      return { rows, totalRows, totalPages, page: safePage };
+    }
+
+    const rows = await this.listReadySourceRows(sheetName);
+    return {
+      rows: rows.slice(safePage * pageSize, (safePage + 1) * pageSize),
+      totalRows,
+      totalPages,
+      page: safePage,
+    };
+  }
+
   async reserveSourceRow(sheetName, topicId, reservedBy) {
+    if (!this.isTopicSourceStatusMutationsEnabled()) {
+      const sourceRow = await this.getSourceRowByTopicId(sheetName, topicId);
+      return sourceRow && String(sourceRow.status).toLowerCase() === 'ready'
+        ? sourceRow
+        : null;
+    }
     let sourceRow = await this.getSourceRowByTopicId(sheetName, topicId);
     if (sourceRow && String(sourceRow.status).toLowerCase() === 'reserved' && this.isExpiredSourceReservation(sourceRow)) {
       sourceRow = await this.reclaimExpiredSourceRow(sheetName, sourceRow);
@@ -1944,6 +2002,9 @@ export class SalonBotService {
   }
 
   async releaseSourceRow(sheetName, topicId) {
+    if (!this.isTopicSourceStatusMutationsEnabled()) {
+      return;
+    }
     const row = await this.getSourceRowByTopicId(sheetName, topicId);
     if (!row) {
       return;
@@ -1963,6 +2024,9 @@ export class SalonBotService {
   }
 
   async markSourceRowPublished(sheetName, topicId, jobId) {
+    if (!this.isTopicSourceStatusMutationsEnabled()) {
+      return;
+    }
     const row = await this.getSourceRowByTopicId(sheetName, topicId);
     if (!row) {
       return;
@@ -1990,8 +2054,8 @@ export class SalonBotService {
       return { ok: false, unknownMode: true };
     }
 
-    const readyRows = await this.listReadySourceRows(config.sourceSheetName);
-    if (readyRows.length === 0) {
+    const readyRowCount = await this.countReadySourceRows(config.sourceSheetName);
+    if (readyRowCount === 0) {
       await this.sendMessage(normalized.chatId, config.emptyMessage);
       return { ok: true, command: config.command, empty: true };
     }
@@ -2002,7 +2066,6 @@ export class SalonBotService {
       jobType,
       page: 0,
       existingMessageId: null,
-      readyRows,
     });
 
     await this.repos.upsertSession({
@@ -2017,7 +2080,6 @@ export class SalonBotService {
         tokenSetId: pickerMessage.tokenSetId,
         messageId: pickerMessage.messageId,
         jobType,
-        readyRows: this.toPickerSnapshotRows(readyRows),
       }),
       expires_at: addMinutes(new Date(), TOPIC_LIKE_PICKER_TTL_MINUTES),
       updated_at: nowIso(),
@@ -2030,8 +2092,8 @@ export class SalonBotService {
       userId: normalized.userId,
       sourceType: jobType,
       status: 'ok',
-      message: `page=1 rows=${readyRows.length}`,
-    }, startedAt, { rowCount: readyRows.length });
+      message: `page=1 rows=${pickerMessage.rowCount}`,
+    }, startedAt, { rowCount: pickerMessage.rowCount });
 
     return { ok: true, command: config.command, picker: true };
   }
@@ -2042,27 +2104,29 @@ export class SalonBotService {
     jobType,
     page = 0,
     existingMessageId = null,
-    readyRows = null,
   }) {
     const startedAt = Date.now();
     const config = this.getTopicLikeModeConfig(jobType);
-    const rows = Array.isArray(readyRows) ? readyRows : await this.listReadySourceRows(config.sourceSheetName);
-    if (rows.length === 0) {
+    const pageData = await this.listReadySourceRowsPage(config.sourceSheetName, page, TOPIC_LIKE_PAGE_SIZE);
+    if (pageData.totalRows === 0) {
+      let messageId = existingMessageId;
+      if (existingMessageId) {
+        const edited = await this.callTelegram('editMessageText', chatId, existingMessageId, config.emptyMessage, {
+          reply_markup: new InlineKeyboard(),
+        });
+        messageId = edited.message_id ?? existingMessageId;
+      }
       return {
-        messageId: existingMessageId,
+        messageId,
         tokenSetId: '',
         page: 0,
         jobId: `PICK:${jobType}:${chatId}`,
         userId,
         empty: true,
+        rowCount: 0,
       };
     }
-    const totalPages = Math.max(1, Math.ceil(rows.length / TOPIC_LIKE_PAGE_SIZE));
-    const safePage = Math.max(0, Math.min(totalPages - 1, page));
-    const pageRows = rows.slice(
-      safePage * TOPIC_LIKE_PAGE_SIZE,
-      (safePage + 1) * TOPIC_LIKE_PAGE_SIZE,
-    );
+    const { rows: pageRows, totalRows, totalPages, page: safePage } = pageData;
     const pickerJobId = `PICK:${jobType}:${chatId}`;
     const definitions = [];
 
@@ -2123,7 +2187,7 @@ export class SalonBotService {
       config.pickerTitle,
       '',
       `Страница ${safePage + 1}/${totalPages}`,
-      `Доступно тем: ${rows.length}`,
+      `Доступно тем: ${totalRows}`,
       '',
       'Нажми на нужную тему ниже.',
     ].join('\n');
@@ -2157,7 +2221,7 @@ export class SalonBotService {
       sourceType: jobType,
       status: 'ok',
       message: `page=${safePage + 1}/${totalPages}`,
-    }, startedAt, { rowCount: rows.length, pageRows: pageRows.length });
+    }, startedAt, { rowCount: totalRows, pageRows: pageRows.length });
 
     return {
       messageId,
@@ -2165,6 +2229,7 @@ export class SalonBotService {
       page: safePage,
       jobId: pickerJobId,
       userId,
+      rowCount: totalRows,
     };
   }
 
@@ -2605,20 +2670,22 @@ export class SalonBotService {
       updated_at: nowIso(),
     });
 
-    await this.store.upsertRowByColumn(
-      config.sourceSheetName,
-      'topic_id',
-      sourceRow.topic_id,
-      {
-        ...sourceRow,
-        status: 'reserved',
-        reserved_by: jobId,
-        reserved_at: sourceRow.reserved_at ?? nowIso(),
-        reservation_expires_at: sourceRow.reservation_expires_at ?? addMinutes(new Date(), TOPIC_RESERVATION_MINUTES),
-        last_job_id: jobId,
-      },
-      SHEET_HEADERS[config.sourceSheetName],
-    );
+    if (this.isTopicSourceStatusMutationsEnabled()) {
+      await this.store.upsertRowByColumn(
+        config.sourceSheetName,
+        'topic_id',
+        sourceRow.topic_id,
+        {
+          ...sourceRow,
+          status: 'reserved',
+          reserved_by: jobId,
+          reserved_at: sourceRow.reserved_at ?? nowIso(),
+          reservation_expires_at: sourceRow.reservation_expires_at ?? addMinutes(new Date(), TOPIC_RESERVATION_MINUTES),
+          last_job_id: jobId,
+        },
+        SHEET_HEADERS[config.sourceSheetName],
+      );
+    }
     await this.ensureSourceRowReserved(config.sourceSheetName, sourceRow.topic_id, jobId);
 
     return { ok: true, command: config.command, jobId, queueId };
@@ -2861,18 +2928,18 @@ export class SalonBotService {
 
     if (action === 'picker_prev' || action === 'picker_next') {
       await this.answerCallback(normalized.callbackQueryId, 'Открываю другую страницу.');
-      const snapshotRows = Array.isArray(sessionPayload.readyRows) && sessionPayload.readyRows.length > 0
-        ? sessionPayload.readyRows
-        : await this.listReadySourceRows(this.getTopicLikeModeConfig(pickerJobType)?.sourceSheetName);
       const picker = await this.presentTopicLikePicker({
         chatId: normalized.chatId,
         userId: normalized.userId,
         jobType: pickerJobType,
         page: Number(tokenRow.payload?.page ?? 0),
         existingMessageId: sessionPayload.messageId ?? normalized.messageId,
-        readyRows: snapshotRows,
       });
       await this.repos.supersedeTokenSet(tokenRow.token_set_id, nowIso());
+      if (picker.empty) {
+        await this.repos.deleteSession(sessionId);
+        return { ok: true, empty: true };
+      }
       await this.repos.upsertSession({
         session_id: sessionId,
         chat_id: normalized.chatId,
@@ -2885,7 +2952,6 @@ export class SalonBotService {
           tokenSetId: picker.tokenSetId,
           messageId: picker.messageId,
           jobType: pickerJobType,
-          readyRows: this.toPickerSnapshotRows(snapshotRows),
         }),
         expires_at: addMinutes(new Date(), TOPIC_LIKE_PICKER_TTL_MINUTES),
         updated_at: nowIso(),
@@ -2899,7 +2965,7 @@ export class SalonBotService {
         sourceType: pickerJobType,
         status: 'ok',
         message: `page=${picker.page + 1}`,
-      }, callbackStartedAt, { page: picker.page, rowCount: snapshotRows.length });
+      }, callbackStartedAt, { page: picker.page, rowCount: picker.rowCount });
       return { ok: true, pickerPage: picker.page };
     }
 
@@ -2909,16 +2975,18 @@ export class SalonBotService {
     const sourceRow = await this.reserveSourceRow(config.sourceSheetName, tokenRow.payload?.topicId, `telegram:${normalized.chatId}`);
     if (!sourceRow) {
       await this.answerCallback(normalized.callbackQueryId, 'Эта тема уже занята. Выбери другую.');
-      const refreshedRows = await this.listReadySourceRows(config.sourceSheetName);
       const picker = await this.presentTopicLikePicker({
         chatId: normalized.chatId,
         userId: normalized.userId,
         jobType: pickerJobType,
         page: Number(sessionPayload.page ?? 0),
         existingMessageId: sessionPayload.messageId ?? normalized.messageId,
-        readyRows: refreshedRows,
       });
       await this.repos.supersedeTokenSet(tokenRow.token_set_id, nowIso());
+      if (picker.empty) {
+        await this.repos.deleteSession(sessionId);
+        return { ok: false, alreadyReserved: true, empty: true };
+      }
       await this.repos.upsertSession({
         session_id: sessionId,
         chat_id: normalized.chatId,
@@ -2931,7 +2999,6 @@ export class SalonBotService {
           tokenSetId: picker.tokenSetId,
           messageId: picker.messageId,
           jobType: pickerJobType,
-          readyRows: this.toPickerSnapshotRows(refreshedRows),
         }),
         expires_at: addMinutes(new Date(), TOPIC_LIKE_PICKER_TTL_MINUTES),
         updated_at: nowIso(),
@@ -2944,7 +3011,7 @@ export class SalonBotService {
         sourceType: pickerJobType,
         status: 'conflict',
         message: tokenRow.payload?.topicId ?? '',
-      }, reserveStartedAt, { rowCount: refreshedRows.length });
+      }, reserveStartedAt, { rowCount: picker.rowCount });
       return { ok: false, alreadyReserved: true };
     }
 
@@ -2961,7 +3028,14 @@ export class SalonBotService {
     await this.repos.supersedeTokenSet(tokenRow.token_set_id, nowIso());
     await this.repos.deleteSession(sessionId);
     await this.deleteMessageSafe(normalized.chatId, sessionPayload.messageId ?? normalized.messageId);
-    return this.startTopicLikeJob(normalized, sourceRow, pickerJobType);
+    try {
+      return await this.startTopicLikeJob(normalized, sourceRow, pickerJobType);
+    } catch (error) {
+      if (sourceRow?.topic_id) {
+        await this.releaseSourceRow(config.sourceSheetName, sourceRow.topic_id);
+      }
+      throw error;
+    }
   }
 
   async answerCallback(callbackQueryId, text) {

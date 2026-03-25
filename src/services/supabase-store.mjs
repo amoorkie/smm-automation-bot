@@ -129,6 +129,27 @@ export class SupabaseStoreService {
     return rows[0] ?? null;
   }
 
+  async countRowsByQuery(tableName, { eq = {}, inFilters = {} } = {}) {
+    let query = this.client
+      .from(tableName)
+      .select('id', { head: true, count: 'exact' });
+
+    for (const [column, value] of Object.entries(eq ?? {})) {
+      query = query.eq(column, value);
+    }
+
+    for (const [column, values] of Object.entries(inFilters ?? {})) {
+      const normalizedValues = Array.isArray(values) ? values.filter((value) => value !== undefined && value !== null) : [];
+      if (normalizedValues.length > 0) {
+        query = query.in(column, normalizedValues);
+      }
+    }
+
+    const { count, error } = await query;
+    assertNoError(error, `Failed to count rows in ${tableName}`);
+    return Number(count ?? 0);
+  }
+
   async appendRow(tableName, row, columns) {
     const payload = selectPayload(row, columns);
     const { data, error } = await this.client

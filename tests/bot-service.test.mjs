@@ -30,8 +30,9 @@ test('topic-like visual prompts forbid baked text and collage layouts', () => {
   assert.match(DEFAULT_PROMPTS.story_visual_generation, /Do not create an infographic, a collage, a grid/i);
   assert.match(DEFAULT_PROMPTS.story_manifest_generation, /коротких постов \/work/i);
   assert.match(DEFAULT_PROMPTS.story_manifest_generation, /Часто слышу этот вопрос/i);
-  assert.match(DEFAULT_PROMPTS.creative_manifest_generation, /ровно такую форму/i);
-  assert.match(DEFAULT_PROMPTS.creative_manifest_generation, /ироничный креатив про/i);
+  assert.match(DEFAULT_PROMPTS.creative_manifest_generation, /headline — это один сильный hook/u);
+  assert.match(DEFAULT_PROMPTS.creative_manifest_generation, /salon-coded/i);
+  assert.match(DEFAULT_PROMPTS.creative_manifest_generation, /Не пиши служебные фразы/i);
   assert.match(DEFAULT_PROMPTS.creative_visual_generation, /zero readable text/i);
   assert.match(DEFAULT_PROMPTS.creative_visual_generation, /simple flat vector/i);
   assert.match(DEFAULT_PROMPTS.slider_visual_generation, /zero readable text/i);
@@ -283,6 +284,11 @@ class FakeStore {
     return rows[0] ?? null;
   }
 
+  async countRowsByQuery(tableName, query = {}) {
+    const rows = await this.getRowsByQuery(tableName, query);
+    return rows.length;
+  }
+
   async appendRow(tableName, row) {
     const table = this.store.get(tableName);
     const next = { __rowNumber: table.nextId, id: table.nextId, ...row };
@@ -481,7 +487,7 @@ function createOpenRouter() {
   };
 }
 
-function createService({ initialTables = {} } = {}) {
+function createService({ initialTables = {}, envOverrides = {} } = {}) {
   const store = new FakeStore(initialTables);
   const repos = createRepositories(store);
   const bot = createFakeBot();
@@ -495,6 +501,8 @@ function createService({ initialTables = {} } = {}) {
       imageModelId: 'google/gemini-3.1-flash-image-preview',
       textModelId: 'openai/gpt-5.4',
       webhookBaseUrl: '',
+      topicSourceStatusMutationsEnabled: true,
+      ...envOverrides,
     },
     bot,
     repos,
@@ -521,6 +529,31 @@ function createService({ initialTables = {} } = {}) {
   return { service, repos, store, bot, botLogger, openrouter };
 }
 
+function buildTopicLikeSourceRow({
+  topicId,
+  title,
+  brief,
+  tags = 'care,home',
+  priority = '1',
+  status = 'ready',
+  notes = '',
+} = {}) {
+  return {
+    topic_id: topicId,
+    title,
+    brief,
+    tags,
+    priority,
+    status,
+    reserved_by: '',
+    reserved_at: '',
+    reservation_expires_at: '',
+    last_job_id: '',
+    last_published_at: '',
+    notes,
+  };
+}
+
 async function expireOnlyCollection(ctx) {
   const collections = await ctx.store.getRows(TABLE_NAMES.workCollections);
   assert.equal(collections.length, 1);
@@ -544,6 +577,15 @@ async function pickCallbackTokenByPrefix(ctx, actionPrefix) {
     .filter((row) => String(row.action ?? '').startsWith(actionPrefix) && String(row.superseded ?? '0') !== '1' && String(row.used ?? '0') !== '1')
     .sort((left, right) => Number(right.__rowNumber ?? right.id ?? 0) - Number(left.__rowNumber ?? left.id ?? 0));
   return candidates[0]?.token ?? null;
+}
+
+function assertTopicLikeSourceRowUntouched(row) {
+  assert.equal(row.status, 'ready');
+  assert.equal(row.reserved_by, '');
+  assert.equal(row.reserved_at, '');
+  assert.equal(row.reservation_expires_at, '');
+  assert.equal(row.last_job_id, '');
+  assert.equal(row.last_published_at, '');
 }
 
 async function waitFor(check, { timeoutMs = 1000, intervalMs = 10 } = {}) {
@@ -1194,6 +1236,61 @@ test('stories picker paginates by ten items per page', async () => {
   assert.ok(ctx.bot.sent.some((item) => item.type === 'edit_message_text' && String(item.text ?? '').includes('Страница 2/2')));
 });
 
+test('stories picker page turns read a fresh slice from storage', async () => {
+  const storyRows = Array.from({ length: 11 }, (_, index) => ({
+    topic_id: `ST-FRESH-${index + 1}`,
+    title: `Stories тема ${index + 1}`,
+    brief: 'Проверка свежего page slice.',
+    tags: 'care,home',
+    priority: String(index + 1),
+    status: 'ready',
+    reserved_by: '',
+    reserved_at: '',
+    reservation_expires_at: '',
+    last_job_id: '',
+    last_published_at: '',
+    notes: '',
+  }));
+  const ctx = createService({
+    initialTables: {
+      [TABLE_NAMES.storyTopics]: storyRows,
+    },
+  });
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 132,
+    message: { message_id: 132, text: '/stories', chat: { id: 55 }, from: { id: 14 } },
+  });
+
+  const currentRows = await ctx.store.getRows(TABLE_NAMES.storyTopics);
+  await ctx.store.updateRowByNumber(TABLE_NAMES.storyTopics, currentRows[10].__rowNumber, {
+    ...currentRows[10],
+    title: 'Stories тема после обновления',
+  });
+
+  const firstPicker = ctx.bot.sent.find((item) => item.type === 'message' && String(item.text ?? '').includes('Страница 1/2'));
+  assert.ok(firstPicker);
+
+  const nextToken = await pickCallbackTokenByPrefix(ctx, 'picker_next_');
+  await ctx.service.handleTelegramUpdate({
+    update_id: 133,
+    callback_query: {
+      id: 'cb-stories-next-fresh',
+      data: `picker_next_0:${nextToken}`,
+      from: { id: 14 },
+      message: { message_id: firstPicker.message_id, chat: { id: 55 } },
+    },
+  });
+
+  const editedPicker = [...ctx.bot.sent]
+    .reverse()
+    .find((item) => item.type === 'edit_message_text' && item.message_id === firstPicker.message_id);
+  assert.ok(editedPicker);
+  const inlineRows = editedPicker.extra?.reply_markup?.inline_keyboard ?? [];
+  const labels = inlineRows.flat().map((button) => String(button?.text ?? ''));
+  assert.ok(labels.some((label) => label.includes('Stories тема после обновления')));
+});
+
 test('stories, creative, and slider modes create expected preview shapes', async () => {
   const cases = [
     { command: '/stories', table: TABLE_NAMES.storyTopics, topicId: 'ST-1', jobType: 'stories', expects: 'single' },
@@ -1645,9 +1742,389 @@ test('publish_confirm marks source row as published', async () => {
   assert.equal((await ctx.store.getRows(TABLE_NAMES.contentQueue))[0].status, 'published');
 });
 
-test('/help remains available and /logs is treated as unknown command', async () => {
+test('topic-like modes do not mutate source rows in QA mode after pick, regenerate, cancel, and publish', async () => {
+  const modes = [
+    { command: '/topic', table: TABLE_NAMES.expertTopics, topicId: 'TP-QA', title: 'Проверка /topic' },
+    { command: '/stories', table: TABLE_NAMES.storyTopics, topicId: 'ST-QA', title: 'Проверка /stories' },
+    { command: '/creative', table: TABLE_NAMES.creativeIdeas, topicId: 'CR-QA', title: 'Проверка /creative' },
+    { command: '/slider', table: TABLE_NAMES.sliderTopics, topicId: 'SL-QA', title: 'Проверка /slider' },
+  ];
+
+  for (const [index, mode] of modes.entries()) {
+    const chatIdBase = 310 + (index * 10);
+    const userId = 710 + index;
+    const initialRow = {
+      topic_id: mode.topicId,
+      title: mode.title,
+      brief: 'Проверка QA-режима без мутаций source rows.',
+      tags: 'qa,topic-like',
+      priority: '1',
+      status: 'ready',
+      reserved_by: '',
+      reserved_at: '',
+      reservation_expires_at: '',
+      last_job_id: '',
+      last_published_at: '',
+      notes: '',
+    };
+
+    const ctxCancel = createService({
+      envOverrides: { topicSourceStatusMutationsEnabled: false },
+      initialTables: { [mode.table]: [initialRow] },
+    });
+
+    await ctxCancel.service.handleTelegramUpdate({
+      update_id: chatIdBase,
+      message: { message_id: chatIdBase, text: mode.command, chat: { id: chatIdBase }, from: { id: userId } },
+    });
+    const pickToken = await pickCallbackTokenByPrefix(ctxCancel, 'pick_source_');
+    assert.ok(pickToken, `Expected pick token for ${mode.command}`);
+    await ctxCancel.service.handleTelegramUpdate({
+      update_id: chatIdBase + 1,
+      callback_query: {
+        id: `cb-qa-pick-${mode.topicId}`,
+        data: `pick_source_0_0:${pickToken}`,
+        from: { id: userId },
+        message: { message_id: chatIdBase, chat: { id: chatIdBase } },
+      },
+    });
+
+    const queueRows = await ctxCancel.store.getRows(TABLE_NAMES.contentQueue);
+    const runtime = await ctxCancel.repos.getRuntime(queueRows[0].job_id);
+    const regenerateToken = await pickCallbackToken(ctxCancel, 'regenerate_text')
+      ?? await pickCallbackToken(ctxCancel, 'regenerate_images');
+    if (regenerateToken) {
+      const regenerateAction = (await ctxCancel.store.getRows(TABLE_NAMES.callbackTokens))
+        .find((row) => row.token === regenerateToken)?.action;
+      await ctxCancel.service.handleTelegramUpdate({
+        update_id: chatIdBase + 2,
+        callback_query: {
+          id: `cb-qa-regen-${mode.topicId}`,
+          data: `${regenerateAction}:${regenerateToken}`,
+          from: { id: userId },
+          message: { message_id: runtime.text_message_id ?? runtime.collage_message_id, chat: { id: chatIdBase } },
+        },
+      });
+    }
+
+    const cancelToken = await pickCallbackToken(ctxCancel, 'cancel');
+    assert.ok(cancelToken, `Expected cancel token for ${mode.command}`);
+    await ctxCancel.service.handleTelegramUpdate({
+      update_id: chatIdBase + 3,
+      callback_query: {
+        id: `cb-qa-cancel-${mode.topicId}`,
+        data: `cancel:${cancelToken}`,
+        from: { id: userId },
+        message: { message_id: runtime.text_message_id ?? runtime.collage_message_id, chat: { id: chatIdBase } },
+      },
+    });
+
+    const sourceAfterCancel = (await ctxCancel.store.getRows(mode.table))[0];
+    assert.equal(sourceAfterCancel.status, 'ready');
+    assert.equal(sourceAfterCancel.reserved_by, '');
+    assert.equal(sourceAfterCancel.reserved_at, '');
+    assert.equal(sourceAfterCancel.reservation_expires_at, '');
+    assert.equal(sourceAfterCancel.last_job_id, '');
+    assert.equal(sourceAfterCancel.last_published_at, '');
+
+    const ctxPublish = createService({
+      envOverrides: { topicSourceStatusMutationsEnabled: false },
+      initialTables: { [mode.table]: [initialRow] },
+    });
+    await ctxPublish.service.handleTelegramUpdate({
+      update_id: chatIdBase + 4,
+      message: { message_id: chatIdBase + 4, text: mode.command, chat: { id: chatIdBase + 4 }, from: { id: userId } },
+    });
+    const pickTokenPublish = await pickCallbackTokenByPrefix(ctxPublish, 'pick_source_');
+    await ctxPublish.service.handleTelegramUpdate({
+      update_id: chatIdBase + 5,
+      callback_query: {
+        id: `cb-qa-pick-publish-${mode.topicId}`,
+        data: `pick_source_0_0:${pickTokenPublish}`,
+        from: { id: userId },
+        message: { message_id: chatIdBase + 4, chat: { id: chatIdBase + 4 } },
+      },
+    });
+    const runtimePublish = await ctxPublish.repos.getRuntime((await ctxPublish.store.getRows(TABLE_NAMES.contentQueue))[0].job_id);
+    const publishToken = await pickCallbackToken(ctxPublish, 'publish_confirm');
+    assert.ok(publishToken, `Expected publish token for ${mode.command}`);
+    await ctxPublish.service.handleTelegramUpdate({
+      update_id: chatIdBase + 6,
+      callback_query: {
+        id: `cb-qa-publish-${mode.topicId}`,
+        data: `publish_confirm:${publishToken}`,
+        from: { id: userId },
+        message: { message_id: runtimePublish.text_message_id ?? runtimePublish.collage_message_id, chat: { id: chatIdBase + 4 } },
+      },
+    });
+
+    const sourceAfterPublish = (await ctxPublish.store.getRows(mode.table))[0];
+    assert.equal(sourceAfterPublish.status, 'ready');
+    assert.equal(sourceAfterPublish.reserved_by, '');
+    assert.equal(sourceAfterPublish.reserved_at, '');
+    assert.equal(sourceAfterPublish.reservation_expires_at, '');
+    assert.equal(sourceAfterPublish.last_job_id, '');
+    assert.equal(sourceAfterPublish.last_published_at, '');
+  }
+});
+
+test('error after source reservation rolls topic-like source row back to ready when mutations are enabled', async () => {
+  const ctx = createService({
+    envOverrides: { topicSourceStatusMutationsEnabled: true },
+    initialTables: {
+      [TABLE_NAMES.storyTopics]: [{
+        topic_id: 'ST-ROLLBACK',
+        title: 'Rollback на ошибке генерации',
+        brief: 'Проверка releaseSourceRow в catch после reserve.',
+        tags: 'rollback,error',
+        priority: '1',
+        status: 'ready',
+        reserved_by: '',
+        reserved_at: '',
+        reservation_expires_at: '',
+        last_job_id: '',
+        last_published_at: '',
+        notes: '',
+      }],
+    },
+  });
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 402,
+    message: { message_id: 402, text: '/stories', chat: { id: 402 }, from: { id: 92 } },
+  });
+  const pickToken = await pickCallbackTokenByPrefix(ctx, 'pick_source_');
+  assert.ok(pickToken);
+
+  const originalStartTopicLikeJob = ctx.service.startTopicLikeJob.bind(ctx.service);
+  ctx.service.startTopicLikeJob = async () => {
+    throw new Error('forced generation failure');
+  };
+
+  const result = await ctx.service.handleTelegramUpdate({
+    update_id: 403,
+    callback_query: {
+      id: 'cb-rollback',
+      data: `pick_source_0_0:${pickToken}`,
+      from: { id: 92 },
+      message: { message_id: 402, chat: { id: 402 } },
+    },
+  });
+  ctx.service.startTopicLikeJob = originalStartTopicLikeJob;
+
+  assert.equal(result.ok, false);
+  assert.match(String(result.error ?? ''), /forced generation failure/u);
+  const row = (await ctx.store.getRows(TABLE_NAMES.storyTopics))[0];
+  assert.equal(row.status, 'ready');
+  assert.equal(row.reserved_by, '');
+  assert.equal(row.reserved_at, '');
+  assert.equal(row.reservation_expires_at, '');
+});
+
+test('picker page switch uses fresh DB slice instead of stale session snapshot', async () => {
+  const storyRows = Array.from({ length: 11 }, (_, index) => ({
+    topic_id: `ST-PAGE-${index + 1}`,
+    title: `Тема ${String(index + 1).padStart(2, '0')}`,
+    brief: 'Проверка page freshness.',
+    tags: 'picker,freshness',
+    priority: '1',
+    status: 'ready',
+    reserved_by: '',
+    reserved_at: '',
+    reservation_expires_at: '',
+    last_job_id: '',
+    last_published_at: '',
+    notes: '',
+  }));
+
+  const ctx = createService({
+    initialTables: {
+      [TABLE_NAMES.storyTopics]: storyRows,
+    },
+  });
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 501,
+    message: { message_id: 501, text: '/stories', chat: { id: 501 }, from: { id: 95 } },
+  });
+  const pickerSession = await ctx.repos.getSessionById('picker:stories:501');
+  const pickerPayload = JSON.parse(pickerSession.pending_payload_json);
+  assert.equal('readyRows' in pickerPayload, false);
+  const firstPicker = ctx.bot.sent.find((item) => item.type === 'message' && String(item.text ?? '').includes('Страница 1/2'));
+  assert.ok(firstPicker);
+  const nextToken = await pickCallbackTokenByPrefix(ctx, 'picker_next_');
+  assert.ok(nextToken);
+
+  const rowToDemote = (await ctx.store.getRows(TABLE_NAMES.storyTopics)).find((row) => row.topic_id === 'ST-PAGE-11');
+  await ctx.store.updateRowByNumber(TABLE_NAMES.storyTopics, rowToDemote.__rowNumber, {
+    ...rowToDemote,
+    status: 'published',
+  });
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 502,
+    callback_query: {
+      id: 'cb-picker-freshness',
+      data: `picker_next_0:${nextToken}`,
+      from: { id: 95 },
+      message: { message_id: firstPicker.message_id, chat: { id: 501 } },
+    },
+  });
+
+  const lastEdit = ctx.bot.sent.filter((item) => item.type === 'edit_message_text').at(-1);
+  assert.ok(lastEdit);
+  assert.match(String(lastEdit.text ?? ''), /Страница 1\/1/u);
+  assert.match(String(lastEdit.text ?? ''), /Доступно тем: 10/u);
+});
+
+test('creative flow supports fallback normalization, regenerate, publish, and cancel', async () => {
+  const baseRows = [{
+    topic_id: 'CR-E2E',
+    title: 'Мне бы как на фото, только за пять минут',
+    brief: 'Ироничный креатив про ожидания и салонный тайминг.',
+    tags: 'creative,qa',
+    priority: '1',
+    status: 'ready',
+    reserved_by: '',
+    reserved_at: '',
+    reservation_expires_at: '',
+    last_job_id: '',
+    last_published_at: '',
+    notes: '',
+  }];
+
+  const ctxPublish = createService({
+    initialTables: {
+      [TABLE_NAMES.creativeIdeas]: baseRows,
+    },
+  });
+
+  await ctxPublish.service.handleTelegramUpdate({
+    update_id: 601,
+    message: { message_id: 601, text: '/creative', chat: { id: 601 }, from: { id: 101 } },
+  });
+  const pickToken = await pickCallbackTokenByPrefix(ctxPublish, 'pick_source_');
+  await ctxPublish.service.handleTelegramUpdate({
+    update_id: 602,
+    callback_query: {
+      id: 'cb-creative-pick',
+      data: `pick_source_0_0:${pickToken}`,
+      from: { id: 101 },
+      message: { message_id: 601, chat: { id: 601 } },
+    },
+  });
+
+  const queueRows = await ctxPublish.store.getRows(TABLE_NAMES.contentQueue);
+  assert.equal(queueRows.length, 1);
+  assert.equal(queueRows[0].job_type, 'creative');
+  assert.equal(queueRows[0].status, 'preview_ready');
+  const runtime = await ctxPublish.repos.getRuntime(queueRows[0].job_id);
+  assert.equal(runtime.active_revision, 1);
+  assert.equal(runtime.draft_payload.finalRenderMode, 'single');
+  assert.equal(runtime.job_type, 'creative');
+  assert.equal(runtime.preview_payload.manifest.eyebrow, '');
+  assert.ok(String(runtime.preview_payload.manifest.headline ?? '').trim().length > 0);
+  assert.ok(String(runtime.preview_payload.manifest.subhead ?? '').trim().length > 0);
+
+  const regenerateToken = await pickCallbackToken(ctxPublish, 'regenerate_text');
+  assert.ok(regenerateToken);
+  await ctxPublish.service.handleTelegramUpdate({
+    update_id: 603,
+    callback_query: {
+      id: 'cb-creative-regenerate',
+      data: `regenerate_text:${regenerateToken}`,
+      from: { id: 101 },
+      message: { message_id: runtime.text_message_id ?? runtime.collage_message_id, chat: { id: 601 } },
+    },
+  });
+
+  const runtimeAfterRegenerate = await ctxPublish.repos.getRuntime(queueRows[0].job_id);
+  assert.equal(runtimeAfterRegenerate.active_revision, 2);
+  assert.ok(Array.isArray(runtimeAfterRegenerate.draft_payload.revisionHistory));
+  assert.ok(runtimeAfterRegenerate.draft_payload.revisionHistory.length >= 2);
+
+  const ctxCancel = createService({
+    initialTables: {
+      [TABLE_NAMES.creativeIdeas]: [{
+        ...baseRows[0],
+        topic_id: 'CR-E2E-CANCEL',
+        title: 'Плойка и спешка не пара',
+      }],
+    },
+  });
+  await ctxCancel.service.handleTelegramUpdate({
+    update_id: 605,
+    message: { message_id: 605, text: '/creative', chat: { id: 605 }, from: { id: 102 } },
+  });
+  const pickTokenCancel = await pickCallbackTokenByPrefix(ctxCancel, 'pick_source_');
+  await ctxCancel.service.handleTelegramUpdate({
+    update_id: 606,
+    callback_query: {
+      id: 'cb-creative-pick-cancel',
+      data: `pick_source_0_0:${pickTokenCancel}`,
+      from: { id: 102 },
+      message: { message_id: 605, chat: { id: 605 } },
+    },
+  });
+  const runtimeCancel = await ctxCancel.repos.getRuntime((await ctxCancel.store.getRows(TABLE_NAMES.contentQueue))[0].job_id);
+  const cancelToken = await pickCallbackToken(ctxCancel, 'cancel');
+  assert.ok(cancelToken);
+  await ctxCancel.service.handleTelegramUpdate({
+    update_id: 607,
+    callback_query: {
+      id: 'cb-creative-cancel',
+      data: `cancel:${cancelToken}`,
+      from: { id: 102 },
+      message: { message_id: runtimeCancel.text_message_id ?? runtimeCancel.collage_message_id, chat: { id: 605 } },
+    },
+  });
+  assert.equal((await ctxCancel.store.getRows(TABLE_NAMES.contentQueue))[0].status, 'cancelled');
+
+  const ctxPublishOnly = createService({
+    initialTables: {
+      [TABLE_NAMES.creativeIdeas]: [{
+        ...baseRows[0],
+        topic_id: 'CR-E2E-PUBLISH',
+        title: 'Термозащита: бывший, про которого вспоминают у плойки',
+      }],
+    },
+  });
+  await ctxPublishOnly.service.handleTelegramUpdate({
+    update_id: 608,
+    message: { message_id: 608, text: '/creative', chat: { id: 608 }, from: { id: 103 } },
+  });
+  const pickTokenPublish = await pickCallbackTokenByPrefix(ctxPublishOnly, 'pick_source_');
+  await ctxPublishOnly.service.handleTelegramUpdate({
+    update_id: 609,
+    callback_query: {
+      id: 'cb-creative-pick-publish',
+      data: `pick_source_0_0:${pickTokenPublish}`,
+      from: { id: 103 },
+      message: { message_id: 608, chat: { id: 608 } },
+    },
+  });
+  const runtimePublish = await ctxPublishOnly.repos.getRuntime((await ctxPublishOnly.store.getRows(TABLE_NAMES.contentQueue))[0].job_id);
+  const publishToken = await pickCallbackToken(ctxPublishOnly, 'publish_confirm');
+  assert.ok(publishToken);
+  await ctxPublishOnly.service.handleTelegramUpdate({
+    update_id: 610,
+    callback_query: {
+      id: 'cb-creative-publish',
+      data: `publish_confirm:${publishToken}`,
+      from: { id: 103 },
+      message: { message_id: runtimePublish.text_message_id ?? runtimePublish.collage_message_id, chat: { id: 608 } },
+    },
+  });
+  assert.equal((await ctxPublishOnly.store.getRows(TABLE_NAMES.contentQueue))[0].status, 'published');
+});
+
+test('/start and /help share the command menu and /logs is treated as unknown command', async () => {
   const ctx = createService();
 
+  await ctx.service.handleTelegramUpdate({
+    update_id: 89,
+    message: { message_id: 89, text: '/start', chat: { id: 99 }, from: { id: 5 } },
+  });
   await ctx.service.handleTelegramUpdate({
     update_id: 90,
     message: { message_id: 90, text: '/help', chat: { id: 99 }, from: { id: 5 } },
@@ -1658,7 +2135,10 @@ test('/help remains available and /logs is treated as unknown command', async ()
   });
 
   const sentTexts = ctx.bot.sent.filter((item) => item.type === 'message').map((item) => item.text);
+  assert.match(sentTexts[0], /Выберите задачу/u);
+  assert.ok(sentTexts[0].includes('/start'));
   assert.ok(sentTexts[0].includes('/work'));
+  assert.equal(sentTexts[1], sentTexts[0].split('\n\n').slice(1).join('\n\n'));
   assert.equal(sentTexts.at(-1), USER_MESSAGES.unknownCommand);
 });
 

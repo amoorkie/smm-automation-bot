@@ -52,6 +52,7 @@ export function loadEnv(source = process.env) {
     textModelId: required('TEXT_MODEL_ID', source.TEXT_MODEL_ID),
     ownerChatId: parseNullableChatId(source.OWNER_CHAT_ID),
     botDisabled: parseBoolean(source.BOT_DISABLED, false),
+    topicSourceStatusMutationsEnabled: parseBoolean(source.TOPIC_SOURCE_STATUS_MUTATIONS_ENABLED, false),
   };
 }
 

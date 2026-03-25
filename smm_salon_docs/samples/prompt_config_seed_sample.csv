@@ -1,5 +1,5 @@
 prompt_key,version,status,model_id_override,temperature,content,notes,updated_at
-help_message,v1,active,,,Команды: /work /topic /stories /creative /slider /help,Current help text seed,2026-03-22T00:00:00+03:00
+help_message,v1,active,,,Команды: /work /topic /stories /creative /slider /help /start,Current help text seed,2026-03-22T00:00:00+03:00
 contact_block,v1,active,,,Запись по телефону +7 (987) 741-83-99 📞,Current contact block seed,2026-03-22T00:00:00+03:00
 work_album_consistency_extraction,v1,active,,,Проанализируй набор фото одной и той же работы и верни короткий locked facts block.,Current work consistency seed,2026-03-22T00:00:00+03:00
 work_image_enhancement_master,v1,active,,,IMAGE EDIT ONLY. Preserve the same person hairstyle accessories and clothing while improving the real photo.,Current work enhancement seed,2026-03-22T00:00:00+03:00
@@ -9,10 +9,10 @@ work_image_reframe_master,v1,active,,,Reframe the same photo without changing id
 work_collage_generation,v1,active,,,Create one final vertical portfolio collage from all provided enhanced photos of the same work.,Current collage seed,2026-03-22T00:00:00+03:00
 work_caption_generation,v1,active,,0.7,Ты пишешь короткие посты для мастера по волосам от первого лица одного мастера.,Current work caption seed,2026-03-22T00:00:00+03:00
 topic_post_generation,v1,active,,0.7,Ты пишешь короткие профессиональные посты для мастера по волосам по теме из title brief и tags.,Current topic post seed,2026-03-22T00:00:00+03:00
-topic_image_generation,v1,active,,,Create one realistic smartphone photo for a professional hair master post using salon reference images.,Current topic image seed,2026-03-22T00:00:00+03:00
+topic_image_generation,v1,active,,,Create one realistic smartphone photo for a professional hair master post using salon reference images and prefer brand accent colors #CE6BD6 and #A21A92 when color accents are useful.,Current topic image seed,2026-03-22T00:00:00+03:00
 story_manifest_generation,v1,active,,,You create a short JSON manifest for a story-style hair-care post.,Current story manifest seed,2026-03-22T00:00:00+03:00
-story_visual_generation,v1,active,,,Create one realistic vertical story visual for a hair-care topic with no baked text.,Current story visual seed,2026-03-22T00:00:00+03:00
+story_visual_generation,v1,active,,,Create one realistic vertical story visual for a hair-care topic with no baked text and prefer brand accent colors #CE6BD6 and #A21A92 when accents are useful.,Current story visual seed,2026-03-22T00:00:00+03:00
 creative_manifest_generation,v1,active,,,You create a short JSON manifest for a playful hair-industry creative post.,Current creative manifest seed,2026-03-22T00:00:00+03:00
-creative_visual_generation,v1,active,,,Create one vertical creative visual for a playful haircare post with no baked text.,Current creative visual seed,2026-03-22T00:00:00+03:00
+creative_visual_generation,v1,active,,,Create one vertical creative visual for a playful haircare post with no baked text and prefer brand accent colors #CE6BD6 and #A21A92 when accents are useful.,Current creative visual seed,2026-03-22T00:00:00+03:00
 slider_manifest_generation,v1,active,,,You create a short JSON manifest for a 3-5 slide hair-care slider.,Current slider manifest seed,2026-03-22T00:00:00+03:00
-slider_visual_generation,v1,active,,,Create vertical slide visuals for a practical hair-care guide with no baked text.,Current slider visual seed,2026-03-22T00:00:00+03:00
+slider_visual_generation,v1,active,,,Create vertical slide visuals for a practical hair-care guide with no baked text and prefer brand accent colors #CE6BD6 and #A21A92 when accents are useful.,Current slider visual seed,2026-03-22T00:00:00+03:00
