@@ -165,10 +165,13 @@ function getTelegramPhotos(message) {
 }
 
 function normalizeCommand(text) {
-  if (!text || !text.startsWith('/')) {
+  const value = String(text ?? '')
+    .replace(/^[\s\u200B-\u200D\uFEFF]+/u, '')
+    .trim();
+  if (!value || !value.startsWith('/')) {
     return null;
   }
-  return text.trim().split(/\s+/u)[0].replace(/@[\p{L}\p{N}_]+$/u, '').toLowerCase();
+  return value.split(/\s+/u)[0].replace(/@[\p{L}\p{N}_]+$/u, '').toLowerCase();
 }
 
 export function normalizeTelegramUpdate(update) {

@@ -91,6 +91,30 @@ test('telegram updates normalize commands and callback payloads', () => {
   assert.equal(startWithPayload.kind, 'command');
   assert.equal(startWithPayload.command, '/start');
 
+  const startWithLeadingWhitespace = normalizeTelegramUpdate({
+    update_id: 6,
+    message: {
+      message_id: 14,
+      text: '   /start   ',
+      chat: { id: 100 },
+      from: { id: 200 },
+    },
+  });
+  assert.equal(startWithLeadingWhitespace.kind, 'command');
+  assert.equal(startWithLeadingWhitespace.command, '/start');
+
+  const startWithInvisiblePrefix = normalizeTelegramUpdate({
+    update_id: 7,
+    message: {
+      message_id: 15,
+      text: '\u200B/start',
+      chat: { id: 100 },
+      from: { id: 200 },
+    },
+  });
+  assert.equal(startWithInvisiblePrefix.kind, 'command');
+  assert.equal(startWithInvisiblePrefix.command, '/start');
+
   const callback = normalizeTelegramUpdate({
     update_id: 2,
     callback_query: {
