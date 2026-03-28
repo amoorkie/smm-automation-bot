@@ -23,10 +23,20 @@ import {
 } from '../src/workflow-kit.mjs';
 
 test('locked prompt keys stay aligned with the prompt contract', () => {
-  assert.equal(LOCKED_PROMPT_KEYS.length, 10);
+  assert.equal(LOCKED_PROMPT_KEYS.length, 16);
   assert.ok(LOCKED_PROMPT_KEYS.includes('help_message'));
-  assert.ok(LOCKED_PROMPT_KEYS.includes('work_image_reframe_master'));
+  assert.ok(LOCKED_PROMPT_KEYS.includes('work_album_consistency_extraction'));
+  assert.ok(LOCKED_PROMPT_KEYS.includes('work_image_edit_keep'));
+  assert.ok(LOCKED_PROMPT_KEYS.includes('work_image_edit_blur'));
+  assert.ok(LOCKED_PROMPT_KEYS.includes('work_image_edit_neutral'));
+  assert.ok(LOCKED_PROMPT_KEYS.includes('work_brow_consistency_extraction'));
+  assert.ok(LOCKED_PROMPT_KEYS.includes('work_brow_edit_keep'));
+  assert.ok(LOCKED_PROMPT_KEYS.includes('work_brow_edit_blur'));
+  assert.ok(LOCKED_PROMPT_KEYS.includes('work_brow_edit_neutral'));
   assert.ok(LOCKED_PROMPT_KEYS.includes('work_collage_generation'));
+  assert.ok(LOCKED_PROMPT_KEYS.includes('work_brow_collage_generation'));
+  assert.ok(LOCKED_PROMPT_KEYS.includes('work_caption_generation'));
+  assert.ok(LOCKED_PROMPT_KEYS.includes('work_brow_caption_generation'));
   assert.ok(LOCKED_PROMPT_KEYS.includes('contact_block'));
 });
 
@@ -178,20 +188,26 @@ test('OpenRouter payload builders use current image_url field names', () => {
     systemPrompt: 'System',
     userPrompt: 'User',
     imageUrls: ['data:image/jpeg;base64,abc'],
+    maxTokens: 321,
   });
   assert.equal(textPayload.messages[0].role, 'system');
   assert.equal(textPayload.messages[1].role, 'user');
   assert.equal(textPayload.messages[1].content[1].type, 'image_url');
+  assert.equal(textPayload.max_tokens, 321);
 
   const imagePayload = buildOpenRouterImagePayload({
     model: 'google/gemini-3.1-flash-image-preview',
     prompt: 'Enhance this image',
     imageUrls: ['https://example.com/a.png'],
+    maxTokens: 256,
+    provider: { ignore: ['google-ai-studio'] },
   });
   assert.equal(imagePayload.messages[0].content[1].type, 'image_url');
   assert.deepEqual(imagePayload.messages[0].content[1].image_url, {
     url: 'https://example.com/a.png',
   });
+  assert.equal(imagePayload.max_tokens, 256);
+  assert.deepEqual(imagePayload.provider, { ignore: ['google-ai-studio'] });
 });
 
 test('OpenRouter response parsers extract text and generated images', () => {

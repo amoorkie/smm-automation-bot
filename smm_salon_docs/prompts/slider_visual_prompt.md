@@ -11,6 +11,8 @@ Create 3 to 5 vertical slides that support a simple instruction or guide.
 - Format: `1080x1920`
 - Keep each slide readable.
 - Prefer one idea per slide.
+- When color accents are useful, prefer the salon brand palette `#CE6BD6` and `#A21A92`.
+- Use those two colors as restrained accents instead of random accent colors.
 - Use a real salon feel or a clean object scene.
 - Do not make the set look like a glossy fashion campaign.
 

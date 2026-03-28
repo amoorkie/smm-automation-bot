@@ -34,8 +34,19 @@ function parseBoolean(value, fallback = false) {
 }
 
 export function loadEnv(source = process.env) {
-  const derivedWebhookBaseUrl = source.WEBHOOK_BASE_URL
-    ?? (source.VERCEL_URL ? `https://${source.VERCEL_URL}` : null);
+  const explicitWebhookBaseUrl = typeof source.WEBHOOK_BASE_URL === 'string' && source.WEBHOOK_BASE_URL.trim()
+    ? source.WEBHOOK_BASE_URL.trim()
+    : null;
+  const productionWebhookBaseUrl = typeof source.VERCEL_PROJECT_PRODUCTION_URL === 'string'
+      && source.VERCEL_PROJECT_PRODUCTION_URL.trim()
+    ? `https://${source.VERCEL_PROJECT_PRODUCTION_URL.trim()}`
+    : null;
+  const deploymentWebhookBaseUrl = typeof source.VERCEL_URL === 'string' && source.VERCEL_URL.trim()
+    ? `https://${source.VERCEL_URL.trim()}`
+    : null;
+  const derivedWebhookBaseUrl = explicitWebhookBaseUrl
+    ?? productionWebhookBaseUrl
+    ?? deploymentWebhookBaseUrl;
 
   return {
     nodeEnv: source.NODE_ENV ?? 'development',
@@ -48,10 +59,16 @@ export function loadEnv(source = process.env) {
     supabaseUrl: required('SUPABASE_URL', source.SUPABASE_URL),
     supabaseServiceRoleKey: required('SUPABASE_SERVICE_ROLE_KEY', source.SUPABASE_SERVICE_ROLE_KEY),
     webhookBaseUrl: derivedWebhookBaseUrl,
+    webhookBaseUrlDerivedFromDeploymentUrl: Boolean(
+      !explicitWebhookBaseUrl
+      && !productionWebhookBaseUrl
+      && deploymentWebhookBaseUrl,
+    ),
     imageModelId: required('IMAGE_MODEL_ID', source.IMAGE_MODEL_ID),
     textModelId: required('TEXT_MODEL_ID', source.TEXT_MODEL_ID),
     ownerChatId: parseNullableChatId(source.OWNER_CHAT_ID),
     botDisabled: parseBoolean(source.BOT_DISABLED, false),
+    internalWorkerDispatchEnabled: parseBoolean(source.INTERNAL_WORKER_DISPATCH_ENABLED, false),
     topicSourceStatusMutationsEnabled: parseBoolean(source.TOPIC_SOURCE_STATUS_MUTATIONS_ENABLED, false),
   };
 }

@@ -51,6 +51,7 @@ test('env example stays aligned with current env contract', async () => {
   const optionalKeys = [
     'OWNER_CHAT_ID',
     'BOT_DISABLED',
+    'INTERNAL_WORKER_DISPATCH_ENABLED',
     'TOPIC_SOURCE_STATUS_MUTATIONS_ENABLED',
     'APP_TIMEZONE',
     'WEBHOOK_BASE_URL',
@@ -66,12 +67,19 @@ test('env example stays aligned with current env contract', async () => {
   assert.match(envExample, /contact_block/u);
 });
 
-test('prompt sample covers every current default prompt key', async () => {
+test('prompt sample covers every active default prompt key', async () => {
   const sample = await readRepoFile('smm_salon_docs', 'samples', 'prompt_config_seed_sample.csv');
   const lines = sample.split(/\r?\n/u).slice(1).filter(Boolean);
   const keys = new Set(lines.map(parseFirstCsvField));
+  const optionalLegacyKeys = new Set([
+    'creative_manifest_generation',
+    'creative_visual_generation',
+  ]);
 
   for (const key of Object.keys(DEFAULT_PROMPTS)) {
+    if (optionalLegacyKeys.has(key)) {
+      continue;
+    }
     assert.ok(keys.has(key), `Missing prompt key in sample: ${key}`);
   }
 
@@ -108,19 +116,38 @@ test('core docs reflect the active command and action surface', async () => {
   const spec = await readRepoFile('smm_salon_docs', '01_system_spec.md');
   const bootstrap = await readRepoFile('smm_salon_docs', '02_bot_service_bootstrap.md');
 
-  for (const command of ['/help', '/start', '/work', '/topic', '/stories', '/creative', '/slider']) {
+  for (const command of ['/help', '/start', '/work', '/topic', '/stories', '/slider']) {
     assert.match(spec, new RegExp(command.replace('/', '\\/'), 'u'));
   }
 
   assert.match(spec, /publish_confirm/u);
+  for (const action of [
+    'work_photo_type_normal',
+    'work_photo_type_studio',
+    'work_subject_hair',
+    'work_subject_brows',
+    'render_mode_collage',
+    'render_mode_separate',
+    'brow_output_before_after',
+    'brow_output_after_only',
+    'background_mode_keep',
+    'background_mode_blur',
+    'cleanup_on',
+    'cleanup_off',
+  ]) {
+    assert.match(spec, new RegExp(action, 'u'));
+  }
   assert.doesNotMatch(spec, /^- `publish_now`$/mu);
   assert.match(spec, /не поддерживает user-facing `schedule` action/u);
   assert.doesNotMatch(bootstrap, /^- `(?:GET|POST) \/api\/cron\/deliver`$/mu);
   assert.doesNotMatch(bootstrap, /schedule_prompt/u);
+  assert.match(bootstrap, /INTERNAL_WORKER_DISPATCH_ENABLED/u);
   assert.match(bootstrap, /story_topics/u);
   assert.match(bootstrap, /creative_ideas/u);
   assert.match(bootstrap, /slider_topics/u);
   assert.match(bootstrap, /runtime-action/u);
+  assert.match(bootstrap, /collection-finalize/u);
+  assert.match(bootstrap, /x-anita-worker-token/u);
 });
 
 test('current docs no longer describe Google SQLite or old env tails as active runtime', async () => {
@@ -131,6 +158,7 @@ test('current docs no longer describe Google SQLite or old env tails as active r
   assert.doesNotMatch(projectContext, /Google Drive stores originals/u);
   assert.doesNotMatch(projectContext, /SQLite stores runtime state/u);
   assert.doesNotMatch(projectContext, /better-sqlite3/u);
+  assert.doesNotMatch(projectContext, /- `\/creative`$/mu);
 
   assert.doesNotMatch(openItems, /MASTER_CONTACT_PHONE/u);
   assert.doesNotMatch(openItems, /\/api\/cron\/deliver/u);

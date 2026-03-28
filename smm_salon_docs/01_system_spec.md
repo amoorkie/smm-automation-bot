@@ -2,7 +2,7 @@
 
 ## 1. Scope
 
-Текущий бот поддерживает шесть продуктовых сценариев:
+Текущий бот поддерживает пять продуктовых сценариев:
 
 - `/work`:
   - принять 1-3 фото одной работы мастера;
@@ -14,9 +14,6 @@
 - `/stories`:
   - выбрать тему сториз из `story_topics`;
   - собрать single-slide story preview.
-- `/creative`:
-  - выбрать идею из `creative_ideas`;
-  - собрать single-slide creative preview.
 - `/slider`:
   - выбрать тему карусели из `slider_topics`;
   - собрать multi-slide preview из 3-5 слайдов.
@@ -54,7 +51,6 @@ Google Sheets, Google Drive и SQLite больше не являются active 
 - `/work`
 - `/topic`
 - `/stories`
-- `/creative`
 - `/slider`
 
 Команды `/logs` и `/logs raw` удалены из продукта и считаются unknown command.
@@ -65,8 +61,9 @@ Google Sheets, Google Drive и SQLite больше не являются active 
 
 - `expert_topics`
 - `story_topics`
-- `creative_ideas`
 - `slider_topics`
+
+Таблица `creative_ideas` сохранена в schema и импортах ради backward compatibility, но user-facing `/creative` больше не входит в активный продуктовый surface.
 
 Каждая строка темы или идеи имеет типовой контракт:
 
@@ -88,22 +85,45 @@ Google Sheets, Google Drive и SQLite больше не являются active 
 ### 5.1 Session and collection rules
 
 - `/work` открывает session window на 10 минут.
+- Первое действие после `/work`:
+  - `work_photo_type_normal`
+  - `work_photo_type_studio`
+  - `cancel`
+- Runtime keeps a compatibility fallback: if the operator uploads photos before pressing a type button, the flow is treated as `work_photo_type_normal`.
 - Фото принимаются только после `/work`; иначе бот отвечает `Сначала отправь /work, потом фото.`
 - Одна logical collection содержит от 1 до 3 фото.
 - Базовый debounce финализации коллекции: 3 секунды после последнего фото.
-- Для первого фото альбома применяется более длинное initial grace window: 60 секунд.
+- Для первого фото альбома и для неполного альбома применяются короткие grace windows поверх базового debounce.
 - Одинарное фото без `media_group_id` тоже финализируется через debounce window.
-- После стабилизации коллекции бот не начинает генерацию автоматически:
-  - сначала показывает выбор render mode;
-  - далее запускает generation по callback action.
+- После стабилизации коллекции бот не всегда начинает generation одинаково:
+  - сначала показывает выбор subject type;
+  - для multi-photo сценария затем показывает `render_mode_collage` / `render_mode_separate`;
+  - для brows отдельно спрашивает `до / после` или `только после`;
+  - для `studio` generation уходит сразу в neutral pipeline без повторного выбора фона;
+  - для `normal` на фоне остаются только `background_mode_keep` и `background_mode_blur`, после чего может идти cleanup step.
 
 ### 5.2 Current UX
 
-- `/work` открывает окно для загрузки фото.
-- После стабилизации альбома бот показывает режимы:
-  - `render_mode_collage`
-  - `render_mode_separate`
-  - `cancel`
+- `/work` сначала открывает выбор типа фото, а уже затем окно загрузки фото.
+- Single-photo hair flow:
+  - `photo type`
+  - upload
+  - `subject`
+  - для `normal`: `background keep|blur` -> `cleanup`
+  - для `studio`: immediate neutral generation
+- Single-photo brow flow:
+  - `photo type`
+  - upload
+  - `subject=brows`
+  - `brow output`
+  - для `normal`: `background keep|blur` -> `cleanup`
+  - для `studio`: immediate neutral brow generation
+- Multi-photo flow:
+  - `photo type`
+  - upload
+  - `subject`
+  - `render mode`
+  - далее либо `brow output`, либо background/cleanup, либо immediate studio generation
 - После выбора режима бот отправляет progress messages:
   - начало обработки;
   - подготовка изображений;
@@ -150,7 +170,7 @@ Google Sheets, Google Drive и SQLite больше не являются active 
 
 ### 6.1 Common contract
 
-Режимы `/topic`, `/stories`, `/creative`, `/slider` работают одинаково по верхнему уровню:
+Режимы `/topic`, `/stories`, `/slider` работают одинаково по верхнему уровню:
 
 - бот не берет следующую тему автоматически;
 - сначала открывается picker со строками в статусе `ready`;
@@ -179,15 +199,7 @@ Google Sheets, Google Drive и SQLite больше не являются active 
   - `story_manifest_generation`
   - `story_visual_generation`
 
-### 6.4 `/creative`
-
-- source table: `creative_ideas`
-- preview type: single vertical creative slide
-- prompt pair:
-  - `creative_manifest_generation`
-  - `creative_visual_generation`
-
-### 6.5 `/slider`
+### 6.4 `/slider`
 
 - source table: `slider_topics`
 - preview type: 3-5 vertical slides
@@ -205,9 +217,21 @@ Google Sheets, Google Drive и SQLite больше не являются active 
   - `picker_prev_*`
   - `picker_next_*`
   - `picker_cancel_*`
-- work mode actions:
+- work bootstrap actions:
+  - `work_photo_type_normal`
+  - `work_photo_type_studio`
+  - `cancel`
+- work runtime actions:
+  - `work_subject_hair`
+  - `work_subject_brows`
   - `render_mode_collage`
   - `render_mode_separate`
+  - `brow_output_before_after`
+  - `brow_output_after_only`
+  - `background_mode_keep`
+  - `background_mode_blur`
+  - `cleanup_on`
+  - `cleanup_off`
   - `cancel`
 - revision actions:
   - `version_prev`
@@ -261,6 +285,8 @@ Structured log entry использует поля:
 - `GET /cron/cleanup`
 - `POST /telegram/webhook`
 - `POST /worker/telegram-update`
+- `POST /worker/runtime-action`
+- `POST /worker/collection-finalize`
 
 ### 9.2 Vercel handlers
 
@@ -271,6 +297,7 @@ Structured log entry использует поля:
 - `POST /api/telegram/webhook`
 - `POST /api/worker/telegram-update`
 - `POST /api/worker/runtime-action`
+- `POST /api/worker/collection-finalize`
 
 ### 9.3 Worker auth
 

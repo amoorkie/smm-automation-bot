@@ -51,8 +51,6 @@
 - `topic_image_generation`
 - `story_manifest_generation`
 - `story_visual_generation`
-- `creative_manifest_generation`
-- `creative_visual_generation`
 - `slider_manifest_generation`
 - `slider_visual_generation`
 
@@ -76,6 +74,8 @@ Reference seed лежит в [prompt_config_seed_sample.csv](/A:/ANITA-BOT/smm_s
 - `APP_TIMEZONE`
 - `OWNER_CHAT_ID`
 - `BOT_DISABLED`
+- `INTERNAL_WORKER_DISPATCH_ENABLED`
+- `TOPIC_SOURCE_STATUS_MUTATIONS_ENABLED`
 - `WEBHOOK_BASE_URL`
 - `PORT`
 
@@ -84,6 +84,9 @@ Reference seed лежит в [prompt_config_seed_sample.csv](/A:/ANITA-BOT/smm_s
 - `APP_TIMEZONE` по умолчанию: `Europe/Moscow`
 - `PORT` по умолчанию: `3000`
 - на Vercel `WEBHOOK_BASE_URL` можно не задавать вручную, если доступен `VERCEL_URL`
+- `INTERNAL_WORKER_DISPATCH_ENABLED=true` включает async self-dispatch для `POST /api/worker/runtime-action` и `POST /api/worker/collection-finalize`
+- `TOPIC_SOURCE_STATUS_MUTATIONS_ENABLED=true` разрешает менять source-row статусы вне QA-safe режима
+- `x-anita-worker-token` вычисляется из `TG_BOT_TOKEN`; отдельный worker secret сейчас не настраивается
 - contact block задается через `prompt_templates.contact_block`, а не через env
 
 ## 5. Vercel env
@@ -102,6 +105,8 @@ Reference seed лежит в [prompt_config_seed_sample.csv](/A:/ANITA-BOT/smm_s
 - `APP_TIMEZONE`
 - `OWNER_CHAT_ID`
 - `BOT_DISABLED`
+- `INTERNAL_WORKER_DISPATCH_ENABLED`
+- `TOPIC_SOURCE_STATUS_MUTATIONS_ENABLED`
 - `WEBHOOK_BASE_URL`
 
 ## 6. Deploy
@@ -128,6 +133,7 @@ Reference seed лежит в [prompt_config_seed_sample.csv](/A:/ANITA-BOT/smm_s
 - `GET /api/cron/cleanup`
 - `POST /api/worker/telegram-update`
 - `POST /api/worker/runtime-action`
+- `POST /api/worker/collection-finalize`
 
 Worker endpoints требуют `x-anita-worker-token`.
 
@@ -145,12 +151,12 @@ Worker endpoints требуют `x-anita-worker-token`.
 
 1. `/help`
 2. `/start`
-3. `/work` + 1 фото
-4. `/work` + 2-3 фото одним альбомом
-5. выбор `collage` и `separate` после `/work`
-6. `/topic`
-7. `/stories`
-8. `/creative`
+3. `/work` -> выбор `обычное` или `студийное` -> 1 фото
+4. `/work` -> выбор `обычное` или `студийное` -> 2-3 фото одним альбомом
+5. для `normal` проверить ветки `background keep|blur` и `cleanup`
+6. для `studio` проверить, что повторный экран выбора фона не появляется и generation идет сразу в neutral pipeline
+7. `/topic`
+8. `/stories`
 9. `/slider`
 10. revision actions:
    - `version_prev`
@@ -159,7 +165,7 @@ Worker endpoints требуют `x-anita-worker-token`.
    - `regenerate_text`
    - `regenerate_all`
    - `cancel`
-10. `publish_confirm` для topic-like preview
+11. `publish_confirm` для topic-like preview
 
 ## 10. Logs
 

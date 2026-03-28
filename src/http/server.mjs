@@ -33,6 +33,28 @@ export function createServer({ env, service, bot }) {
     return reply.send({ ok: true, result });
   });
 
+  app.post('/worker/runtime-action', async (request, reply) => {
+    if (env.botDisabled) {
+      return reply.status(503).send({ ok: false, error: 'bot_disabled' });
+    }
+    if (!isWorkerRequestAuthorized(request.headers, env)) {
+      return reply.status(401).send({ ok: false, error: 'unauthorized_worker_request' });
+    }
+    const result = await service.handleQueuedRuntimeAction(request.body ?? {});
+    return reply.send({ ok: true, result });
+  });
+
+  app.post('/worker/collection-finalize', async (request, reply) => {
+    if (env.botDisabled) {
+      return reply.status(503).send({ ok: false, error: 'bot_disabled' });
+    }
+    if (!isWorkerRequestAuthorized(request.headers, env)) {
+      return reply.status(401).send({ ok: false, error: 'unauthorized_worker_request' });
+    }
+    const result = await service.handleCollectionFinalizeAction(request.body ?? {});
+    return reply.send({ ok: true, result });
+  });
+
   app.post('/telegram/webhook', async (request, reply) => {
     if (env.botDisabled) {
       return reply.status(503).send({ ok: false, error: 'bot_disabled' });

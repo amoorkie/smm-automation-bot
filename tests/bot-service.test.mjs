@@ -30,11 +30,6 @@ test('topic-like visual prompts forbid baked text and collage layouts', () => {
   assert.match(DEFAULT_PROMPTS.story_visual_generation, /Do not create an infographic, a collage, a grid/i);
   assert.match(DEFAULT_PROMPTS.story_manifest_generation, /коротких постов \/work/i);
   assert.match(DEFAULT_PROMPTS.story_manifest_generation, /Часто слышу этот вопрос/i);
-  assert.match(DEFAULT_PROMPTS.creative_manifest_generation, /headline — это один сильный hook/u);
-  assert.match(DEFAULT_PROMPTS.creative_manifest_generation, /salon-coded/i);
-  assert.match(DEFAULT_PROMPTS.creative_manifest_generation, /Не пиши служебные фразы/i);
-  assert.match(DEFAULT_PROMPTS.creative_visual_generation, /zero readable text/i);
-  assert.match(DEFAULT_PROMPTS.creative_visual_generation, /simple flat vector/i);
   assert.match(DEFAULT_PROMPTS.slider_visual_generation, /zero readable text/i);
   assert.match(DEFAULT_PROMPTS.slider_visual_generation, /Do not generate a collage, a tiled grid/i);
   assert.match(DEFAULT_PROMPTS.slider_manifest_generation, /меньше текста, чем stories/i);
@@ -50,24 +45,6 @@ test('stories body normalization humanizes neutral text to master voice', () => 
   );
 
   assert.match(body, /Если коротко,|Часто слышу этот вопрос\.|Я бы сказала так:|По опыту скажу так:/u);
-});
-
-test('creative manifest normalization replaces generic brief with real subhead and removes eyebrow label', () => {
-  const ctx = createService();
-  const manifest = ctx.service.normalizeTopicLikeManifest('creative', {
-    headline: 'День, когда утюжок устал сильнее меня',
-    subhead: 'Ироничный креатив про частую горячую укладку и ее цену.',
-    bullets: [],
-  }, {
-    topic_id: 'CR-1',
-    title: 'День, когда утюжок устал сильнее меня',
-    brief: 'Ироничный креатив про частую горячую укладку и ее цену.',
-    tags: 'термозащита;утюжок;укладка',
-  });
-
-  assert.equal(manifest.eyebrow, '');
-  assert.notEqual(manifest.subhead, 'Ироничный креатив про частую горячую укладку и ее цену.');
-  assert.match(manifest.subhead, /длина|жара|утюж|горяч/u);
 });
 
 test('slider manifest normalization replaces generic cover brief and uses descriptive fallback slides', () => {
@@ -450,7 +427,7 @@ function createPromptConfig() {
   };
 }
 
-function createOpenRouter() {
+function createOpenRouter(options = {}) {
   const textCalls = [];
   const imageCalls = [];
   return {
@@ -479,7 +456,7 @@ function createOpenRouter() {
           width: 900,
           height: 1200,
           channels: 3,
-          background: label.includes('reframe') ? '#d7c6b4' : '#b7926f',
+          background: label.includes('polish') ? '#ead8c4' : label.includes('reframe') ? '#d7c6b4' : '#b7926f',
         },
       }).jpeg().toBuffer();
       return { images: [`data:image/jpeg;base64,${imageBuffer.toString('base64')}`] };
@@ -487,12 +464,12 @@ function createOpenRouter() {
   };
 }
 
-function createService({ initialTables = {}, envOverrides = {} } = {}) {
+function createService({ initialTables = {}, envOverrides = {}, openrouterOverrides = {} } = {}) {
   const store = new FakeStore(initialTables);
   const repos = createRepositories(store);
   const bot = createFakeBot();
   const botLogger = new FakeBotLogger();
-  const openrouter = createOpenRouter();
+  const openrouter = createOpenRouter(openrouterOverrides);
   const service = new SalonBotService({
     env: {
       appTimezone: 'Europe/Moscow',
@@ -501,6 +478,7 @@ function createService({ initialTables = {}, envOverrides = {} } = {}) {
       imageModelId: 'google/gemini-3.1-flash-image-preview',
       textModelId: 'openai/gpt-5.4',
       webhookBaseUrl: '',
+      internalWorkerDispatchEnabled: false,
       topicSourceStatusMutationsEnabled: true,
       ...envOverrides,
     },
@@ -608,12 +586,114 @@ function allSentTexts(bot) {
     .map((item) => item.text ?? item.caption ?? '');
 }
 
+async function getWorkSessionPayload(ctx, chatId) {
+  const session = await ctx.repos.getSessionByChatAndMode(chatId, 'work');
+  return session ? JSON.parse(session.pending_payload_json || '{}') : null;
+}
+
+async function chooseWorkSubject(ctx, {
+  chatId,
+  userId,
+  action = 'work_subject_hair',
+  updateId = Date.now(),
+  callbackId = `cb-${action}-${Date.now()}`,
+} = {}) {
+  const token = await pickCallbackToken(ctx, action);
+  assert.ok(token, `Missing callback token for ${action}`);
+  const payload = await getWorkSessionPayload(ctx, chatId);
+  const runtimes = await ctx.store.getRows(TABLE_NAMES.jobRuntimeCache);
+  const runtime = runtimes.length > 0
+    ? await ctx.repos.getRuntime(runtimes[runtimes.length - 1].job_id)
+    : null;
+  await ctx.service.handleTelegramUpdate({
+    update_id: updateId,
+    callback_query: {
+      id: callbackId,
+      data: `${action}:${token}`,
+      from: { id: userId },
+      message: { message_id: payload?.textMessageId ?? runtime?.text_message_id ?? 0, chat: { id: chatId } },
+    },
+  });
+}
+
+async function chooseWorkPhotoType(ctx, {
+  chatId,
+  userId,
+  action = 'work_photo_type_normal',
+  updateId = Date.now(),
+  callbackId = `cb-${action}-${Date.now()}`,
+} = {}) {
+  const session = await ctx.repos.getSessionByChatAndMode(chatId, 'work');
+  assert.notEqual(session?.state, 'awaiting_assets', 'Photo type must be selected before uploading /work assets');
+  const token = await pickCallbackToken(ctx, action);
+  assert.ok(token, `Missing callback token for ${action}`);
+  const payload = await getWorkSessionPayload(ctx, chatId);
+  await ctx.service.handleTelegramUpdate({
+    update_id: updateId,
+    callback_query: {
+      id: callbackId,
+      data: `${action}:${token}`,
+      from: { id: userId },
+      message: { message_id: payload?.textMessageId ?? 0, chat: { id: chatId } },
+    },
+  });
+}
+
+async function chooseRuntimeAction(ctx, {
+  chatId,
+  userId,
+  action,
+  updateId = Date.now(),
+  callbackId = `cb-${action}-${Date.now()}`,
+} = {}) {
+  const token = await pickCallbackToken(ctx, action);
+  assert.ok(token, `Missing callback token for ${action}`);
+  const runtimes = await ctx.store.getRows(TABLE_NAMES.jobRuntimeCache);
+  assert.ok(runtimes.length > 0, 'No runtime rows found');
+  const runtime = await ctx.repos.getRuntime(runtimes[runtimes.length - 1].job_id);
+  await ctx.service.handleTelegramUpdate({
+    update_id: updateId,
+    callback_query: {
+      id: callbackId,
+      data: `${action}:${token}`,
+      from: { id: userId },
+      message: { message_id: runtime.text_message_id ?? 0, chat: { id: chatId } },
+    },
+  });
+  return await ctx.repos.getRuntime(runtime.job_id);
+}
+
+async function chooseHairSubjectIfNeeded(ctx, {
+  chatId,
+  userId,
+  updateId = Date.now(),
+  callbackId = `cb-work-subject-hair-${Date.now()}`,
+} = {}) {
+  if (!(await pickCallbackToken(ctx, 'work_subject_hair'))) {
+    return null;
+  }
+  return chooseRuntimeAction(ctx, {
+    chatId,
+    userId,
+    action: 'work_subject_hair',
+    updateId,
+    callbackId,
+  });
+}
+
 test('work flow builds collage preview without photo-accepted spam', async () => {
   const ctx = createService();
 
   await ctx.service.handleTelegramUpdate({
     update_id: 1,
     message: { message_id: 1, text: '/work', chat: { id: 42 }, from: { id: 7 } },
+  });
+  await chooseWorkPhotoType(ctx, {
+    chatId: 42,
+    userId: 7,
+      action: 'work_photo_type_normal',
+    updateId: 1001,
+    callbackId: 'cb-work-photo-type-1',
   });
   await Promise.all([
     ctx.service.handleTelegramUpdate({
@@ -648,7 +728,14 @@ test('work flow builds collage preview without photo-accepted spam', async () =>
   await ctx.service.runCollectionFinalizer();
 
   const runtimesAfterFinalize = await ctx.store.getRows(TABLE_NAMES.jobRuntimeCache);
-  const interimRuntime = await ctx.repos.getRuntime(runtimesAfterFinalize[0].job_id);
+  let interimRuntime = await ctx.repos.getRuntime(runtimesAfterFinalize[0].job_id);
+  assert.equal(interimRuntime.runtime_status, 'awaiting_subject_type');
+  interimRuntime = await chooseHairSubjectIfNeeded(ctx, {
+    chatId: 42,
+    userId: 7,
+    updateId: 1002,
+    callbackId: 'cb-work-subject-hair-1',
+  });
   const renderModeToken = await pickCallbackToken(ctx, 'render_mode_collage');
   assert.ok(renderModeToken);
   assert.equal(interimRuntime.runtime_status, 'awaiting_render_mode');
@@ -661,6 +748,20 @@ test('work flow builds collage preview without photo-accepted spam', async () =>
       from: { id: 7 },
       message: { message_id: interimRuntime.text_message_id, chat: { id: 42 } },
     },
+  });
+  await chooseRuntimeAction(ctx, {
+    chatId: 42,
+    userId: 7,
+    action: 'background_mode_blur',
+    updateId: 5,
+    callbackId: 'cb-work-bg-1',
+  });
+  await chooseRuntimeAction(ctx, {
+    chatId: 42,
+    userId: 7,
+    action: 'cleanup_off',
+    updateId: 6,
+    callbackId: 'cb-work-cleanup-1',
   });
 
   await waitFor(async () => {
@@ -678,19 +779,27 @@ test('work flow builds collage preview without photo-accepted spam', async () =>
   assert.equal(runtime.active_revision, 1);
   assert.deepEqual(runtime.draft_payload.originalTelegramFileIds, ['p1-large', 'p2-large']);
   assert.equal(runtime.draft_payload.previewTelegramFileIds.length, 1);
+  assert.equal(runtime.draft_payload.promptMode, 'normal');
+  assert.equal(runtime.draft_payload.photoType, 'normal');
+  assert.equal(runtime.draft_payload.backgroundMode, 'blur');
+  assert.equal(runtime.draft_payload.cleanupMode, 'off');
   assert.equal(runtime.draft_payload.renderMode, 'collage');
   assert.equal(runtime.draft_payload.finalRenderMode, 'collage');
   assert.equal(runtime.draft_payload.revisionHistory.length, 1);
+  assert.notEqual(runtime.text_message_id, runtime.collage_message_id);
   assert.equal(await ctx.repos.getSessionByChatAndMode(42, 'work'), null);
   assert.equal(ctx.openrouter.textCalls.find((call) => call.metadata?.source_type === 'work').model, 'openai/gpt-5.4');
   assert.ok(ctx.openrouter.imageCalls.every((call) => call.metadata?.model === 'google/gemini-3.1-flash-image-preview'));
   assert.equal(ctx.openrouter.imageCalls.filter((call) => call.metadata?.pass === 'compose_collage').length, 1);
 
   const sentTexts = allSentTexts(ctx.bot);
-  assert.ok(sentTexts.includes(USER_MESSAGES.workStarted));
+  assert.ok(sentTexts.includes(USER_MESSAGES.workPhotoRequest));
+  assert.ok(sentTexts.some((text) => text.includes(USER_MESSAGES.workSubjectChoice)));
   assert.ok(sentTexts.some((text) => text.includes(USER_MESSAGES.workModeChoice)));
+  assert.ok(sentTexts.some((text) => text.includes(USER_MESSAGES.workBackgroundChoice)));
   assert.ok(!sentTexts.some((text) => /Фото принято:/u.test(text)));
   assert.ok(sentTexts.includes(USER_MESSAGES.generationQueued.collage));
+  assert.ok(sentTexts.includes(USER_MESSAGES.workAnalyzingPhotos));
   assert.ok(sentTexts.includes(USER_MESSAGES.workEnhancingImages));
   assert.ok(sentTexts.includes(USER_MESSAGES.workPreparingText));
   assert.ok(sentTexts.includes(USER_MESSAGES.assemblingPreview));
@@ -704,6 +813,13 @@ test('three-photo album can be rendered in separate mode and keeps all files', a
   await ctx.service.handleTelegramUpdate({
     update_id: 30,
     message: { message_id: 30, text: '/work', chat: { id: 77 }, from: { id: 11 } },
+  });
+  await chooseWorkPhotoType(ctx, {
+    chatId: 77,
+    userId: 11,
+    action: 'work_photo_type_normal',
+    updateId: 1030,
+    callbackId: 'cb-work-prompt-3',
   });
 
   for (const [offset, fileId] of ['a-large', 'b-large', 'c-large'].entries()) {
@@ -726,9 +842,16 @@ test('three-photo album can be rendered in separate mode and keeps all files', a
   await ctx.service.runCollectionFinalizer();
 
   const runtimesAfterFinalize = await ctx.store.getRows(TABLE_NAMES.jobRuntimeCache);
+  let runtimeBefore = await ctx.repos.getRuntime(runtimesAfterFinalize[0].job_id);
+  assert.equal(runtimeBefore.runtime_status, 'awaiting_subject_type');
+  runtimeBefore = await chooseHairSubjectIfNeeded(ctx, {
+    chatId: 77,
+    userId: 11,
+    updateId: 1031,
+    callbackId: 'cb-work-subject-hair-3',
+  });
   const separateToken = await pickCallbackToken(ctx, 'render_mode_separate');
   assert.ok(separateToken);
-  const runtimeBefore = await ctx.repos.getRuntime(runtimesAfterFinalize[0].job_id);
   await ctx.service.handleTelegramUpdate({
     update_id: 40,
     callback_query: {
@@ -737,6 +860,22 @@ test('three-photo album can be rendered in separate mode and keeps all files', a
       from: { id: 11 },
       message: { message_id: runtimeBefore.text_message_id, chat: { id: 77 } },
     },
+  });
+
+  const runtimeAfterBackground = await chooseRuntimeAction(ctx, {
+    chatId: 77,
+    userId: 11,
+    action: 'background_mode_blur',
+    updateId: 41,
+    callbackId: 'cb-work-bg-3',
+  });
+  assert.equal(runtimeAfterBackground.runtime_status, 'awaiting_cleanup_mode');
+  await chooseRuntimeAction(ctx, {
+    chatId: 77,
+    userId: 11,
+    action: 'cleanup_off',
+    updateId: 42,
+    callbackId: 'cb-work-cleanup-3',
   });
 
   await waitFor(async () => {
@@ -748,6 +887,8 @@ test('three-photo album can be rendered in separate mode and keeps all files', a
   const runtime = await ctx.repos.getRuntime(queueRows[0].job_id);
   assert.deepEqual(runtime.draft_payload.originalTelegramFileIds, ['a-large', 'b-large', 'c-large']);
   assert.equal(runtime.draft_payload.previewTelegramFileIds.length, 3);
+  assert.equal(runtime.draft_payload.backgroundMode, 'blur');
+  assert.equal(runtime.draft_payload.cleanupMode, 'off');
   assert.equal(runtime.draft_payload.renderMode, 'separate');
   assert.equal(runtime.draft_payload.finalRenderMode, 'separate');
   assert.equal(runtime.draft_payload.sourceAssetCount, 3);
@@ -756,12 +897,120 @@ test('three-photo album can be rendered in separate mode and keeps all files', a
   assert.ok(ctx.bot.sent.some((item) => item.type === 'edit_message_text'));
 });
 
+test('separate mode regenerates images in place without sending a new album', async () => {
+  const ctx = createService();
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 130,
+    message: { message_id: 130, text: '/work', chat: { id: 91 }, from: { id: 17 } },
+  });
+  await chooseWorkPhotoType(ctx, {
+    chatId: 91,
+    userId: 17,
+    action: 'work_photo_type_normal',
+    updateId: 1130,
+    callbackId: 'cb-work-prompt-separate',
+  });
+
+  for (const [offset, fileId] of ['s1-large', 's2-large', 's3-large'].entries()) {
+    await ctx.service.handleTelegramUpdate({
+      update_id: 131 + offset,
+      message: {
+        message_id: 131 + offset,
+        media_group_id: 'album-separate-refresh',
+        chat: { id: 91 },
+        from: { id: 17 },
+        photo: [
+          { file_id: `${fileId}-small`, file_unique_id: `us-small-${offset}`, width: 100, height: 100 },
+          { file_id: fileId, file_unique_id: `us-${offset}`, width: 1000, height: 1000 },
+        ],
+      },
+    });
+  }
+
+  await expireOnlyCollection(ctx);
+  await ctx.service.runCollectionFinalizer();
+
+  const runtimesAfterFinalize = await ctx.store.getRows(TABLE_NAMES.jobRuntimeCache);
+  let runtimeBeforeMode = await ctx.repos.getRuntime(runtimesAfterFinalize[0].job_id);
+  assert.equal(runtimeBeforeMode.runtime_status, 'awaiting_subject_type');
+  runtimeBeforeMode = await chooseHairSubjectIfNeeded(ctx, {
+    chatId: 91,
+    userId: 17,
+    updateId: 1131,
+    callbackId: 'cb-work-subject-hair-separate',
+  });
+  const separateToken = await pickCallbackToken(ctx, 'render_mode_separate');
+  await ctx.service.handleTelegramUpdate({
+    update_id: 140,
+    callback_query: {
+      id: 'cb-work-separate-1',
+      data: `render_mode_separate:${separateToken}`,
+      from: { id: 17 },
+      message: { message_id: runtimeBeforeMode.text_message_id, chat: { id: 91 } },
+    },
+  });
+
+  await chooseRuntimeAction(ctx, {
+    chatId: 91,
+    userId: 17,
+    action: 'background_mode_blur',
+    updateId: 141,
+    callbackId: 'cb-work-bg-separate',
+  });
+  await chooseRuntimeAction(ctx, {
+    chatId: 91,
+    userId: 17,
+    action: 'cleanup_off',
+    updateId: 142,
+    callbackId: 'cb-work-cleanup-separate',
+  });
+
+  await waitFor(async () => {
+    const runtime = await ctx.repos.getRuntime(runtimesAfterFinalize[0].job_id);
+    assert.equal(runtime.runtime_status, 'preview_ready');
+  });
+
+  const runtimeBeforeRegenerate = await ctx.repos.getRuntime(runtimesAfterFinalize[0].job_id);
+  const initialMediaGroupCount = ctx.bot.sent.filter((item) => item.type === 'media_group').length;
+  const initialMediaEdits = ctx.bot.sent.filter((item) => item.type === 'edit_message_media').length;
+  const regenerateToken = await pickCallbackToken(ctx, 'regenerate_images');
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 143,
+    callback_query: {
+      id: 'cb-work-separate-2',
+      data: `regenerate_images:${regenerateToken}`,
+      from: { id: 17 },
+      message: { message_id: runtimeBeforeRegenerate.text_message_id, chat: { id: 91 } },
+    },
+  });
+
+  await waitFor(async () => {
+    const runtime = await ctx.repos.getRuntime(runtimesAfterFinalize[0].job_id);
+    assert.equal(runtime.runtime_status, 'preview_ready');
+    assert.equal(runtime.assets_message_ids.length, 3);
+  });
+
+  const runtimeAfterRegenerate = await ctx.repos.getRuntime(runtimesAfterFinalize[0].job_id);
+  assert.deepEqual(runtimeAfterRegenerate.assets_message_ids, runtimeBeforeRegenerate.assets_message_ids);
+  assert.equal(ctx.bot.sent.filter((item) => item.type === 'media_group').length, initialMediaGroupCount);
+  assert.equal(ctx.bot.sent.filter((item) => item.type === 'edit_message_media').length, initialMediaEdits + 3);
+});
+
 test('regenerate text creates a new revision and version_prev opens the older one', async () => {
   const ctx = createService();
 
   await ctx.service.handleTelegramUpdate({
     update_id: 50,
     message: { message_id: 50, text: '/work', chat: { id: 61 }, from: { id: 9 } },
+  });
+  await chooseWorkPhotoType(ctx, {
+    chatId: 61,
+    userId: 9,
+    action: 'work_photo_type_normal',
+    updateId: 1050,
+    callbackId: 'cb-work-prompt-r',
   });
   for (const [offset, fileId] of ['r1-large', 'r2-large'].entries()) {
     await ctx.service.handleTelegramUpdate({
@@ -783,15 +1032,38 @@ test('regenerate text creates a new revision and version_prev opens the older on
   await ctx.service.runCollectionFinalizer();
   const modeToken = await pickCallbackToken(ctx, 'render_mode_separate');
   const runtimesAfterFinalize = await ctx.store.getRows(TABLE_NAMES.jobRuntimeCache);
-  const runtimeBefore = await ctx.repos.getRuntime(runtimesAfterFinalize[0].job_id);
+  let runtimeBefore = await ctx.repos.getRuntime(runtimesAfterFinalize[0].job_id);
+  assert.equal(runtimeBefore.runtime_status, 'awaiting_subject_type');
+  runtimeBefore = await chooseHairSubjectIfNeeded(ctx, {
+    chatId: 61,
+    userId: 9,
+    updateId: 1051,
+    callbackId: 'cb-work-subject-hair-r',
+  });
+  const refreshedModeToken = await pickCallbackToken(ctx, 'render_mode_separate');
   await ctx.service.handleTelegramUpdate({
     update_id: 60,
     callback_query: {
       id: 'cb-work-r1',
-      data: `render_mode_separate:${modeToken}`,
+      data: `render_mode_separate:${refreshedModeToken}`,
       from: { id: 9 },
       message: { message_id: runtimeBefore.text_message_id, chat: { id: 61 } },
     },
+  });
+
+  await chooseRuntimeAction(ctx, {
+    chatId: 61,
+    userId: 9,
+    action: 'background_mode_blur',
+    updateId: 64,
+    callbackId: 'cb-work-bg-r',
+  });
+  await chooseRuntimeAction(ctx, {
+    chatId: 61,
+    userId: 9,
+    action: 'cleanup_off',
+    updateId: 65,
+    callbackId: 'cb-work-cleanup-r',
   });
 
   await waitFor(async () => {
@@ -836,7 +1108,7 @@ test('regenerate text creates a new revision and version_prev opens the older on
 
   runtime = await ctx.repos.getRuntime(jobId);
   assert.equal(runtime.draft_payload.viewRevision, 1);
-  assert.equal(ctx.bot.sent.filter((item) => item.type === 'media_group').length, 3);
+  assert.equal(ctx.bot.sent.filter((item) => item.type === 'media_group').length, 1);
   assert.ok(ctx.bot.sent.some((item) => item.type === 'edit_message_text' && String(item.text ?? '').includes('Версия 1/2')));
 
   const callbackCountAfterPrev = (await ctx.store.getRows(TABLE_NAMES.callbackTokens)).length;
@@ -857,12 +1129,24 @@ test('regenerate text creates a new revision and version_prev opens the older on
   assert.equal((await ctx.store.getRows(TABLE_NAMES.callbackTokens)).length, callbackCountAfterPrev);
 });
 
-test('first album photo keeps the collection open longer before finalize, then shortens after more photos arrive', async () => {
+test('album grace stays open long enough for a late third photo, then shortens once all three arrive', async () => {
   const ctx = createService();
+  const finalizeCalls = [];
+  ctx.service.scheduleCollectionFinalize = async (collectionId) => {
+    finalizeCalls.push(collectionId);
+    return { ok: true, scheduled: true };
+  };
 
   await ctx.service.handleTelegramUpdate({
     update_id: 70,
     message: { message_id: 70, text: '/work', chat: { id: 88 }, from: { id: 12 } },
+  });
+  await chooseWorkPhotoType(ctx, {
+    chatId: 88,
+    userId: 12,
+    action: 'work_photo_type_normal',
+    updateId: 1070,
+    callbackId: 'cb-work-prompt-grace',
   });
 
   await ctx.service.handleTelegramUpdate({
@@ -882,7 +1166,8 @@ test('first album photo keeps the collection open longer before finalize, then s
   let rows = await ctx.store.getRows(TABLE_NAMES.workCollections);
   let collection = await ctx.repos.getCollectionById(rows[0].collection_id);
   assert.equal(collection.count, 1);
-  assert.ok(new Date(collection.deadline_at).getTime() - new Date(collection.last_message_at).getTime() >= 55_000);
+  assert.ok(new Date(collection.deadline_at).getTime() - new Date(collection.last_message_at).getTime() >= 3_000);
+  assert.equal(finalizeCalls.length, 0);
 
   await ctx.service.handleTelegramUpdate({
     update_id: 72,
@@ -901,7 +1186,664 @@ test('first album photo keeps the collection open longer before finalize, then s
   rows = await ctx.store.getRows(TABLE_NAMES.workCollections);
   collection = await ctx.repos.getCollectionById(rows[0].collection_id);
   assert.equal(collection.count, 2);
+  assert.ok(new Date(collection.deadline_at).getTime() - new Date(collection.last_message_at).getTime() >= 5_000);
+  assert.equal(finalizeCalls.length, 1);
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 73,
+    message: {
+      message_id: 73,
+      media_group_id: 'album-grace',
+      chat: { id: 88 },
+      from: { id: 12 },
+      photo: [
+        { file_id: 'g3-small', file_unique_id: 'g3s', width: 100, height: 100 },
+        { file_id: 'g3-large', file_unique_id: 'g3l', width: 1000, height: 1000 },
+      ],
+    },
+  });
+
+  rows = await ctx.store.getRows(TABLE_NAMES.workCollections);
+  collection = await ctx.repos.getCollectionById(rows[0].collection_id);
+  assert.equal(collection.count, 3);
   assert.ok(new Date(collection.deadline_at).getTime() - new Date(collection.last_message_at).getTime() <= 5_000);
+  assert.equal(finalizeCalls.length, 2);
+});
+
+test('handlePhoto dispatches collection finalize to worker and skips inline finalize when base url exists', async () => {
+  const ctx = createService({
+    envOverrides: { webhookBaseUrl: 'https://bot.example.com', internalWorkerDispatchEnabled: true },
+  });
+  const dispatchCalls = [];
+  ctx.service.dispatchCollectionFinalizeAsync = (collectionId, meta) => {
+    dispatchCalls.push({ collectionId, meta });
+    return true;
+  };
+  ctx.service.scheduleCollectionFinalize = async () => {
+    throw new Error('inline finalize should not run when worker dispatch succeeds');
+  };
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 170,
+    message: { message_id: 170, text: '/work', chat: { id: 188 }, from: { id: 12 } },
+  });
+  await chooseWorkPhotoType(ctx, {
+    chatId: 188,
+    userId: 12,
+    action: 'work_photo_type_normal',
+    updateId: 1170,
+    callbackId: 'cb-work-prompt-dispatch',
+  });
+
+  for (const [offset, fileId] of ['dispatch-large-1', 'dispatch-large-2'].entries()) {
+    await ctx.service.handleTelegramUpdate({
+      update_id: 171 + offset,
+      message: {
+        message_id: 171 + offset,
+        media_group_id: 'album-dispatch',
+        chat: { id: 188 },
+        from: { id: 12 },
+        photo: [
+          { file_id: `${fileId}-small`, file_unique_id: `dispatch-small-${offset}`, width: 100, height: 100 },
+          { file_id: fileId, file_unique_id: `dispatch-${offset}`, width: 1000, height: 1000 },
+        ],
+      },
+    });
+  }
+
+  assert.equal(dispatchCalls.length, 1);
+  assert.equal(dispatchCalls[0].meta.count, 2);
+});
+
+test('handlePhoto falls back to inline finalize when worker dispatch is unavailable', async () => {
+  const ctx = createService();
+  const finalizeCalls = [];
+  ctx.service.dispatchCollectionFinalizeAsync = () => false;
+  ctx.service.scheduleCollectionFinalize = async (collectionId) => {
+    finalizeCalls.push(collectionId);
+    return { ok: true, scheduled: true };
+  };
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 180,
+    message: { message_id: 180, text: '/work', chat: { id: 199 }, from: { id: 12 } },
+  });
+  await chooseWorkPhotoType(ctx, {
+    chatId: 199,
+    userId: 12,
+    action: 'work_photo_type_normal',
+    updateId: 1180,
+    callbackId: 'cb-work-prompt-inline',
+  });
+
+  for (const [offset, fileId] of ['inline-large-1', 'inline-large-2'].entries()) {
+    await ctx.service.handleTelegramUpdate({
+      update_id: 181 + offset,
+      message: {
+        message_id: 181 + offset,
+        media_group_id: 'album-inline',
+        chat: { id: 199 },
+        from: { id: 12 },
+        photo: [
+          { file_id: `${fileId}-small`, file_unique_id: `inline-small-${offset}`, width: 100, height: 100 },
+          { file_id: fileId, file_unique_id: `inline-${offset}`, width: 1000, height: 1000 },
+        ],
+      },
+    });
+  }
+
+  assert.equal(finalizeCalls.length, 1);
+});
+
+test('dispatchCollectionFinalizeAsync skips self worker dispatch on protected vercel host', async () => {
+  const ctx = createService({
+    envOverrides: {
+      webhookBaseUrl: 'https://anita-bot-service-qro74qq9t-amoorkie-gmailcoms-projects.vercel.app',
+      webhookBaseUrlDerivedFromDeploymentUrl: true,
+      internalWorkerDispatchEnabled: true,
+    },
+  });
+  const originalFetch = global.fetch;
+  global.fetch = async () => {
+    throw new Error('self worker dispatch should not hit fetch on protected vercel host');
+  };
+
+  try {
+    const dispatched = await ctx.service.dispatchCollectionFinalizeAsync('COL-VERCEL', {
+      chatId: 208,
+      userId: 12,
+      collectionIdForLog: 'COL-VERCEL',
+      mediaGroupId: 'album-vercel-inline',
+      count: 2,
+    });
+    assert.equal(dispatched, false);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('late third photo reopens an awaiting_render_mode album and keeps all three assets', async () => {
+  const ctx = createService();
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 80,
+    message: { message_id: 80, text: '/work', chat: { id: 95 }, from: { id: 14 } },
+  });
+  await chooseWorkPhotoType(ctx, {
+    chatId: 95,
+    userId: 14,
+    action: 'work_photo_type_normal',
+    updateId: 1080,
+    callbackId: 'cb-work-prompt-late',
+  });
+
+  for (const [offset, fileId] of ['l1-large', 'l2-large'].entries()) {
+    await ctx.service.handleTelegramUpdate({
+      update_id: 81 + offset,
+      message: {
+        message_id: 81 + offset,
+        media_group_id: 'album-late',
+        chat: { id: 95 },
+        from: { id: 14 },
+        photo: [
+          { file_id: `${fileId}-small`, file_unique_id: `late-small-${offset}`, width: 100, height: 100 },
+          { file_id: fileId, file_unique_id: `late-${offset}`, width: 1000, height: 1000 },
+        ],
+      },
+    });
+  }
+
+  await expireOnlyCollection(ctx);
+  await ctx.service.runCollectionFinalizer();
+
+  const rows = await ctx.store.getRows(TABLE_NAMES.jobRuntimeCache);
+  let runtime = await ctx.repos.getRuntime(rows[0].job_id);
+  assert.equal(runtime.runtime_status, 'awaiting_subject_type');
+  runtime = await chooseHairSubjectIfNeeded(ctx, {
+    chatId: 95,
+    userId: 14,
+    updateId: 1081,
+    callbackId: 'cb-work-subject-hair-late',
+  });
+  assert.equal(runtime.runtime_status, 'awaiting_render_mode');
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 83,
+    message: {
+      message_id: 83,
+      media_group_id: 'album-late',
+      chat: { id: 95 },
+      from: { id: 14 },
+      photo: [
+        { file_id: 'l3-small', file_unique_id: 'late-small-2', width: 100, height: 100 },
+        { file_id: 'l3-large', file_unique_id: 'late-2', width: 1000, height: 1000 },
+      ],
+    },
+  });
+
+  let collection = await ctx.repos.getCollectionById(runtime.collection_id);
+  assert.equal(collection.status, 'collecting');
+  assert.equal(collection.count, 3);
+
+  runtime = await ctx.repos.getRuntime(rows[0].job_id);
+  assert.equal(runtime.runtime_status, 'collecting');
+  assert.equal(runtime.active_callback_set_id, '');
+
+  await expireOnlyCollection(ctx);
+  await ctx.service.runCollectionFinalizer();
+
+  runtime = await ctx.repos.getRuntime(rows[0].job_id);
+  if (runtime.runtime_status === 'awaiting_subject_type') {
+    runtime = await chooseHairSubjectIfNeeded(ctx, {
+      chatId: 95,
+      userId: 14,
+      updateId: 1082,
+      callbackId: 'cb-work-subject-hair-late-reopen',
+    });
+  }
+  const separateToken = await pickCallbackToken(ctx, 'render_mode_separate');
+  runtime = await ctx.repos.getRuntime(rows[0].job_id);
+  await ctx.service.handleTelegramUpdate({
+    update_id: 84,
+    callback_query: {
+      id: 'cb-work-late',
+      data: `render_mode_separate:${separateToken}`,
+      from: { id: 14 },
+      message: { message_id: runtime.text_message_id, chat: { id: 95 } },
+    },
+  });
+
+  await chooseRuntimeAction(ctx, {
+    chatId: 95,
+    userId: 14,
+    action: 'background_mode_blur',
+    updateId: 85,
+    callbackId: 'cb-work-bg-late',
+  });
+  await chooseRuntimeAction(ctx, {
+    chatId: 95,
+    userId: 14,
+    action: 'cleanup_off',
+    updateId: 86,
+    callbackId: 'cb-work-cleanup-late',
+  });
+
+  await waitFor(async () => {
+    const finalRuntime = await ctx.repos.getRuntime(rows[0].job_id);
+    assert.equal(finalRuntime.runtime_status, 'preview_ready');
+    assert.deepEqual(finalRuntime.draft_payload.originalTelegramFileIds, ['l1-large', 'l2-large', 'l3-large']);
+  });
+});
+
+test('single-photo work flow skips render mode and asks background directly', async () => {
+  const ctx = createService();
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 1900,
+    message: { message_id: 1900, text: '/work', chat: { id: 501 }, from: { id: 41 } },
+  });
+  await chooseWorkPhotoType(ctx, {
+    chatId: 501,
+    userId: 41,
+    action: 'work_photo_type_normal',
+    updateId: 1901,
+    callbackId: 'cb-work-prompt-single',
+  });
+  await ctx.service.handleTelegramUpdate({
+    update_id: 1902,
+    message: {
+      message_id: 1902,
+      chat: { id: 501 },
+      from: { id: 41 },
+      photo: [
+        { file_id: 'single-small', file_unique_id: 'single-small-u', width: 100, height: 100 },
+        { file_id: 'single-large', file_unique_id: 'single-large-u', width: 1000, height: 1000 },
+      ],
+    },
+  });
+
+  await expireOnlyCollection(ctx);
+  await ctx.service.runCollectionFinalizer();
+
+  const runtimes = await ctx.store.getRows(TABLE_NAMES.jobRuntimeCache);
+  let runtime = await ctx.repos.getRuntime(runtimes[0].job_id);
+  assert.equal(runtime.runtime_status, 'awaiting_subject_type');
+  runtime = await chooseHairSubjectIfNeeded(ctx, {
+    chatId: 501,
+    userId: 41,
+    updateId: 1903,
+    callbackId: 'cb-work-subject-hair-single',
+  });
+  assert.equal(runtime.runtime_status, 'awaiting_background_mode');
+  assert.equal(runtime.draft_payload.renderMode, 'separate');
+  assert.equal(runtime.draft_payload.promptMode, 'normal');
+  assert.equal(await pickCallbackToken(ctx, 'render_mode_collage'), null);
+});
+
+test('/work starts with photo type choice and opens awaiting_assets only after selection', async () => {
+  const ctx = createService();
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 1905,
+    message: { message_id: 1905, text: '/work', chat: { id: 601 }, from: { id: 51 } },
+  });
+
+  let session = await ctx.repos.getSessionByChatAndMode(601, 'work');
+  assert.equal(session?.state, 'awaiting_photo_type');
+  assert.ok(await pickCallbackToken(ctx, 'work_photo_type_normal'));
+  assert.ok(await pickCallbackToken(ctx, 'work_photo_type_studio'));
+  assert.equal(await pickCallbackToken(ctx, 'work_subject_hair'), null);
+  assert.equal(await pickCallbackToken(ctx, 'work_subject_brows'), null);
+  assert.ok(allSentTexts(ctx.bot).some((text) => text.includes(USER_MESSAGES.workPhotoTypeChoice)));
+
+  await chooseWorkPhotoType(ctx, {
+    chatId: 601,
+    userId: 51,
+    updateId: 1906,
+    callbackId: 'cb-work-photo-type-regular',
+  });
+
+  session = await ctx.repos.getSessionByChatAndMode(601, 'work');
+  assert.equal(session?.state, 'awaiting_assets');
+  assert.ok(allSentTexts(ctx.bot).includes(USER_MESSAGES.workPhotoRequest));
+});
+
+test('single-photo studio flow skips background choice and starts generation right after subject selection', async () => {
+  const ctx = createService();
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 1907,
+    message: { message_id: 1907, text: '/work', chat: { id: 602 }, from: { id: 52 } },
+  });
+  await chooseWorkPhotoType(ctx, {
+    chatId: 602,
+    userId: 52,
+    action: 'work_photo_type_studio',
+    updateId: 1908,
+    callbackId: 'cb-work-photo-type-studio',
+  });
+  await ctx.service.handleTelegramUpdate({
+    update_id: 1909,
+    message: {
+      message_id: 1909,
+      chat: { id: 602 },
+      from: { id: 52 },
+      photo: [
+        { file_id: 'studio-single-small', file_unique_id: 'studio-single-small-u', width: 100, height: 100 },
+        { file_id: 'studio-single-large', file_unique_id: 'studio-single-large-u', width: 1000, height: 1000 },
+      ],
+    },
+  });
+
+  await expireOnlyCollection(ctx);
+  await ctx.service.runCollectionFinalizer();
+
+  const runtimes = await ctx.store.getRows(TABLE_NAMES.jobRuntimeCache);
+  let runtime = await ctx.repos.getRuntime(runtimes[0].job_id);
+  assert.equal(runtime.runtime_status, 'awaiting_subject_type');
+  runtime = await chooseHairSubjectIfNeeded(ctx, {
+    chatId: 602,
+    userId: 52,
+    updateId: 1910,
+    callbackId: 'cb-work-subject-hair-studio',
+  });
+
+  await waitFor(async () => {
+    const freshRuntime = await ctx.repos.getRuntime(runtime.job_id);
+    assert.equal(freshRuntime.runtime_status, 'preview_ready');
+  });
+
+  const finalRuntime = await ctx.repos.getRuntime(runtime.job_id);
+  assert.equal(finalRuntime.draft_payload.photoType, 'studio');
+  assert.equal(finalRuntime.draft_payload.backgroundMode, 'neutral');
+  assert.equal(finalRuntime.draft_payload.cleanupMode, 'off');
+  assert.equal(await pickCallbackToken(ctx, 'background_mode_neutral'), null);
+  assert.ok(ctx.openrouter.imageCalls.some((call) => call.metadata?.pass === 'edit_neutral'));
+
+  const sentTexts = allSentTexts(ctx.bot);
+  assert.ok(sentTexts.includes(USER_MESSAGES.generationQueued.separate));
+  assert.ok(!sentTexts.some((text) => text.includes(USER_MESSAGES.workBackgroundChoice)));
+});
+
+test('single-photo brow flow asks brow output before background', async () => {
+  const ctx = createService();
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 1906,
+    message: { message_id: 1906, text: '/work', chat: { id: 602 }, from: { id: 52 } },
+  });
+  await chooseWorkPhotoType(ctx, {
+    chatId: 602,
+    userId: 52,
+    updateId: 1907,
+    callbackId: 'cb-work-photo-type-brow-single',
+  });
+  await ctx.service.handleTelegramUpdate({
+    update_id: 1908,
+    message: {
+      message_id: 1908,
+      chat: { id: 602 },
+      from: { id: 52 },
+      photo: [
+        { file_id: 'brow-single-small', file_unique_id: 'brow-single-small-u', width: 100, height: 100 },
+        { file_id: 'brow-single-large', file_unique_id: 'brow-single-large-u', width: 1000, height: 1000 },
+      ],
+    },
+  });
+
+  await expireOnlyCollection(ctx);
+  await ctx.service.runCollectionFinalizer();
+
+  const runtimes = await ctx.store.getRows(TABLE_NAMES.jobRuntimeCache);
+  let runtime = await ctx.repos.getRuntime(runtimes[0].job_id);
+  assert.equal(runtime.runtime_status, 'awaiting_subject_type');
+  runtime = await chooseRuntimeAction(ctx, {
+    chatId: 602,
+    userId: 52,
+    action: 'work_subject_brows',
+    updateId: 1909,
+    callbackId: 'cb-work-subject-brows-single',
+  });
+  assert.equal(runtime.runtime_status, 'awaiting_brow_output_mode');
+  assert.equal(runtime.draft_payload.subjectType, 'brows');
+  assert.ok(await pickCallbackToken(ctx, 'brow_output_after_only'));
+
+  runtime = await chooseRuntimeAction(ctx, {
+    chatId: 602,
+    userId: 52,
+    action: 'brow_output_after_only',
+    updateId: 1910,
+    callbackId: 'cb-brow-output-after',
+  });
+  assert.equal(runtime.runtime_status, 'awaiting_background_mode');
+});
+
+test('studio photo type skips background choice for single hair work and goes through neutral pipeline', async () => {
+  const ctx = createService();
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 1920,
+    message: { message_id: 1920, text: '/work', chat: { id: 604 }, from: { id: 54 } },
+  });
+  await chooseWorkPhotoType(ctx, {
+    chatId: 604,
+    userId: 54,
+    action: 'work_photo_type_studio',
+    updateId: 1921,
+    callbackId: 'cb-work-photo-type-studio-hair',
+  });
+  await ctx.service.handleTelegramUpdate({
+    update_id: 1922,
+    message: {
+      message_id: 1922,
+      chat: { id: 604 },
+      from: { id: 54 },
+      photo: [
+        { file_id: 'studio-hair-small', file_unique_id: 'studio-hair-small-u', width: 100, height: 100 },
+        { file_id: 'studio-hair-large', file_unique_id: 'studio-hair-large-u', width: 1000, height: 1000 },
+      ],
+    },
+  });
+
+  await expireOnlyCollection(ctx);
+  await ctx.service.runCollectionFinalizer();
+
+  const runtimes = await ctx.store.getRows(TABLE_NAMES.jobRuntimeCache);
+  let runtime = await ctx.repos.getRuntime(runtimes[0].job_id);
+  assert.equal(runtime.runtime_status, 'awaiting_subject_type');
+  runtime = await chooseHairSubjectIfNeeded(ctx, {
+    chatId: 604,
+    userId: 54,
+    updateId: 1923,
+    callbackId: 'cb-work-subject-studio-hair',
+  });
+  assert.equal(runtime.draft_payload.photoType, 'studio');
+  assert.equal(runtime.draft_payload.backgroundMode, 'neutral');
+  assert.equal(await pickCallbackToken(ctx, 'background_mode_neutral'), null);
+
+  await waitFor(async () => {
+    const freshRuntime = await ctx.repos.getRuntime(runtime.job_id);
+    assert.equal(freshRuntime.runtime_status, 'preview_ready');
+  });
+
+  assert.ok(ctx.openrouter.imageCalls.some((call) => call.metadata?.pass === 'edit_neutral'));
+});
+
+test('studio photo type skips background choice after brow output and uses neutral brow pipeline', async () => {
+  const ctx = createService();
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 1924,
+    message: { message_id: 1924, text: '/work', chat: { id: 605 }, from: { id: 55 } },
+  });
+  await chooseWorkPhotoType(ctx, {
+    chatId: 605,
+    userId: 55,
+    action: 'work_photo_type_studio',
+    updateId: 1925,
+    callbackId: 'cb-work-photo-type-studio-brow',
+  });
+  await ctx.service.handleTelegramUpdate({
+    update_id: 1926,
+    message: {
+      message_id: 1926,
+      chat: { id: 605 },
+      from: { id: 55 },
+      photo: [
+        { file_id: 'studio-brow-small', file_unique_id: 'studio-brow-small-u', width: 100, height: 100 },
+        { file_id: 'studio-brow-large', file_unique_id: 'studio-brow-large-u', width: 1000, height: 1000 },
+      ],
+    },
+  });
+
+  await expireOnlyCollection(ctx);
+  await ctx.service.runCollectionFinalizer();
+
+  const runtimes = await ctx.store.getRows(TABLE_NAMES.jobRuntimeCache);
+  let runtime = await ctx.repos.getRuntime(runtimes[0].job_id);
+  assert.equal(runtime.runtime_status, 'awaiting_subject_type');
+  runtime = await chooseRuntimeAction(ctx, {
+    chatId: 605,
+    userId: 55,
+    action: 'work_subject_brows',
+    updateId: 1927,
+    callbackId: 'cb-work-subject-studio-brow',
+  });
+  assert.equal(runtime.runtime_status, 'awaiting_brow_output_mode');
+  runtime = await chooseRuntimeAction(ctx, {
+    chatId: 605,
+    userId: 55,
+    action: 'brow_output_after_only',
+    updateId: 1928,
+    callbackId: 'cb-work-brow-output-studio',
+  });
+  assert.equal(runtime.draft_payload.photoType, 'studio');
+  assert.equal(runtime.draft_payload.backgroundMode, 'neutral');
+  assert.equal(await pickCallbackToken(ctx, 'background_mode_neutral'), null);
+
+  await waitFor(async () => {
+    const freshRuntime = await ctx.repos.getRuntime(runtime.job_id);
+    assert.equal(freshRuntime.runtime_status, 'preview_ready');
+  });
+
+  assert.ok(ctx.openrouter.imageCalls.some((call) => call.metadata?.pass === 'brow_edit_neutral'));
+});
+
+test('multi-photo brow flow asks render mode then brow output then background', async () => {
+  const ctx = createService();
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 1911,
+    message: { message_id: 1911, text: '/work', chat: { id: 603 }, from: { id: 53 } },
+  });
+  await chooseWorkPhotoType(ctx, {
+    chatId: 603,
+    userId: 53,
+    updateId: 1912,
+    callbackId: 'cb-work-photo-type-brow-multi',
+  });
+  await Promise.all([
+    ctx.service.handleTelegramUpdate({
+      update_id: 1913,
+      message: {
+        message_id: 1913,
+        media_group_id: 'album-brow-flow',
+        chat: { id: 603 },
+        from: { id: 53 },
+        photo: [
+          { file_id: 'brow-a-small', file_unique_id: 'brow-a-small-u', width: 100, height: 100 },
+          { file_id: 'brow-a-large', file_unique_id: 'brow-a-large-u', width: 1000, height: 1000 },
+        ],
+      },
+    }),
+    ctx.service.handleTelegramUpdate({
+      update_id: 1914,
+      message: {
+        message_id: 1914,
+        media_group_id: 'album-brow-flow',
+        chat: { id: 603 },
+        from: { id: 53 },
+        photo: [
+          { file_id: 'brow-b-small', file_unique_id: 'brow-b-small-u', width: 100, height: 100 },
+          { file_id: 'brow-b-large', file_unique_id: 'brow-b-large-u', width: 1000, height: 1000 },
+        ],
+      },
+    }),
+  ]);
+
+  await expireOnlyCollection(ctx);
+  await ctx.service.runCollectionFinalizer();
+
+  let runtime = await ctx.repos.getRuntime((await ctx.store.getRows(TABLE_NAMES.jobRuntimeCache))[0].job_id);
+  assert.equal(runtime.runtime_status, 'awaiting_subject_type');
+  runtime = await chooseRuntimeAction(ctx, {
+    chatId: 603,
+    userId: 53,
+    action: 'work_subject_brows',
+    updateId: 1915,
+    callbackId: 'cb-work-subject-brows-multi',
+  });
+  assert.equal(runtime.runtime_status, 'awaiting_render_mode');
+  assert.ok(await pickCallbackToken(ctx, 'render_mode_collage'));
+  assert.ok(await pickCallbackToken(ctx, 'render_mode_separate'));
+  runtime = await chooseRuntimeAction(ctx, {
+    chatId: 603,
+    userId: 53,
+    action: 'render_mode_collage',
+    updateId: 1916,
+    callbackId: 'cb-brow-render-mode-collage',
+  });
+  assert.equal(runtime.runtime_status, 'awaiting_brow_output_mode');
+  assert.ok(await pickCallbackToken(ctx, 'brow_output_before_after'));
+  assert.ok(await pickCallbackToken(ctx, 'brow_output_after_only'));
+
+  runtime = await chooseRuntimeAction(ctx, {
+    chatId: 603,
+    userId: 53,
+    action: 'brow_output_before_after',
+    updateId: 1917,
+    callbackId: 'cb-brow-output-before-after',
+  });
+  assert.equal(runtime.runtime_status, 'awaiting_background_mode');
+});
+
+test('repeated /work refreshes the photo request session instead of hanging on stale wizard state', async () => {
+  const ctx = createService();
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 1910,
+    message: { message_id: 1910, text: '/work', chat: { id: 502 }, from: { id: 42 } },
+  });
+  await ctx.service.handleTelegramUpdate({
+    update_id: 1911,
+    message: { message_id: 1911, text: '/work', chat: { id: 502 }, from: { id: 42 } },
+  });
+
+  const session = await ctx.repos.getSessionByChatAndMode(502, 'work');
+  const payload = JSON.parse(session?.pending_payload_json ?? '{}');
+  assert.equal(session?.state, 'awaiting_photo_type');
+  assert.equal(payload.textMessageId, 101);
+  assert.equal(ctx.bot.sent.filter((entry) => entry.type === 'message' && String(entry.text ?? '').includes(USER_MESSAGES.workPhotoTypeChoice)).length, 2);
+});
+
+test('upsertControlMessage falls back to a new control message when stored message id can no longer be edited', async () => {
+  const ctx = createService();
+  await ctx.bot.api.sendMessage(503, 'старое сообщение');
+  const originalEditMessageText = ctx.bot.api.editMessageText;
+  ctx.bot.api.editMessageText = async (chatId, messageId, text, extra = {}) => {
+    if (messageId === 100 && text === USER_MESSAGES.workPhotoRequest) {
+      throw new Error("Call to 'editMessageText' failed! (400: Bad Request: message to edit not found)");
+    }
+    return originalEditMessageText(chatId, messageId, text, extra);
+  };
+
+  const messageId = await ctx.service.upsertControlMessage(503, USER_MESSAGES.workPhotoRequest, {
+    existingMessageId: 100,
+    replyMarkup: { inline_keyboard: [] },
+  });
+
+  assert.equal(messageId, 101);
+  assert.equal(ctx.bot.sent.filter((entry) => entry.type === 'message' && entry.text === USER_MESSAGES.workPhotoRequest).length, 1);
 });
 
 test('mergeAlbumCollection deduplicates duplicate rows and preserves all album assets', async () => {
@@ -946,6 +1888,168 @@ test('mergeAlbumCollection deduplicates duplicate rows and preserves all album a
   const collection = await repos.getCollectionById('COL-ALBUM');
   assert.equal(collection.count, 2);
   assert.deepEqual(collection.assets.map((asset) => asset.fileId), ['p1-large', 'p2-large']);
+});
+
+test('duplicate telegram update exits cheaply after atomic idempotency claim', async () => {
+  const ctx = createService();
+  let claims = 0;
+  ctx.repos.recordIdempotency = async () => {
+    claims += 1;
+    return { idemKey: 'IDEM-1', inserted: claims === 1 };
+  };
+
+  const update = {
+    update_id: 9901,
+    message: { message_id: 1, text: '/help', chat: { id: 42 }, from: { id: 7 } },
+  };
+
+  const first = await ctx.service.handleTelegramUpdate(update);
+  const second = await ctx.service.handleTelegramUpdate(update);
+
+  assert.equal(first.ok, true);
+  assert.equal(second.duplicate, true);
+  assert.equal(ctx.bot.sent.filter((item) => item.type === 'message').length, 1);
+});
+
+test('queueRuntimeGeneration dispatches worker action and skips inline generation when worker dispatch succeeds', async () => {
+  const ctx = createService({
+    envOverrides: { webhookBaseUrl: 'https://bot.example.com', internalWorkerDispatchEnabled: true },
+  });
+  const originalFetch = global.fetch;
+  const fetchCalls = [];
+  global.fetch = async (url, options) => {
+    fetchCalls.push({ url, options });
+    return {
+      ok: true,
+      async text() { return ''; },
+    };
+  };
+
+  ctx.service.updateRuntimeStatusMessage = async () => 77;
+  ctx.service.runQueuedGenerationJob = async () => {
+    throw new Error('inline generation should not run when dispatch succeeds');
+  };
+
+  try {
+    const result = await ctx.service.queueRuntimeGeneration({
+      job_id: 'JOB-DISPATCH',
+      job_type: 'work',
+      chat_id: 51,
+      user_id: 9,
+      collection_id: 'COL-DISPATCH',
+      active_revision: 1,
+      collage_message_id: '',
+      assets_message_ids: [],
+      text_message_id: '11',
+      active_callback_set_id: '',
+      lock_flags: {},
+      draft_payload: { queueId: 'QUE-DISPATCH', renderMode: 'separate', sourceAssetCount: 1 },
+      preview_payload: { queueId: 'QUE-DISPATCH', renderMode: 'separate', sourceAssetCount: 1 },
+    }, { action: 'regenerate_text' });
+
+    assert.equal(result.dispatched, true);
+    assert.equal(result.inline, false);
+    assert.equal(fetchCalls.length, 1);
+    assert.equal(String(fetchCalls[0].url), 'https://bot.example.com/api/worker/runtime-action');
+    assert.equal(fetchCalls[0].options?.method, 'POST');
+    assert.ok(fetchCalls[0].options?.headers?.['x-anita-worker-token']);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('queueRuntimeGeneration skips worker self-dispatch on protected vercel host and runs inline', async () => {
+  const ctx = createService({
+    envOverrides: {
+      webhookBaseUrl: 'https://anita-bot-service-qro74qq9t-amoorkie-gmailcoms-projects.vercel.app',
+      webhookBaseUrlDerivedFromDeploymentUrl: true,
+      internalWorkerDispatchEnabled: true,
+    },
+  });
+  const originalFetch = global.fetch;
+  global.fetch = async () => {
+    throw new Error('worker self-dispatch should not call fetch on protected vercel host');
+  };
+  ctx.service.updateRuntimeStatusMessage = async () => 77;
+  const inlineCalls = [];
+  ctx.service.runQueuedGenerationJob = async (jobId, action) => {
+    inlineCalls.push({ jobId, action });
+    return { ok: true, inline: true };
+  };
+
+  try {
+    const result = await ctx.service.queueRuntimeGeneration({
+      job_id: 'JOB-VERCEL',
+      job_type: 'work',
+      chat_id: 51,
+      user_id: 9,
+      collection_id: 'COL-VERCEL',
+      active_revision: 1,
+      collage_message_id: '',
+      assets_message_ids: [],
+      text_message_id: '11',
+      active_callback_set_id: '',
+      lock_flags: {},
+      draft_payload: { queueId: 'QUE-VERCEL', renderMode: 'separate', sourceAssetCount: 1 },
+      preview_payload: { queueId: 'QUE-VERCEL', renderMode: 'separate', sourceAssetCount: 1 },
+    }, { action: 'regenerate_text' });
+
+    assert.equal(result.inline, true);
+    assert.equal(inlineCalls.length, 1);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('queueRuntimeGeneration skips worker dispatch when only protected deployment url is available', async () => {
+  const ctx = createService({
+    envOverrides: {
+      webhookBaseUrl: 'https://anita-bot-service-qro74qq9t-amoorkie-gmailcoms-projects.vercel.app',
+      webhookBaseUrlDerivedFromDeploymentUrl: true,
+      internalWorkerDispatchEnabled: true,
+    },
+  });
+  const originalFetch = global.fetch;
+  const fetchCalls = [];
+  global.fetch = async (url, options) => {
+    fetchCalls.push({ url, options });
+    return {
+      ok: true,
+      async text() { return ''; },
+    };
+  };
+
+  const inlineCalls = [];
+  ctx.service.updateRuntimeStatusMessage = async () => 77;
+  ctx.service.runQueuedGenerationJob = async (jobId, options) => {
+    inlineCalls.push({ jobId, options });
+    return { ok: true, jobId };
+  };
+
+  try {
+    const result = await ctx.service.queueRuntimeGeneration({
+      job_id: 'JOB-PROTECTED',
+      job_type: 'work',
+      chat_id: 51,
+      user_id: 9,
+      collection_id: 'COL-PROTECTED',
+      active_revision: 1,
+      collage_message_id: '',
+      assets_message_ids: [],
+      text_message_id: '11',
+      active_callback_set_id: '',
+      lock_flags: {},
+      draft_payload: { queueId: 'QUE-PROTECTED', renderMode: 'separate', sourceAssetCount: 1 },
+      preview_payload: { queueId: 'QUE-PROTECTED', renderMode: 'separate', sourceAssetCount: 1 },
+    }, { action: 'regenerate_text' });
+
+    assert.equal(result.dispatched, false);
+    assert.equal(result.inline, true);
+    assert.equal(fetchCalls.length, 0);
+    assert.equal(inlineCalls.length, 1);
+  } finally {
+    global.fetch = originalFetch;
+  }
 });
 
 test('topic picker opens first and selected topic creates preview with revision controls', async () => {
@@ -1291,10 +2395,9 @@ test('stories picker page turns read a fresh slice from storage', async () => {
   assert.ok(labels.some((label) => label.includes('Stories тема после обновления')));
 });
 
-test('stories, creative, and slider modes create expected preview shapes', async () => {
+test('stories and slider modes create expected preview shapes', async () => {
   const cases = [
     { command: '/stories', table: TABLE_NAMES.storyTopics, topicId: 'ST-1', jobType: 'stories', expects: 'single' },
-    { command: '/creative', table: TABLE_NAMES.creativeIdeas, topicId: 'CR-1', jobType: 'creative', expects: 'single' },
     { command: '/slider', table: TABLE_NAMES.sliderTopics, topicId: 'SL-1', jobType: 'slider', expects: 'separate' },
   ];
 
@@ -1746,7 +2849,6 @@ test('topic-like modes do not mutate source rows in QA mode after pick, regenera
   const modes = [
     { command: '/topic', table: TABLE_NAMES.expertTopics, topicId: 'TP-QA', title: 'Проверка /topic' },
     { command: '/stories', table: TABLE_NAMES.storyTopics, topicId: 'ST-QA', title: 'Проверка /stories' },
-    { command: '/creative', table: TABLE_NAMES.creativeIdeas, topicId: 'CR-QA', title: 'Проверка /creative' },
     { command: '/slider', table: TABLE_NAMES.sliderTopics, topicId: 'SL-QA', title: 'Проверка /slider' },
   ];
 
@@ -1977,148 +3079,7 @@ test('picker page switch uses fresh DB slice instead of stale session snapshot',
   assert.match(String(lastEdit.text ?? ''), /Доступно тем: 10/u);
 });
 
-test('creative flow supports fallback normalization, regenerate, publish, and cancel', async () => {
-  const baseRows = [{
-    topic_id: 'CR-E2E',
-    title: 'Мне бы как на фото, только за пять минут',
-    brief: 'Ироничный креатив про ожидания и салонный тайминг.',
-    tags: 'creative,qa',
-    priority: '1',
-    status: 'ready',
-    reserved_by: '',
-    reserved_at: '',
-    reservation_expires_at: '',
-    last_job_id: '',
-    last_published_at: '',
-    notes: '',
-  }];
-
-  const ctxPublish = createService({
-    initialTables: {
-      [TABLE_NAMES.creativeIdeas]: baseRows,
-    },
-  });
-
-  await ctxPublish.service.handleTelegramUpdate({
-    update_id: 601,
-    message: { message_id: 601, text: '/creative', chat: { id: 601 }, from: { id: 101 } },
-  });
-  const pickToken = await pickCallbackTokenByPrefix(ctxPublish, 'pick_source_');
-  await ctxPublish.service.handleTelegramUpdate({
-    update_id: 602,
-    callback_query: {
-      id: 'cb-creative-pick',
-      data: `pick_source_0_0:${pickToken}`,
-      from: { id: 101 },
-      message: { message_id: 601, chat: { id: 601 } },
-    },
-  });
-
-  const queueRows = await ctxPublish.store.getRows(TABLE_NAMES.contentQueue);
-  assert.equal(queueRows.length, 1);
-  assert.equal(queueRows[0].job_type, 'creative');
-  assert.equal(queueRows[0].status, 'preview_ready');
-  const runtime = await ctxPublish.repos.getRuntime(queueRows[0].job_id);
-  assert.equal(runtime.active_revision, 1);
-  assert.equal(runtime.draft_payload.finalRenderMode, 'single');
-  assert.equal(runtime.job_type, 'creative');
-  assert.equal(runtime.preview_payload.manifest.eyebrow, '');
-  assert.ok(String(runtime.preview_payload.manifest.headline ?? '').trim().length > 0);
-  assert.ok(String(runtime.preview_payload.manifest.subhead ?? '').trim().length > 0);
-
-  const regenerateToken = await pickCallbackToken(ctxPublish, 'regenerate_text');
-  assert.ok(regenerateToken);
-  await ctxPublish.service.handleTelegramUpdate({
-    update_id: 603,
-    callback_query: {
-      id: 'cb-creative-regenerate',
-      data: `regenerate_text:${regenerateToken}`,
-      from: { id: 101 },
-      message: { message_id: runtime.text_message_id ?? runtime.collage_message_id, chat: { id: 601 } },
-    },
-  });
-
-  const runtimeAfterRegenerate = await ctxPublish.repos.getRuntime(queueRows[0].job_id);
-  assert.equal(runtimeAfterRegenerate.active_revision, 2);
-  assert.ok(Array.isArray(runtimeAfterRegenerate.draft_payload.revisionHistory));
-  assert.ok(runtimeAfterRegenerate.draft_payload.revisionHistory.length >= 2);
-
-  const ctxCancel = createService({
-    initialTables: {
-      [TABLE_NAMES.creativeIdeas]: [{
-        ...baseRows[0],
-        topic_id: 'CR-E2E-CANCEL',
-        title: 'Плойка и спешка не пара',
-      }],
-    },
-  });
-  await ctxCancel.service.handleTelegramUpdate({
-    update_id: 605,
-    message: { message_id: 605, text: '/creative', chat: { id: 605 }, from: { id: 102 } },
-  });
-  const pickTokenCancel = await pickCallbackTokenByPrefix(ctxCancel, 'pick_source_');
-  await ctxCancel.service.handleTelegramUpdate({
-    update_id: 606,
-    callback_query: {
-      id: 'cb-creative-pick-cancel',
-      data: `pick_source_0_0:${pickTokenCancel}`,
-      from: { id: 102 },
-      message: { message_id: 605, chat: { id: 605 } },
-    },
-  });
-  const runtimeCancel = await ctxCancel.repos.getRuntime((await ctxCancel.store.getRows(TABLE_NAMES.contentQueue))[0].job_id);
-  const cancelToken = await pickCallbackToken(ctxCancel, 'cancel');
-  assert.ok(cancelToken);
-  await ctxCancel.service.handleTelegramUpdate({
-    update_id: 607,
-    callback_query: {
-      id: 'cb-creative-cancel',
-      data: `cancel:${cancelToken}`,
-      from: { id: 102 },
-      message: { message_id: runtimeCancel.text_message_id ?? runtimeCancel.collage_message_id, chat: { id: 605 } },
-    },
-  });
-  assert.equal((await ctxCancel.store.getRows(TABLE_NAMES.contentQueue))[0].status, 'cancelled');
-
-  const ctxPublishOnly = createService({
-    initialTables: {
-      [TABLE_NAMES.creativeIdeas]: [{
-        ...baseRows[0],
-        topic_id: 'CR-E2E-PUBLISH',
-        title: 'Термозащита: бывший, про которого вспоминают у плойки',
-      }],
-    },
-  });
-  await ctxPublishOnly.service.handleTelegramUpdate({
-    update_id: 608,
-    message: { message_id: 608, text: '/creative', chat: { id: 608 }, from: { id: 103 } },
-  });
-  const pickTokenPublish = await pickCallbackTokenByPrefix(ctxPublishOnly, 'pick_source_');
-  await ctxPublishOnly.service.handleTelegramUpdate({
-    update_id: 609,
-    callback_query: {
-      id: 'cb-creative-pick-publish',
-      data: `pick_source_0_0:${pickTokenPublish}`,
-      from: { id: 103 },
-      message: { message_id: 608, chat: { id: 608 } },
-    },
-  });
-  const runtimePublish = await ctxPublishOnly.repos.getRuntime((await ctxPublishOnly.store.getRows(TABLE_NAMES.contentQueue))[0].job_id);
-  const publishToken = await pickCallbackToken(ctxPublishOnly, 'publish_confirm');
-  assert.ok(publishToken);
-  await ctxPublishOnly.service.handleTelegramUpdate({
-    update_id: 610,
-    callback_query: {
-      id: 'cb-creative-publish',
-      data: `publish_confirm:${publishToken}`,
-      from: { id: 103 },
-      message: { message_id: runtimePublish.text_message_id ?? runtimePublish.collage_message_id, chat: { id: 608 } },
-    },
-  });
-  assert.equal((await ctxPublishOnly.store.getRows(TABLE_NAMES.contentQueue))[0].status, 'published');
-});
-
-test('/start and /help share the command menu and /logs is treated as unknown command', async () => {
+test('/start and /help share the command menu and removed commands are treated as unknown', async () => {
   const ctx = createService();
 
   await ctx.service.handleTelegramUpdate({
@@ -2133,13 +3094,19 @@ test('/start and /help share the command menu and /logs is treated as unknown co
     update_id: 91,
     message: { message_id: 91, text: '/logs', chat: { id: 99 }, from: { id: 5 } },
   });
+  await ctx.service.handleTelegramUpdate({
+    update_id: 92,
+    message: { message_id: 92, text: '/creative', chat: { id: 99 }, from: { id: 5 } },
+  });
 
   const sentTexts = ctx.bot.sent.filter((item) => item.type === 'message').map((item) => item.text);
   assert.match(sentTexts[0], /Выберите задачу/u);
   assert.ok(sentTexts[0].includes('/start'));
   assert.ok(sentTexts[0].includes('/work'));
+  assert.ok(!sentTexts[0].includes('/creative'));
   assert.equal(sentTexts[1], sentTexts[0].split('\n\n').slice(1).join('\n\n'));
   assert.equal(sentTexts.at(-1), USER_MESSAGES.unknownCommand);
+  assert.equal(sentTexts.at(-2), USER_MESSAGES.unknownCommand);
 });
 
 test('preview extraction fails fast when Telegram does not return reusable file ids', async () => {
@@ -2172,6 +3139,429 @@ test('preview extraction fails fast when Telegram does not return reusable file 
     }),
     /Telegram preview file ids are missing/u,
   );
+});
+
+test('work image pipeline uses one unified edit pass without quality gate', async () => {
+  const ctx = createService();
+  const prompts = await ctx.service.promptConfig.refresh();
+
+  const result = await ctx.service.processSingleWorkAsset({
+    fileId: 'qa-large',
+    prompts,
+    jobId: 'JOB-QA',
+    index: 0,
+    revision: 1,
+    renderMode: 'separate',
+    sourceAssetCount: 1,
+    logContext: {
+      chatId: 10,
+      userId: 20,
+      queueId: 'QUE-QA',
+      collectionId: 'COL-QA',
+    },
+  });
+
+  assert.ok(result.asset?.buffer);
+  assert.deepEqual(
+    ctx.openrouter.imageCalls.map((call) => call.metadata?.pass),
+    ['edit_blur'],
+  );
+  assert.equal(ctx.openrouter.textCalls.filter((call) => call.metadata?.pass === 'quality_gate').length, 0);
+  assert.ok(ctx.botLogger.entries.some((entry) => entry.event === 'image_edit_completed'));
+});
+
+test('work image pipeline switches to neutral background variant from locked facts', async () => {
+  const ctx = createService();
+  const prompts = await ctx.service.promptConfig.refresh();
+
+  const result = await ctx.service.processSingleWorkAsset({
+    fileId: 'neutral-bg-large',
+    prompts,
+    jobId: 'JOB-NEUTRAL-BG',
+    index: 0,
+    revision: 1,
+    renderMode: 'separate',
+    sourceAssetCount: 1,
+    consistencyNotes: 'BACKGROUND_POLICY\nNEUTRAL_LIGHT_BACKGROUND\nCAMERA_LEVEL = TRUE\nSUBJECT_PRIORITY = HAIRCUT_DOMINANT',
+    logContext: {
+      chatId: 11,
+      userId: 21,
+      queueId: 'QUE-NEUTRAL-BG',
+      collectionId: 'COL-NEUTRAL-BG',
+    },
+  });
+
+  assert.ok(result.asset?.buffer);
+  assert.deepEqual(
+    ctx.openrouter.imageCalls.map((call) => call.metadata?.pass),
+    ['edit_neutral'],
+  );
+  assert.match(String(ctx.openrouter.imageCalls[0]?.prompt ?? ''), /neutral light background/u);
+  assert.match(String(ctx.openrouter.imageCalls[0]?.prompt ?? ''), /75-85% of the frame|about 80% of the frame/u);
+});
+
+test('single-photo first-pass provider failure degrades to local emergency enhancement', async () => {
+  const ctx = createService();
+  const prompts = await ctx.service.promptConfig.refresh();
+  ctx.openrouter.generateImages = async () => {
+    const error = new Error('openrouter returned no images');
+    error.name = 'ProviderEmptyResultError';
+    throw error;
+  };
+
+  const result = await ctx.service.processSingleWorkAsset({
+      fileId: 'provider-empty-large',
+      prompts,
+      jobId: 'JOB-FIRST-PASS-DEGRADE',
+      index: 0,
+      revision: 1,
+      renderMode: 'separate',
+      promptMode: 'normal',
+      backgroundMode: 'keep',
+      cleanupMode: 'off',
+      sourceAssetCount: 1,
+      logContext: {
+        chatId: 16,
+      userId: 26,
+      queueId: 'QUE-FIRST-PASS-DEGRADE',
+      collectionId: 'COL-FIRST-PASS-DEGRADE',
+    },
+  });
+
+  assert.ok(result.asset?.buffer);
+  assert.equal(result.asset.mimeType, 'image/jpeg');
+  assert.ok(ctx.botLogger.entries.some((entry) => entry.event === 'image_provider_first_pass_failed' && entry.status === 'degraded_accept'));
+  assert.ok(ctx.botLogger.entries.some((entry) => entry.event === 'image_provider_degraded_fallback_applied'));
+});
+
+test('single-photo provider failure does not hide neutral background request behind local fallback', async () => {
+  const ctx = createService();
+  const prompts = await ctx.service.promptConfig.refresh();
+  ctx.openrouter.generateImages = async () => {
+    const error = new Error('openrouter returned no images');
+    error.name = 'ProviderEmptyResultError';
+    throw error;
+  };
+
+  await assert.rejects(
+    () => ctx.service.processSingleWorkAsset({
+      fileId: 'provider-empty-neutral-large',
+      prompts,
+      jobId: 'JOB-FIRST-PASS-NEUTRAL-FAIL',
+      index: 0,
+      revision: 1,
+      renderMode: 'separate',
+      promptMode: 'normal',
+      backgroundMode: 'neutral',
+      cleanupMode: 'off',
+      sourceAssetCount: 1,
+      logContext: {
+        chatId: 17,
+        userId: 27,
+        queueId: 'QUE-FIRST-PASS-NEUTRAL-FAIL',
+        collectionId: 'COL-FIRST-PASS-NEUTRAL-FAIL',
+      },
+    }),
+    /returned no images/u,
+  );
+
+  assert.ok(ctx.botLogger.entries.some((entry) => entry.event === 'image_provider_first_pass_failed' && entry.status === 'failed'));
+  assert.ok(!ctx.botLogger.entries.some((entry) => entry.event === 'image_provider_degraded_fallback_applied'));
+});
+
+test('neutral background retries once with compact prompt when provider returns no images', async () => {
+  const ctx = createService();
+  const prompts = await ctx.service.promptConfig.refresh();
+  let callCount = 0;
+  ctx.openrouter.generateImages = async (payload) => {
+    callCount += 1;
+    if (callCount === 1) {
+      const error = new Error('openrouter returned no images');
+      error.name = 'ProviderEmptyResultError';
+      throw error;
+    }
+    return {
+      images: ['data:image/jpeg;base64,aGVsbG8='],
+      durationMs: 123,
+      prompt: payload?.prompt ?? '',
+    };
+  };
+
+  const result = await ctx.service.processSingleWorkAsset({
+    fileId: 'provider-empty-neutral-retry-large',
+    prompts,
+    jobId: 'JOB-NEUTRAL-RETRY',
+    index: 0,
+    revision: 1,
+    renderMode: 'separate',
+    promptMode: 'normal',
+    backgroundMode: 'neutral',
+    cleanupMode: 'off',
+    sourceAssetCount: 1,
+    logContext: {
+      chatId: 18,
+      userId: 28,
+      queueId: 'QUE-NEUTRAL-RETRY',
+      collectionId: 'COL-NEUTRAL-RETRY',
+    },
+  });
+
+  assert.ok(result.asset?.buffer);
+  assert.equal(callCount, 2);
+  assert.ok(ctx.botLogger.entries.some((entry) => entry.event === 'image_provider_retry_started'));
+  assert.ok(ctx.botLogger.entries.some((entry) => entry.event === 'image_provider_retry_succeeded'));
+});
+
+test('blur cleanup and test mode are combined into one final work prompt', async () => {
+  const ctx = createService();
+  const prompts = await ctx.service.promptConfig.refresh();
+
+  const result = await ctx.service.processSingleWorkAsset({
+    fileId: 'blur-cleanup-large',
+    prompts,
+    jobId: 'JOB-BLUR-CLEANUP',
+    index: 0,
+    revision: 1,
+    renderMode: 'separate',
+    promptMode: 'test',
+    backgroundMode: 'blur',
+    cleanupMode: 'on',
+    sourceAssetCount: 1,
+    logContext: {
+      chatId: 19,
+      userId: 29,
+      queueId: 'QUE-BLUR-CLEANUP',
+      collectionId: 'COL-BLUR-CLEANUP',
+    },
+  });
+
+  assert.ok(result.asset?.buffer);
+  assert.deepEqual(
+    ctx.openrouter.imageCalls.map((call) => call.metadata?.pass),
+    ['edit_blur'],
+  );
+  const prompt = String(ctx.openrouter.imageCalls[0]?.prompt ?? '');
+  assert.match(prompt, /extremely strong creamy blur|extremely strong soft blur/u);
+  assert.match(prompt, /Cleanup rule:/u);
+  assert.match(prompt, /Combined blur plus cleanup rule:|When blur and cleanup are both selected/u);
+  assert.match(prompt, /Test mode:|subtle professional contour relight/u);
+});
+
+test('brow before-after mode uses two brow passes and preserves brows subject prompt branch', async () => {
+  const ctx = createService();
+  const prompts = await ctx.service.promptConfig.refresh();
+
+  const result = await ctx.service.processSingleWorkAsset({
+    fileId: 'brow-before-after-large',
+    prompts,
+    jobId: 'JOB-BROW-BEFORE-AFTER',
+    index: 0,
+    revision: 1,
+    renderMode: 'separate',
+    promptMode: 'normal',
+    subjectType: 'brows',
+    browOutputMode: 'before_after',
+    backgroundMode: 'neutral',
+    cleanupMode: 'off',
+    sourceAssetCount: 1,
+    logContext: {
+      chatId: 20,
+      userId: 30,
+      queueId: 'QUE-BROW-BEFORE-AFTER',
+      collectionId: 'COL-BROW-BEFORE-AFTER',
+    },
+  });
+
+  assert.ok(result.asset?.buffer);
+  assert.deepEqual(
+    ctx.openrouter.imageCalls.map((call) => call.metadata?.pass),
+    ['brow_edit_neutral', 'brow_edit_neutral_before'],
+  );
+  assert.match(String(ctx.openrouter.imageCalls[0]?.prompt ?? ''), /AFTER state|permanent makeup|перманент/u);
+  assert.match(String(ctx.openrouter.imageCalls[1]?.prompt ?? ''), /BEFORE state|sparser|less tidy/u);
+});
+
+test('single-photo completed preview shows one-photo mode label instead of collage', async () => {
+  const ctx = createService();
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 1950,
+    message: { message_id: 1950, text: '/work', chat: { id: 511 }, from: { id: 42 } },
+  });
+  await chooseWorkPhotoType(ctx, {
+    chatId: 511,
+    userId: 42,
+    action: 'work_photo_type_normal',
+    updateId: 1951,
+    callbackId: 'cb-work-photo-type-single-preview',
+  });
+  await ctx.service.handleTelegramUpdate({
+    update_id: 1952,
+    message: {
+      message_id: 1952,
+      chat: { id: 511 },
+      from: { id: 42 },
+      photo: [
+        { file_id: 'single-preview-small', file_unique_id: 'single-preview-small-u', width: 100, height: 100 },
+        { file_id: 'single-preview-large', file_unique_id: 'single-preview-large-u', width: 1000, height: 1000 },
+      ],
+    },
+  });
+
+  await expireOnlyCollection(ctx);
+  await ctx.service.runCollectionFinalizer();
+
+  await chooseHairSubjectIfNeeded(ctx, {
+    chatId: 511,
+    userId: 42,
+    updateId: 1953,
+    callbackId: 'cb-single-preview-subject',
+  });
+  await chooseRuntimeAction(ctx, {
+    chatId: 511,
+    userId: 42,
+    action: 'background_mode_blur',
+    updateId: 1954,
+    callbackId: 'cb-single-preview-background',
+  });
+  await chooseRuntimeAction(ctx, {
+    chatId: 511,
+    userId: 42,
+    action: 'cleanup_off',
+    updateId: 1955,
+    callbackId: 'cb-single-preview-cleanup',
+  });
+  const sentTexts = allSentTexts(ctx.bot);
+  assert.ok(sentTexts.some((text) => text.includes('Режим: одно фото')));
+  assert.ok(!sentTexts.some((text) => text.includes('Режим: коллаж')));
+});
+
+test('collage compose pass receives selected background and cleanup rules without test-mode branch', async () => {
+  const ctx = createService();
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 1960,
+    message: { message_id: 1960, text: '/work', chat: { id: 512 }, from: { id: 43 } },
+  });
+  await chooseWorkPhotoType(ctx, {
+    chatId: 512,
+    userId: 43,
+    action: 'work_photo_type_normal',
+    updateId: 1961,
+    callbackId: 'cb-work-prompt-collage-rules',
+  });
+  await Promise.all([
+    ctx.service.handleTelegramUpdate({
+      update_id: 1962,
+      message: {
+        message_id: 1962,
+        media_group_id: 'album-collage-rules',
+        chat: { id: 512 },
+        from: { id: 43 },
+        photo: [
+          { file_id: 'cr1-small', file_unique_id: 'cr1s', width: 100, height: 100 },
+          { file_id: 'cr1-large', file_unique_id: 'cr1l', width: 1000, height: 1000 },
+        ],
+      },
+    }),
+    ctx.service.handleTelegramUpdate({
+      update_id: 1963,
+      message: {
+        message_id: 1963,
+        media_group_id: 'album-collage-rules',
+        chat: { id: 512 },
+        from: { id: 43 },
+        photo: [
+          { file_id: 'cr2-small', file_unique_id: 'cr2s', width: 100, height: 100 },
+          { file_id: 'cr2-large', file_unique_id: 'cr2l', width: 1000, height: 1000 },
+        ],
+      },
+    }),
+  ]);
+
+  await expireOnlyCollection(ctx);
+  await ctx.service.runCollectionFinalizer();
+
+  await chooseHairSubjectIfNeeded(ctx, {
+    chatId: 512,
+    userId: 43,
+    updateId: 1964,
+    callbackId: 'cb-collage-rules-subject',
+  });
+  await chooseRuntimeAction(ctx, {
+    chatId: 512,
+    userId: 43,
+    jobId: 'JOB-CF44542C',
+    action: 'render_mode_collage',
+    updateId: 1965,
+    callbackId: 'cb-collage-rules-mode',
+  });
+  await chooseRuntimeAction(ctx, {
+    chatId: 512,
+    userId: 43,
+    jobId: 'JOB-CF44542C',
+    action: 'background_mode_keep',
+    updateId: 1966,
+    callbackId: 'cb-collage-rules-bg',
+  });
+  await chooseRuntimeAction(ctx, {
+    chatId: 512,
+    userId: 43,
+    jobId: 'JOB-CF44542C',
+    action: 'cleanup_on',
+    updateId: 1967,
+    callbackId: 'cb-collage-rules-cleanup',
+  });
+
+  const collageCall = ctx.openrouter.imageCalls.find((call) => call.metadata?.pass === 'compose_collage');
+  assert.ok(collageCall);
+  assert.match(collageCall.prompt, /Final collage background rule:/u);
+  assert.match(collageCall.prompt, /Final collage cleanup rule:/u);
+  assert.doesNotMatch(collageCall.prompt, /Test mode collage rule:/u);
+});
+
+test('empty work caption provider result falls back to deterministic caption', async () => {
+  const ctx = createService();
+  const prompts = await ctx.service.promptConfig.refresh();
+  const originalGenerateText = ctx.openrouter.generateText;
+  ctx.openrouter.generateText = async (payload) => {
+    if (payload?.metadata?.pass === 'work_caption') {
+      const error = new Error('openrouter returned no text');
+      error.name = 'ProviderEmptyResultError';
+      throw error;
+    }
+    return originalGenerateText(payload);
+  };
+
+  const result = await ctx.service.generateWorkCaptionText({
+    prompts,
+    sourceAssetCount: 1,
+    imageUrls: ['https://example.com/image.jpg'],
+    jobId: 'JOB-CAPTION-FALLBACK',
+    revision: 1,
+    renderMode: 'separate',
+    chatId: 15,
+    userId: 25,
+    queueId: 'QUE-CAPTION-FALLBACK',
+    collectionId: 'COL-CAPTION-FALLBACK',
+  });
+
+  assert.equal(result.fallback, true);
+  assert.match(result.text, /Запись по телефону/i);
+  assert.ok(ctx.botLogger.entries.some((entry) => entry.event === 'work_caption_provider_empty'));
+});
+
+test('work caption prompt keeps focus on client result and avoids repetitive master-love phrasing', () => {
+  const ctx = createService();
+
+  const hairPrompt = ctx.service.buildWorkCaptionUserPrompt(1, { subjectType: 'hair' });
+  const browPrompt = ctx.service.buildWorkCaptionUserPrompt(1, { subjectType: 'brows', browOutputMode: 'after_only' });
+
+  assert.match(hairPrompt, /результате для клиента/u);
+  assert.match(browPrompt, /результате для клиента/u);
+  assert.match(hairPrompt, /Не повторяй формулировки вроде "люблю"/u);
+  assert.match(browPrompt, /Не повторяй формулировки вроде "люблю"/u);
+  assert.match(hairPrompt, /иногда достаточно 2 коротких строк/u);
 });
 
 test('bot logger writes structured rows into bot_logs', async () => {

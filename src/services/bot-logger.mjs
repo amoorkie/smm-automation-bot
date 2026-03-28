@@ -43,21 +43,33 @@ export class BotLogger {
     } else {
       console.log(line);
     }
+    const persistMode = String(entry?.persistMode ?? '').toLowerCase();
     if (this.store) {
-      try {
-        await this.store.appendRow(this.tableName, sanitized, BOT_LOG_COLUMNS);
-      } catch (error) {
-        console.error(JSON.stringify({
-          ts: new Date().toISOString(),
-          level: 'ERROR',
-          event: 'bot_log_sink_failed',
-          workflow: this.workflow,
-          status: 'failed',
-          message: error.message,
-        }));
+      const append = async () => {
+        try {
+          await this.store.appendRow(this.tableName, sanitized, BOT_LOG_COLUMNS);
+        } catch (error) {
+          console.error(JSON.stringify({
+            ts: new Date().toISOString(),
+            level: 'ERROR',
+            event: 'bot_log_sink_failed',
+            workflow: this.workflow,
+            status: 'failed',
+            message: error.message,
+          }));
+        }
+      };
+      if (persistMode === 'best_effort') {
+        void append();
+      } else {
+        await append();
       }
     }
     return sanitized;
+  }
+
+  logBestEffort(entry) {
+    return this.log({ ...entry, persistMode: 'best_effort' });
   }
 }
 

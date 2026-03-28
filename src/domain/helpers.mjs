@@ -38,6 +38,85 @@ export function buildRenderModeKeyboard(tokensByAction = {}) {
   return keyboard;
 }
 
+function buildChoiceKeyboard(rows = [], { cancelToken = '' } = {}) {
+  const keyboard = new InlineKeyboard();
+  for (const row of rows) {
+    let hasButtons = false;
+    for (const button of row) {
+      if (!button?.token || !button?.action || !button?.label) {
+        continue;
+      }
+      keyboard.text(button.label, `${button.action}:${button.token}`);
+      hasButtons = true;
+    }
+    if (hasButtons) {
+      keyboard.row();
+    }
+  }
+  if (cancelToken) {
+    keyboard.text('Отмена', `cancel:${cancelToken}`);
+  }
+  return keyboard;
+}
+
+export function buildWorkPromptModeKeyboard(tokensByAction = {}) {
+  return buildChoiceKeyboard([
+    [
+      { label: 'Обычный', action: 'work_prompt_mode_normal', token: tokensByAction.work_prompt_mode_normal },
+      { label: 'Тестовый', action: 'work_prompt_mode_test', token: tokensByAction.work_prompt_mode_test },
+    ],
+  ], { cancelToken: tokensByAction.cancel });
+}
+
+export function buildWorkPhotoTypeKeyboard(tokensByAction = {}) {
+  return buildChoiceKeyboard([
+    [
+      { label: 'Обычное фото', action: 'work_photo_type_normal', token: tokensByAction.work_photo_type_normal },
+      { label: 'Студийное', action: 'work_photo_type_studio', token: tokensByAction.work_photo_type_studio },
+    ],
+  ], { cancelToken: tokensByAction.cancel });
+}
+
+export function buildWorkSubjectKeyboard(tokensByAction = {}) {
+  return buildChoiceKeyboard([
+    [
+      { label: 'Прически / стрижки', action: 'work_subject_hair', token: tokensByAction.work_subject_hair },
+      { label: 'Брови', action: 'work_subject_brows', token: tokensByAction.work_subject_brows },
+    ],
+  ], { cancelToken: tokensByAction.cancel });
+}
+
+export function buildWorkBrowOutputKeyboard(tokensByAction = {}) {
+  return buildChoiceKeyboard([
+    [
+      { label: 'До / после', action: 'brow_output_before_after', token: tokensByAction.brow_output_before_after },
+      { label: 'Только после', action: 'brow_output_after_only', token: tokensByAction.brow_output_after_only },
+    ],
+  ], { cancelToken: tokensByAction.cancel });
+}
+
+export function buildWorkBackgroundKeyboard(tokensByAction = {}, { includeStudioOption = true } = {}) {
+  const rows = [[
+    { label: 'Как есть', action: 'background_mode_keep', token: tokensByAction.background_mode_keep },
+    { label: 'Сильный блюр', action: 'background_mode_blur', token: tokensByAction.background_mode_blur },
+  ]];
+  if (includeStudioOption) {
+    rows.push([
+      { label: 'Светлый студийный', action: 'background_mode_neutral', token: tokensByAction.background_mode_neutral },
+    ]);
+  }
+  return buildChoiceKeyboard(rows, { cancelToken: tokensByAction.cancel });
+}
+
+export function buildWorkCleanupKeyboard(tokensByAction = {}) {
+  return buildChoiceKeyboard([
+    [
+      { label: 'Да', action: 'cleanup_on', token: tokensByAction.cleanup_on },
+      { label: 'Нет', action: 'cleanup_off', token: tokensByAction.cleanup_off },
+    ],
+  ], { cancelToken: tokensByAction.cancel });
+}
+
 export function buildPreviewKeyboard(tokensByAction = {}, { canPrev = false, canNext = false } = {}) {
   const keyboard = new InlineKeyboard();
 
@@ -75,9 +154,14 @@ export function buildControlMessageText({
   totalRevisions,
   renderMode,
 }) {
+  const modeLabel = renderMode === 'separate'
+    ? 'по отдельности'
+    : renderMode === 'single'
+      ? 'одно фото'
+      : 'коллаж';
   return [
     `Версия ${revision}/${totalRevisions}`,
-    `Режим: ${renderMode === 'separate' ? 'по отдельности' : 'коллаж'}`,
+    `Режим: ${modeLabel}`,
     '',
     escapeTelegramText(caption),
   ].join('\n');
@@ -89,10 +173,15 @@ export function buildPreviewCaption({
   totalRevisions,
   renderMode,
 }) {
+  const modeLabel = renderMode === 'separate'
+    ? 'по отдельности'
+    : renderMode === 'single'
+      ? 'одно фото'
+      : 'коллаж';
   return [
     escapeTelegramText(caption),
     '',
-    `Версия ${revision}/${totalRevisions} · ${renderMode === 'separate' ? 'по отдельности' : 'коллаж'}`,
+    `Версия ${revision}/${totalRevisions} · ${modeLabel}`,
   ].join('\n');
 }
 

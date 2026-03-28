@@ -18,6 +18,14 @@ function createContext(overrides = {}) {
       calls.push(update);
       return { ok: true };
     },
+    async handleQueuedRuntimeAction(payload) {
+      calls.push({ worker: payload });
+      return { ok: true };
+    },
+    async handleCollectionFinalizeAction(payload) {
+      calls.push({ finalize: payload });
+      return { ok: true };
+    },
     async runCollectionFinalizer() {},
     async runCleanup() {},
     ...overrides.service,
@@ -72,6 +80,60 @@ test('worker route requires auth token and executes service handler', async () =
     });
     assert.equal(authorized.statusCode, 200);
     assert.deepEqual(context.calls, [{ update_id: 3 }]);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('runtime worker route requires auth token and executes queued runtime action', async () => {
+  const context = createContext();
+  const server = createServer(context);
+
+  try {
+    const unauthorized = await server.app.inject({
+      method: 'POST',
+      url: '/worker/runtime-action',
+      payload: { jobId: 'JOB-1', action: 'generate_initial' },
+    });
+    assert.equal(unauthorized.statusCode, 401);
+
+    const authorized = await server.app.inject({
+      method: 'POST',
+      url: '/worker/runtime-action',
+      payload: { jobId: 'JOB-2', action: 'regenerate_text' },
+      headers: {
+        'x-anita-worker-token': createWorkerAuthToken(context.env),
+      },
+    });
+    assert.equal(authorized.statusCode, 200);
+    assert.deepEqual(context.calls, [{ worker: { jobId: 'JOB-2', action: 'regenerate_text' } }]);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('collection finalize worker route requires auth token and executes finalize action', async () => {
+  const context = createContext();
+  const server = createServer(context);
+
+  try {
+    const unauthorized = await server.app.inject({
+      method: 'POST',
+      url: '/worker/collection-finalize',
+      payload: { collectionId: 'COL-1' },
+    });
+    assert.equal(unauthorized.statusCode, 401);
+
+    const authorized = await server.app.inject({
+      method: 'POST',
+      url: '/worker/collection-finalize',
+      payload: { collectionId: 'COL-2' },
+      headers: {
+        'x-anita-worker-token': createWorkerAuthToken(context.env),
+      },
+    });
+    assert.equal(authorized.statusCode, 200);
+    assert.deepEqual(context.calls, [{ finalize: { collectionId: 'COL-2' } }]);
   } finally {
     await server.stop();
   }

@@ -1,4 +1,5 @@
 ﻿import { InputFile } from 'grammy';
+import sharp from 'sharp';
 
 import {
   CALLBACK_TTL_MINUTES,
@@ -9,6 +10,7 @@ import {
   TOPIC_RESERVATION_MINUTES,
   WORK_COLLECTION_DEBOUNCE_SECONDS,
   WORK_COLLECTION_INITIAL_ALBUM_GRACE_SECONDS,
+  WORK_COLLECTION_PARTIAL_ALBUM_GRACE_SECONDS,
   WORK_SESSION_TTL_MINUTES,
 } from '../config/defaults.mjs';
 import {
@@ -24,7 +26,12 @@ import {
   buildPreviewCaption,
   buildQueueRow,
   buildRenderModeKeyboard,
-  computeIdempotencyKey,
+  buildWorkBackgroundKeyboard,
+  buildWorkBrowOutputKeyboard,
+  buildWorkPhotoTypeKeyboard,
+  buildWorkCleanupKeyboard,
+  buildWorkPromptModeKeyboard,
+  buildWorkSubjectKeyboard,
   normalizeTelegramUpdate,
   nowIso,
   parseTags,
@@ -34,6 +41,7 @@ import {
   toDataUrl,
   validateCallbackToken,
 } from '../domain/index.mjs';
+import { dispatchWorkerPayload } from '../http/worker-dispatch.mjs';
 import { isRetryableHttpError, withRetry, withTimeout } from './resilience.mjs';
 import { InlineKeyboard } from 'grammy';
 import {
@@ -48,6 +56,19 @@ function addMinutes(base, minutes) {
 
 function addSeconds(base, seconds) {
   return new Date(new Date(base).getTime() + (seconds * 1000)).toISOString();
+}
+
+function isTelegramMessageNotModifiedError(error) {
+  const message = String(error?.message ?? '');
+  return /message is not modified/iu.test(message);
+}
+
+function shouldReplaceTelegramControlMessage(error) {
+  const message = String(error?.message ?? '');
+  return /message to edit not found/iu.test(message)
+    || /message can't be edited/iu.test(message)
+    || /MESSAGE_ID_INVALID/iu.test(message)
+    || /message identifier is not specified/iu.test(message);
 }
 
 function sanitizeCaption(text) {
@@ -109,6 +130,11 @@ async function measureDuration(action) {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isDuplicateIdempotencyError(error) {
+  const message = String(error?.message ?? '');
+  return /duplicate key|already exists|23505|unique constraint|violates unique/i.test(message);
 }
 
 const TELEGRAM_PHOTO_CAPTION_LIMIT = 1024;
@@ -195,6 +221,23 @@ function toStoredText(value) {
 }
 
 const PINNED_WORK_TEXT_MODEL_ID = 'openai/gpt-5.4';
+const MODEL_IMAGE_MAX_DIMENSION = 1280;
+const MODEL_IMAGE_JPEG_QUALITY = 82;
+const REQUIRED_WORK_PROMPT_KEYS = [
+  'work_album_consistency_extraction',
+  'work_brow_consistency_extraction',
+  'work_image_edit_keep',
+  'work_image_edit_blur',
+  'work_image_edit_neutral',
+  'work_brow_edit_keep',
+  'work_brow_edit_blur',
+  'work_brow_edit_neutral',
+  'work_collage_generation',
+  'work_brow_collage_generation',
+  'work_caption_generation',
+  'work_brow_caption_generation',
+  'contact_block',
+];
 
 export class SalonBotService {
   constructor({
@@ -215,6 +258,7 @@ export class SalonBotService {
     this.botLogger = botLogger;
     this.localLocks = new Map();
     this.sourceReclaimState = new Map();
+    this.workerDispatchDisabledReason = '';
   }
 
   buildUserErrorMessage(error, fallback = USER_MESSAGES.genericError) {
@@ -225,48 +269,499 @@ export class SalonBotService {
     return appendContactBlock(text, contactBlock);
   }
 
+  isEmptyProviderTextError(error) {
+    return error?.name === 'ProviderEmptyResultError'
+      || /returned no text/i.test(String(error?.message ?? ''));
+  }
+
+  shouldDisableWorkerDispatch(error) {
+    const message = String(error?.message ?? '');
+    return /Worker dispatch failed with 401/i.test(message)
+      || /Authentication Required/i.test(message)
+      || /unauthorized_worker_request/i.test(message);
+  }
+
+  getWorkerDispatchSkipReason() {
+    if (this.workerDispatchDisabledReason) {
+      return this.workerDispatchDisabledReason;
+    }
+    if (!this.env?.internalWorkerDispatchEnabled) {
+      return 'worker_dispatch_disabled';
+    }
+    const webhookBaseUrl = String(this.env?.webhookBaseUrl ?? '').trim();
+    if (!webhookBaseUrl) {
+      return 'missing_base_url';
+    }
+    if (this.env?.webhookBaseUrlDerivedFromDeploymentUrl) {
+      return 'protected_deployment_base_url';
+    }
+    try {
+      const host = new URL(webhookBaseUrl).hostname.toLowerCase();
+      if (host === 'vercel.app' || host.endsWith('.vercel.app')) {
+        return 'protected_vercel_host';
+      }
+    } catch {
+      return 'invalid_base_url';
+    }
+    return '';
+  }
+
+  buildFallbackWorkCaption(sourceAssetCount = 1, { subjectType = 'hair', browOutputMode = 'after_only' } = {}) {
+    if (subjectType === 'brows') {
+      if (browOutputMode === 'before_after') {
+        return 'Показываю брови до и после ✨\nФорму и насыщенность вывела аккуратно, чтобы результат выглядел чисто, ровно и естественно.';
+      }
+      return 'Показываю готовый результат по бровям ✨\nСделала форму чище и аккуратнее, чтобы взгляд смотрелся мягко и собранно.';
+    }
+    if (Number(sourceAssetCount) > 1) {
+      return 'Показываю работу с нескольких ракурсов ✨\nФорма и силуэт читаются чище, а волосы выглядят аккуратно и собранно.';
+    }
+    return 'Аккуратная работа с формой и текстурой ✨\nСделала образ чище и выразительнее, чтобы волосы выглядели ухоженно и легко читались в кадре.';
+  }
+
+  async generateWorkCaptionText({
+    prompts,
+    sourceAssetCount = 1,
+    imageUrls = [],
+    jobId = '',
+    revision = null,
+    renderMode = 'separate',
+    subjectType = 'hair',
+    browOutputMode = 'after_only',
+    chatId = null,
+    userId = null,
+    queueId = '',
+    collectionId = '',
+  }) {
+    try {
+      const result = await this.openrouter.generateText({
+        systemPrompt: subjectType === 'brows'
+          ? (prompts.work_brow_caption_generation ?? DEFAULT_PROMPTS.work_brow_caption_generation)
+          : (prompts.work_caption_generation ?? DEFAULT_PROMPTS.work_caption_generation),
+        userPrompt: this.buildWorkCaptionUserPrompt(sourceAssetCount, { subjectType, browOutputMode }),
+        imageUrls,
+        temperature: 0.9,
+        maxTokens: 220,
+        model: this.getWorkTextModelId(),
+        metadata: {
+          source_type: 'work',
+          job_id: jobId,
+          revision,
+          model: this.getWorkTextModelId(),
+          source_asset_count: sourceAssetCount,
+          render_mode: renderMode,
+          subject_type: subjectType,
+          brow_output_mode: browOutputMode,
+          pass: 'work_caption',
+        },
+      });
+      return {
+        text: this.formatCaptionWithContact(result.text, prompts.contact_block),
+        fallback: false,
+      };
+    } catch (error) {
+      if (!this.isEmptyProviderTextError(error)) {
+        throw error;
+      }
+      this.logEventBestEffort({
+        level: 'ERROR',
+        event: 'work_caption_provider_empty',
+        stage: 'processing',
+        chatId,
+        userId,
+        jobId,
+        queueId,
+        collectionId,
+        sourceType: 'work',
+        status: 'fallback',
+        message: error.message,
+        payload: {
+          model: this.getWorkTextModelId(),
+          sourceAssetCount,
+          renderMode,
+          subjectType,
+          browOutputMode,
+        },
+      });
+      return {
+        text: this.formatCaptionWithContact(
+          this.buildFallbackWorkCaption(sourceAssetCount, { subjectType, browOutputMode }),
+          prompts.contact_block,
+        ),
+        fallback: true,
+      };
+    }
+  }
+
   formatTopicCaption(text, contactBlock = DEFAULT_PROMPTS.contact_block) {
     return appendTopicOutro(text, contactBlock);
   }
 
-  buildWorkCaptionUserPrompt(assetCount) {
+  buildWorkCaptionUserPrompt(assetCount, { subjectType = 'hair', browOutputMode = 'after_only' } = {}) {
+    if (subjectType === 'brows') {
+      return [
+        `Сделай готовый короткий пост к работе мастера по бровям. Количество фото: ${assetCount}.`,
+        `Режим показа: ${browOutputMode === 'before_after' ? 'до и после' : 'только после'}.`,
+        'Это должен быть финальный текст для публикации, а не комментарий к задаче.',
+        'Не задавай вопросов, не проси прислать фото, не объясняй процесс.',
+        'Пиши от первого лица одного мастера.',
+        'Не используй формулировки "мы", "наши мастера", "один из мастеров", "команда".',
+        'Сделай текст коротким и живым: иногда достаточно 2 коротких строк, иногда 1-2 коротких абзацев.',
+        'Если по фото можно уверенно назвать работу перманентным макияжем или оформлением бровей — назови это. Если уверенности нет, используй нейтральную формулировку про брови.',
+        'Главный акцент делай на результате для клиента, а не на предпочтениях мастера.',
+        'Не повторяй формулировки вроде "люблю", "обожаю", "именно так я люблю" и похожие обороты. Такие фразы допустимы редко и только если действительно к месту.',
+        'Добавь живую человеческую подачу без канцелярита.',
+        'Контактный блок добавлять не нужно.',
+      ].join('\n');
+    }
     return [
       `Сделай готовый короткий пост к работе мастера. Количество фото: ${assetCount}.`,
       'Это должен быть финальный текст для публикации, а не комментарий к задаче.',
       'Не задавай вопросов, не проси прислать фото, не объясняй процесс.',
       'Пиши от первого лица одного мастера.',
       'Не используй формулировки "мы", "наши мастера", "один из мастеров", "команда".',
-      'Сделай 1-2 коротких абзаца, без воды, короче текущего стандартного поста.',
+      'Сделай текст коротким и разнообразным по длине: иногда достаточно 2 коротких строк, иногда 1-2 коротких абзацев.',
       'Если тип работы можно уверенно определить по фото, назови его в начале. Если уверенности нет — не выдумывай и используй нейтральную формулировку.',
       'Не называй работу свадебной, вечерней, мужской, окрашиванием или любой другой конкретной услугой без прямых визуальных признаков.',
+      'Главный акцент делай на результате для клиента: что получилось, как выглядит форма, текстура, силуэт, аккуратность и удобство в носке.',
+      'Не повторяй формулировки вроде "люблю", "обожаю", "именно так я люблю" и похожие обороты. Такие фразы допустимы редко и только если действительно к месту.',
       'Добавь умеренно больше эмодзи и живую человеческую подачу.',
-      'Допустима лёгкая разговорная шероховатость и местами чуть неидеальная разговорная фраза, но без явных ошибок и без сломанной грамматики.',
+      'Допустима лёгкая разговорная шероховатость, но без явных ошибок и без сломанной грамматики.',
       'Контактный блок добавлять не нужно.',
     ].join('\n');
   }
 
-  buildWorkCaptionImageUrls(assets) {
-    return (assets ?? [])
-      .map((asset) => {
-        if (!asset?.buffer) {
-          return null;
-        }
-        return toDataUrl(asset.buffer, asset.mimeType ?? 'image/jpeg');
-      })
-      .filter(Boolean)
-      .slice(0, 3);
+  async toModelImageUrl(asset) {
+    if (!asset?.buffer) {
+      return null;
+    }
+    try {
+      const normalizedBuffer = await sharp(asset.buffer, { failOn: 'none' })
+        .rotate()
+        .resize({
+          width: MODEL_IMAGE_MAX_DIMENSION,
+          height: MODEL_IMAGE_MAX_DIMENSION,
+          fit: 'inside',
+          withoutEnlargement: true,
+        })
+        .jpeg({ quality: MODEL_IMAGE_JPEG_QUALITY, mozjpeg: true })
+        .toBuffer();
+      return toDataUrl(normalizedBuffer, 'image/jpeg');
+    } catch {
+      return toDataUrl(asset.buffer, asset.mimeType ?? 'image/jpeg');
+    }
   }
 
-  buildWorkCollageImageUrls(assets) {
-    return (assets ?? [])
-      .map((asset) => {
-        if (!asset?.buffer) {
-          return null;
-        }
-        return toDataUrl(asset.buffer, asset.mimeType ?? 'image/jpeg');
+  async buildWorkCaptionImageUrls(assets) {
+    const urls = await Promise.all((assets ?? []).map((asset) => this.toModelImageUrl(asset)));
+    return urls.filter(Boolean).slice(0, 3);
+  }
+
+  async buildWorkCollageImageUrls(assets) {
+    const urls = await Promise.all((assets ?? []).map((asset) => this.toModelImageUrl(asset)));
+    return urls.filter(Boolean).slice(0, 3);
+  }
+
+  getWorkImageConfig(pass) {
+    if (pass === 'compose_collage') {
+      return { aspect_ratio: '4:5' };
+    }
+    return { aspect_ratio: '3:4' };
+  }
+
+  isRecoverableWorkImageProviderFailure(error) {
+    if (!error) {
+      return false;
+    }
+    if (error?.name === 'ProviderEmptyResultError' || error?.name === 'ProviderRequestError') {
+      return true;
+    }
+    const message = String(error?.message ?? '');
+    return /openrouter error (402|429)/iu.test(message)
+      || /returned no images/iu.test(message)
+      || /did not return a work image/iu.test(message)
+      || /temporarily rate-limited upstream|rate-?limit/iu.test(message);
+  }
+
+  async buildDegradedLocalWorkAsset(inputAsset) {
+    const buffer = await sharp(inputAsset.buffer, { failOn: 'none' })
+      .rotate()
+      .resize({
+        width: MODEL_IMAGE_MAX_DIMENSION,
+        height: MODEL_IMAGE_MAX_DIMENSION,
+        fit: 'inside',
+        withoutEnlargement: true,
       })
-      .filter(Boolean)
-      .slice(0, 3);
+      .normalize()
+      .modulate({
+        brightness: 1.03,
+        saturation: 1.07,
+      })
+      .gamma(1.02)
+      .sharpen(1.1, 1, 2)
+      .jpeg({ quality: 90, mozjpeg: true })
+      .toBuffer();
+    return {
+      buffer,
+      mimeType: 'image/jpeg',
+      filename: basenameForMime('image/jpeg', inputAsset.filename ?? 'work.jpg'),
+    };
+  }
+
+  shouldAllowDegradedLocalWorkFallback({
+    sourceAssetCount = 1,
+    subjectType = 'hair',
+    backgroundMode = '',
+    cleanupMode = 'off',
+    promptMode = 'normal',
+  } = {}) {
+    if (Number(sourceAssetCount) !== 1) {
+      return false;
+    }
+    if (this.getWorkSubjectType(subjectType) !== 'hair') {
+      return false;
+    }
+    return String(backgroundMode || '') === 'keep'
+      && String(cleanupMode || 'off') === 'off'
+      && String(promptMode || 'normal') === 'normal';
+  }
+
+  inferWorkBackgroundMode(consistencyNotes = '') {
+    const notes = String(consistencyNotes ?? '');
+    if (/NEUTRAL_LIGHT_BACKGROUND/u.test(notes)) {
+      return 'neutral';
+    }
+    return 'blur';
+  }
+
+  getWorkSubjectType(value = '') {
+    return String(value || '') === 'brows' ? 'brows' : 'hair';
+  }
+
+  getBrowOutputMode(value = '') {
+    return String(value || '') === 'before_after' ? 'before_after' : 'after_only';
+  }
+
+  getWorkImagePromptKey(subjectType = 'hair', backgroundMode = 'blur') {
+    if (this.getWorkSubjectType(subjectType) === 'brows') {
+      if (backgroundMode === 'neutral') {
+        return 'work_brow_edit_neutral';
+      }
+      if (backgroundMode === 'keep') {
+        return 'work_brow_edit_keep';
+      }
+      return 'work_brow_edit_blur';
+    }
+    if (backgroundMode === 'neutral') {
+      return 'work_image_edit_neutral';
+    }
+    if (backgroundMode === 'keep') {
+      return 'work_image_edit_keep';
+    }
+    return 'work_image_edit_blur';
+  }
+
+  buildUnifiedWorkImagePrompt(prompts, {
+    consistencyNotes = '',
+    backgroundMode = '',
+    cleanupMode = 'off',
+    promptMode = 'normal',
+    subjectType = 'hair',
+    browOutputMode = 'after_only',
+    browPassKind = 'after',
+  } = {}) {
+    const normalizedBackgroundMode = backgroundMode || this.inferWorkBackgroundMode(consistencyNotes);
+    const normalizedSubjectType = this.getWorkSubjectType(subjectType);
+    const promptKey = this.getWorkImagePromptKey(normalizedSubjectType, normalizedBackgroundMode);
+    const basePrompt = prompts[promptKey] ?? DEFAULT_PROMPTS[promptKey];
+    return [
+      basePrompt,
+      normalizedSubjectType === 'brows'
+        ? (
+          this.getBrowOutputMode(browOutputMode) === 'before_after' && browPassKind === 'before'
+            ? 'Brow mode: create a realistic BEFORE state from the same real person and same close-up. Keep the exact same eyebrow placement, face geometry, eyes, eyelids, squint, nose, ears, beard or stubble, clothing, pose, and camera angle. Make the brows visibly sparser, less filled, less tidy, a bit duller, and less defined, but still believable and natural. Do not invent a different person or a new facial expression.'
+            : 'Brow mode: create a realistic AFTER state from the same real person and same close-up. Show аккуратный, ровный, естественный permanent makeup result with cleaner shape, richer but believable pigment, and a polished eyebrow finish. Do not invent a different person or change the face.'
+        )
+        : '',
+      normalizedBackgroundMode === 'neutral'
+        ? 'Neutral background override: fully replace the busy salon background with a plain clean light studio wall or a soft light gray seamless background. Remove mirrors, shelves, bottles, certificates, posters, window details, and all other interior distractions from the final frame.'
+        : normalizedBackgroundMode === 'blur'
+          ? 'Blur background override: keep the same room only as an extremely strong creamy blur so the main beauty result stays dominant and the background no longer reads as a detailed salon interior. Bottles, shelves, certificates, mirrors, windows, and text must stop being recognizable objects.'
+          : '',
+      cleanupMode === 'on'
+        ? 'Cleanup rule: visibly clean the background. Remove or simplify small distracting clutter such as bottles, tools, cords, shelf junk, table mess, busy reflections, posters, and certificates whenever they distract from the main beauty result. If blur is selected, the cleaned background still must stay strongly blurred. Keep the person, beauty work, clothing, pose, body geometry, mirror placement, and main room perspective unchanged.'
+        : '',
+      cleanupMode === 'on' && normalizedBackgroundMode === 'blur'
+        ? 'Combined blur plus cleanup rule: after cleanup, leave the remaining room only as a heavy blur. Background items must not survive as distinct readable objects.'
+        : '',
+      cleanupMode === 'on' && normalizedBackgroundMode === 'keep'
+        ? 'Combined keep plus cleanup rule: preserve the room structure, but make it visibly tidier and calmer without changing the person or the beauty result.'
+        : '',
+      promptMode === 'test'
+        ? 'Test mode: add a subtle studio contour relight and slightly clearer separation of the main beauty result from the background, but keep the result natural and physically plausible. Avoid any cutout, pasted, floating, or over-staged look.'
+        : '',
+      consistencyNotes ? `Locked album facts:\n${consistencyNotes}` : '',
+    ].filter(Boolean).join('\n');
+  }
+
+  buildCompactWorkImagePrompt({
+    backgroundMode = '',
+    cleanupMode = 'off',
+    promptMode = 'normal',
+    consistencyNotes = '',
+    subjectType = 'hair',
+    browOutputMode = 'after_only',
+    browPassKind = 'after',
+  } = {}) {
+    const normalizedBackgroundMode = backgroundMode || this.inferWorkBackgroundMode(consistencyNotes);
+    const normalizedSubjectType = this.getWorkSubjectType(subjectType);
+    return [
+      'IMAGE EDIT ONLY. Use only the uploaded real photo.',
+      normalizedSubjectType === 'brows'
+        ? 'Preserve the exact same person, exact side profile, eyes, squint, eyelids, brows, nose, ears, beard or stubble, clothing, pose, and face geometry.'
+        : 'Preserve the exact same person, exact side profile, eyes, brows, nose, ears, beard or stubble, clothing, pose, neck line, haircut shape, hair length, fade or graduation, neckline, and silhouette.',
+      normalizedSubjectType === 'brows'
+        ? 'Keep the camera visually level. Make one eyebrow or both eyebrows with the eyes dominate the frame naturally.'
+        : 'Keep the camera visually level. Make the head and haircut dominate the frame naturally.',
+      normalizedSubjectType === 'brows'
+        ? (
+          this.getBrowOutputMode(browOutputMode) === 'before_after' && browPassKind === 'before'
+            ? 'Create a realistic BEFORE brow state: sparser, duller, less tidy, but still the same real person and same eyebrow placement.'
+            : 'Create a realistic AFTER brow state with аккуратный natural permanent makeup styling while preserving the same person and same eyebrow placement.'
+        )
+        : '',
+      normalizedBackgroundMode === 'neutral'
+        ? 'Replace the busy salon background with a plain clean light studio background. Remove all readable text, certificates, mirrors, shelves, bottles, windows, and clutter from the final background.'
+        : normalizedBackgroundMode === 'blur'
+          ? 'Keep the real room only as an extremely strong soft blur. Do not keep any readable text, certificates, mirrors, shelves, bottles, or detailed clutter recognizable in the background.'
+          : 'Keep the real room structure, but make the background calmer, cleaner, and less distracting. Any readable text must become unreadable.',
+      cleanupMode === 'on'
+        ? 'Clean up distracting small background clutter and junk, and if blur is selected keep the cleaned background strongly blurred. Do not change the person, beauty work, clothing, or scene geometry.'
+        : '',
+      cleanupMode === 'on' && normalizedBackgroundMode === 'blur'
+        ? 'When blur and cleanup are both selected, remove or simplify clutter first and then leave the rest only as a heavy blur, not as recognizable objects.'
+        : '',
+      cleanupMode === 'on' && normalizedBackgroundMode === 'keep'
+        ? 'When keep and cleanup are both selected, preserve the room structure but make the scene visibly tidier, calmer, and cleaner.'
+        : '',
+      promptMode === 'test'
+        ? 'Use a subtle professional contour relight and gentle subject separation, but avoid any cutout or pasted look.'
+        : '',
+      'Apply realistic relight, upscale, texture clarity, and premium polish in this single pass.',
+      consistencyNotes ? `Locked album facts:\n${consistencyNotes}` : '',
+    ].filter(Boolean).join('\n');
+  }
+
+  async buildBeforeAfterPreviewAsset(beforeAsset, afterAsset, seed = 'brow-before-after') {
+    const gap = 24;
+    const targetHeight = 1350;
+    const panelWidth = 528;
+    const width = (panelWidth * 2) + gap;
+    const background = { r: 245, g: 245, b: 245, alpha: 1 };
+
+    const [beforeBuffer, afterBuffer] = await Promise.all([
+      sharp(beforeAsset.buffer, { failOn: 'none' })
+        .rotate()
+        .resize({ width: panelWidth, height: targetHeight, fit: 'cover', position: 'centre' })
+        .jpeg({ quality: 90, mozjpeg: true })
+        .toBuffer(),
+      sharp(afterAsset.buffer, { failOn: 'none' })
+        .rotate()
+        .resize({ width: panelWidth, height: targetHeight, fit: 'cover', position: 'centre' })
+        .jpeg({ quality: 90, mozjpeg: true })
+        .toBuffer(),
+    ]);
+
+    const buffer = await sharp({
+      create: {
+        width,
+        height: targetHeight,
+        channels: 4,
+        background,
+      },
+    })
+      .composite([
+        { input: beforeBuffer, left: 0, top: 0 },
+        { input: afterBuffer, left: panelWidth + gap, top: 0 },
+      ])
+      .jpeg({ quality: 92, mozjpeg: true })
+      .toBuffer();
+
+    return {
+      buffer,
+      mimeType: 'image/jpeg',
+      filename: basenameForMime('image/jpeg', `${seed}.jpg`),
+    };
+  }
+
+  buildWorkCollagePrompt(prompts, {
+    consistencyNotes = '',
+    backgroundMode = '',
+    cleanupMode = 'off',
+    promptMode = 'normal',
+    subjectType = 'hair',
+    browOutputMode = '',
+  } = {}) {
+    const normalizedBackgroundMode = backgroundMode || this.inferWorkBackgroundMode(consistencyNotes);
+    const normalizedSubjectType = this.getWorkSubjectType(subjectType);
+    return [
+      normalizedSubjectType === 'brows'
+        ? (prompts.work_brow_collage_generation ?? DEFAULT_PROMPTS.work_brow_collage_generation)
+        : (prompts.work_collage_generation ?? DEFAULT_PROMPTS.work_collage_generation),
+      normalizedBackgroundMode === 'neutral'
+        ? 'Final collage background rule: every panel must keep the clean neutral light studio background treatment. Do not reintroduce salon interior details, mirrors, shelves, bottles, posters, certificates, windows, or readable background text.'
+        : normalizedBackgroundMode === 'blur'
+          ? 'Final collage background rule: every panel must keep the real room only as an extremely strong soft blur. Do not let the salon interior become detailed, recognizable, or readable again.'
+          : 'Final collage background rule: preserve the original room structure, but keep it visibly calmer and less distracting. Any background text must remain unreadable.',
+      cleanupMode === 'on'
+        ? 'Final collage cleanup rule: keep distracting clutter, bottles, tools, cords, shelf junk, posters, certificates, and busy reflections cleaned up or visually minimized across all panels. If blur is selected, the cleaned background must still remain strongly blurred.'
+        : '',
+      promptMode === 'test'
+        ? 'Test mode collage rule: keep the haircut clearly separated from the background with a subtle professional contour relight, but avoid any cutout, pasted, or floating look.'
+        : '',
+      normalizedSubjectType === 'brows'
+        ? 'Eyebrow collage rule: keep eyebrows and eye area readable in every panel and do not zoom out into a wide salon scene.'
+        : '',
+      normalizedSubjectType === 'brows' && browOutputMode === 'before_after'
+        ? 'Eyebrow before/after collage rule: preserve the before-versus-after eyebrow comparison in every panel. Do not collapse the result into after-only frames.'
+        : '',
+      consistencyNotes ? `Locked album facts:\n${consistencyNotes}` : '',
+    ].filter(Boolean).join('\n');
+  }
+
+  async runWorkImagePass({
+    inputAsset,
+    prompt,
+    jobId,
+    index,
+    revision = null,
+    pass,
+    renderMode = 'separate',
+    sourceAssetCount = 1,
+  }) {
+    const result = await this.openrouter.generateImages({
+      prompt,
+      imageUrls: [await this.toModelImageUrl(inputAsset)].filter(Boolean),
+      imageConfig: this.getWorkImageConfig(pass),
+      metadata: {
+        source_type: 'work',
+        job_id: jobId,
+        asset_index: index,
+        revision,
+        model: this.env.imageModelId,
+        pass,
+        render_mode: renderMode,
+        source_asset_count: sourceAssetCount,
+      },
+    });
+    const generatedSource = result.images[0];
+    if (!generatedSource) {
+      throw new Error(`OpenRouter did not return a work image for pass ${pass}`);
+    }
+    return {
+      asset: await this.resolveRemoteImage(generatedSource),
+      durationMs: result.durationMs ?? 0,
+    };
   }
 
   isTopicSourceStatusMutationsEnabled() {
@@ -1387,47 +1882,125 @@ export class SalonBotService {
     return TOPIC_SALON_REFERENCE_IMAGE_URLS;
   }
 
-  async extractAlbumConsistencyNotes({ assets, prompts, jobId, revision = null }) {
+  async extractAlbumConsistencyNotes({ assets, prompts, jobId, revision = null, subjectType = 'hair' }) {
     if (!Array.isArray(assets) || assets.length <= 1) {
       return '';
     }
-    const imageUrls = assets
-      .map((asset) => {
-        if (!asset?.buffer) {
-          return null;
-        }
-        return toDataUrl(asset.buffer, asset.mimeType ?? 'image/jpeg');
-      })
+    const imageUrls = (await Promise.all((assets ?? []).map((asset) => this.toModelImageUrl(asset))))
       .filter(Boolean)
       .slice(0, 3);
     if (imageUrls.length <= 1) {
       return '';
     }
-    const consistency = await this.openrouter.generateText({
-      systemPrompt: prompts.work_album_consistency_extraction ?? DEFAULT_PROMPTS.work_album_consistency_extraction,
-      userPrompt: 'Опиши только locked facts, которые должны сохраняться одинаковыми на всех кадрах альбома.',
-      imageUrls,
-      temperature: 0.1,
-      model: this.getWorkTextModelId(),
-      metadata: {
-        source_type: 'work',
-        job_id: jobId,
-        revision,
+    try {
+      const consistency = await this.openrouter.generateText({
+        systemPrompt: this.getWorkSubjectType(subjectType) === 'brows'
+          ? (prompts.work_brow_consistency_extraction ?? DEFAULT_PROMPTS.work_brow_consistency_extraction)
+          : (prompts.work_album_consistency_extraction ?? DEFAULT_PROMPTS.work_album_consistency_extraction),
+        userPrompt: this.getWorkSubjectType(subjectType) === 'brows'
+          ? 'Опиши только locked facts, которые должны сохраняться одинаковыми на всех кадрах альбома с бровями.'
+          : 'Опиши только locked facts, которые должны сохраняться одинаковыми на всех кадрах альбома.',
+        imageUrls,
+        temperature: 0.1,
+        maxTokens: 220,
         model: this.getWorkTextModelId(),
-        pass: 'consistency',
-        source_asset_count: imageUrls.length,
-      },
-    });
-    return String(consistency?.text ?? '').trim();
+        metadata: {
+          source_type: 'work',
+          job_id: jobId,
+          revision,
+          model: this.getWorkTextModelId(),
+          pass: 'consistency',
+          source_asset_count: imageUrls.length,
+          subject_type: this.getWorkSubjectType(subjectType),
+        },
+      });
+      return String(consistency?.text ?? '').trim();
+    } catch (error) {
+      if (!this.isEmptyProviderTextError(error)) {
+        throw error;
+      }
+      this.logEventBestEffort({
+        level: 'ERROR',
+        event: 'consistency_provider_empty',
+        stage: 'processing',
+        jobId,
+        sourceType: 'work',
+        status: 'fallback',
+        message: error.message,
+        payload: {
+          revision,
+          sourceAssetCount: imageUrls.length,
+          model: this.getWorkTextModelId(),
+        },
+      });
+      return '';
+    }
   }
 
   getWorkTextModelId() {
     return PINNED_WORK_TEXT_MODEL_ID;
   }
 
+  async resolveWorkPrompts({ jobId = '', revision = null, sourceAssetCount = 0, renderMode = '', subjectType = 'hair' } = {}) {
+    const prompts = await this.promptConfig.refresh();
+    let remoteKeys = [];
+    let fallbackKeys = [...REQUIRED_WORK_PROMPT_KEYS];
+    let missingKeys = [];
+
+    if (typeof this.promptConfig.getWorkPromptCoverage === 'function') {
+      const coverage = await this.promptConfig.getWorkPromptCoverage(subjectType);
+      remoteKeys = [...(coverage.supabaseKeys ?? [])];
+      fallbackKeys = [...(coverage.fallbackKeys ?? [])];
+      missingKeys = [...(coverage.missingRequiredKeys ?? [])];
+    }
+
+    this.logEventBestEffort({
+      event: 'work_prompt_source_resolved',
+      stage: 'config',
+      jobId,
+      sourceType: 'work',
+      status: missingKeys.length > 0 ? 'missing_keys' : 'ok',
+      message: `remote=${remoteKeys.length} fallback=${fallbackKeys.length}`,
+      payload: {
+        revision,
+        renderMode,
+        sourceAssetCount,
+        subjectType: this.getWorkSubjectType(subjectType),
+        remoteKeys,
+        fallbackKeys,
+        missingKeys,
+      },
+    });
+
+    if (missingKeys.length > 0) {
+      this.logEventBestEffort({
+        level: 'ERROR',
+        event: 'work_prompt_misconfigured',
+        stage: 'config',
+        jobId,
+        sourceType: 'work',
+        status: 'missing_keys',
+        message: missingKeys.join(', '),
+        payload: {
+          remoteKeys,
+          fallbackKeys,
+          missingKeys,
+        },
+      });
+    }
+
+    return prompts;
+  }
+
   getCollectionDeadlineAt(currentTime, { mediaGroupId, assetCount }) {
-    if (mediaGroupId && Number(assetCount) <= 1) {
-      return addSeconds(currentTime, WORK_COLLECTION_INITIAL_ALBUM_GRACE_SECONDS);
+    if (mediaGroupId) {
+      const normalizedCount = Number(assetCount);
+      if (normalizedCount <= 1) {
+        return addSeconds(currentTime, WORK_COLLECTION_INITIAL_ALBUM_GRACE_SECONDS);
+      }
+      if (normalizedCount < 3) {
+        return addSeconds(currentTime, WORK_COLLECTION_PARTIAL_ALBUM_GRACE_SECONDS);
+      }
     }
     return addSeconds(currentTime, WORK_COLLECTION_DEBOUNCE_SECONDS);
   }
@@ -1436,7 +2009,13 @@ export class SalonBotService {
     return !mediaGroupId || Number(collectionCount) > 1;
   }
 
-  async buildFinalWorkPreviewAsset(assets, jobId, prompts = DEFAULT_PROMPTS, consistencyNotes = '') {
+  async buildFinalWorkPreviewAsset(assets, jobId, prompts = DEFAULT_PROMPTS, consistencyNotes = '', {
+    backgroundMode = '',
+    cleanupMode = 'off',
+    promptMode = 'normal',
+    subjectType = 'hair',
+    browOutputMode = '',
+  } = {}) {
     if (!Array.isArray(assets) || assets.length === 0) {
       throw new Error('No processed work assets available for preview');
     }
@@ -1446,17 +2025,22 @@ export class SalonBotService {
         asset: assets[0],
       };
     }
-    const collageImageUrls = this.buildWorkCollageImageUrls(assets);
+    const collageImageUrls = await this.buildWorkCollageImageUrls(assets);
     if (collageImageUrls.length !== assets.length) {
       throw new Error('Missing processed work assets for collage composition');
-    }
-    const collageResult = await this.openrouter.generateImages({
-      prompt: [
-        prompts.work_collage_generation ?? DEFAULT_PROMPTS.work_collage_generation,
-        consistencyNotes ? `Locked album facts:\n${consistencyNotes}` : '',
-      ].filter(Boolean).join('\n'),
-      imageUrls: collageImageUrls,
-      metadata: {
+      }
+      const collageResult = await this.openrouter.generateImages({
+        prompt: this.buildWorkCollagePrompt(prompts, {
+          consistencyNotes,
+          backgroundMode,
+          cleanupMode,
+          promptMode,
+          subjectType,
+          browOutputMode,
+        }),
+        imageUrls: collageImageUrls,
+        imageConfig: this.getWorkImageConfig('compose_collage'),
+        metadata: {
         source_type: 'work',
         job_id: jobId,
         model: this.env.imageModelId,
@@ -1602,52 +2186,253 @@ export class SalonBotService {
     revision = null,
     consistencyNotes = '',
     originalAsset = null,
+    renderMode = 'separate',
+    promptMode = 'normal',
+    subjectType = 'hair',
+    browOutputMode = 'after_only',
+    backgroundMode = '',
+    cleanupMode = 'off',
+    sourceAssetCount = 1,
+    logContext = {},
   }) {
     const original = originalAsset ?? await this.downloadTelegramFile(fileId);
-    const imageResult = await this.openrouter.generateImages({
-      prompt: [
-        prompts.work_image_enhancement_master,
-        prompts.work_image_enhancement_short,
-        consistencyNotes ? `Locked album facts:\n${consistencyNotes}` : '',
-        `Negative prompt: ${prompts.work_image_enhancement_negative}`,
-      ].filter(Boolean).join('\n'),
-      imageUrls: [toDataUrl(original.buffer, original.mimeType)],
-      metadata: {
-        source_type: 'work',
-        job_id: jobId,
-        asset_index: index,
-        revision,
+    const logBase = {
+      stage: 'processing',
+      chatId: logContext.chatId ?? null,
+      userId: logContext.userId ?? null,
+      jobId,
+      queueId: logContext.queueId ?? null,
+      collectionId: logContext.collectionId ?? null,
+      sourceType: 'work',
+      payload: {
         model: this.env.imageModelId,
-        pass: 'enhance',
-      },
-    });
-    const generatedSource = imageResult.images[0];
-    if (!generatedSource) {
-      throw new Error('OpenRouter did not return an enhanced work image');
-    }
-    const firstPassAsset = await this.resolveRemoteImage(generatedSource);
-    const reframeResult = await this.openrouter.generateImages({
-      prompt: [
-        prompts.work_image_reframe_master,
-        consistencyNotes ? `Locked album facts:\n${consistencyNotes}` : '',
-        `Negative prompt: ${prompts.work_image_enhancement_negative}`,
-      ].filter(Boolean).join('\n'),
-      imageUrls: [toDataUrl(firstPassAsset.buffer, firstPassAsset.mimeType)],
-      metadata: {
-        source_type: 'work',
-        job_id: jobId,
-        asset_index: index,
+        assetIndex: index,
+        renderMode,
         revision,
-        model: this.env.imageModelId,
-        pass: 'reframe',
+        sourceAssetCount,
+        promptMode,
+        subjectType,
+        browOutputMode,
+        backgroundMode: backgroundMode || '',
+        cleanupMode,
       },
+    };
+    const normalizedSubjectType = this.getWorkSubjectType(subjectType);
+    const normalizedBrowOutputMode = this.getBrowOutputMode(browOutputMode);
+    const effectiveBackgroundMode = backgroundMode || this.inferWorkBackgroundMode(consistencyNotes);
+    logBase.payload.backgroundMode = effectiveBackgroundMode;
+    const editPassBase = effectiveBackgroundMode === 'neutral'
+      ? 'edit_neutral'
+      : effectiveBackgroundMode === 'keep'
+        ? 'edit_keep'
+        : 'edit_blur';
+    const editPass = normalizedSubjectType === 'brows'
+      ? `brow_${editPassBase}`
+      : editPassBase;
+    const unifiedPrompt = this.buildUnifiedWorkImagePrompt(prompts, {
+      consistencyNotes,
+      backgroundMode: effectiveBackgroundMode,
+      cleanupMode,
+      promptMode,
+      subjectType: normalizedSubjectType,
+      browOutputMode: normalizedBrowOutputMode,
+      browPassKind: 'after',
     });
 
+    await this.logEvent({
+      ...logBase,
+      event: 'image_enhancement_started',
+      status: 'started',
+      message: `asset=${index + 1}`,
+    });
+
+    let processedAsset;
+    let editDurationMs = 0;
+      try {
+        const measuredEdit = await measureDuration(async () => (
+          (await this.runWorkImagePass({
+          inputAsset: original,
+          prompt: unifiedPrompt,
+          jobId,
+          index,
+          revision,
+          pass: editPass,
+          renderMode,
+          sourceAssetCount,
+        })).asset
+        ));
+        processedAsset = measuredEdit.result;
+        editDurationMs = measuredEdit.durationMs;
+        if (normalizedSubjectType === 'brows' && normalizedBrowOutputMode === 'before_after') {
+          const beforeMeasured = await measureDuration(async () => (
+            (await this.runWorkImagePass({
+              inputAsset: original,
+              prompt: this.buildUnifiedWorkImagePrompt(prompts, {
+                consistencyNotes,
+                backgroundMode: effectiveBackgroundMode,
+                cleanupMode,
+                promptMode,
+                subjectType: normalizedSubjectType,
+                browOutputMode: normalizedBrowOutputMode,
+                browPassKind: 'before',
+              }),
+              jobId,
+              index,
+              revision,
+              pass: `${editPass}_before`,
+              renderMode,
+              sourceAssetCount,
+            })).asset
+          ));
+          processedAsset = await this.buildBeforeAfterPreviewAsset(beforeMeasured.result, processedAsset, `${jobId}-${index}-brows`);
+          editDurationMs += beforeMeasured.durationMs;
+        }
+      } catch (error) {
+        const degradedAccept = this.shouldAllowDegradedLocalWorkFallback({
+          sourceAssetCount,
+          subjectType: normalizedSubjectType,
+          backgroundMode: effectiveBackgroundMode,
+          cleanupMode,
+          promptMode,
+        }) && this.isRecoverableWorkImageProviderFailure(error);
+        await this.logEvent({
+          ...logBase,
+          event: 'image_provider_first_pass_failed',
+        status: degradedAccept ? 'degraded_accept' : 'failed',
+        message: error?.message || `asset=${index + 1}`,
+        payload: {
+          ...logBase.payload,
+          degradedAccept,
+            reason: degradedAccept ? 'local_sharp_fallback' : 'provider_failure',
+          },
+        });
+        const shouldRetryWithCompactPrompt = !degradedAccept && this.isRecoverableWorkImageProviderFailure(error);
+        if (shouldRetryWithCompactPrompt) {
+          const compactPrompt = this.buildCompactWorkImagePrompt({
+            backgroundMode: effectiveBackgroundMode,
+            cleanupMode,
+            promptMode,
+            consistencyNotes,
+            subjectType: normalizedSubjectType,
+            browOutputMode: normalizedBrowOutputMode,
+            browPassKind: 'after',
+          });
+          await this.logEvent({
+            ...logBase,
+            event: 'image_provider_retry_started',
+            status: 'retrying',
+            message: error?.message || `asset=${index + 1}`,
+            payload: {
+              ...logBase.payload,
+              retryMode: 'compact_prompt',
+            },
+          });
+          try {
+            const retryMeasured = await measureDuration(async () => (
+              (await this.runWorkImagePass({
+                inputAsset: original,
+                prompt: compactPrompt,
+                jobId,
+                index,
+                revision,
+                pass: `${editPass}_retry`,
+                renderMode,
+                sourceAssetCount,
+              })).asset
+            ));
+            processedAsset = retryMeasured.result;
+            editDurationMs = retryMeasured.durationMs;
+            if (normalizedSubjectType === 'brows' && normalizedBrowOutputMode === 'before_after') {
+              const beforeRetryMeasured = await measureDuration(async () => (
+                (await this.runWorkImagePass({
+                  inputAsset: original,
+                  prompt: this.buildCompactWorkImagePrompt({
+                    backgroundMode: effectiveBackgroundMode,
+                    cleanupMode,
+                    promptMode,
+                    consistencyNotes,
+                    subjectType: normalizedSubjectType,
+                    browOutputMode: normalizedBrowOutputMode,
+                    browPassKind: 'before',
+                  }),
+                  jobId,
+                  index,
+                  revision,
+                  pass: `${editPass}_before_retry`,
+                  renderMode,
+                  sourceAssetCount,
+                })).asset
+              ));
+              processedAsset = await this.buildBeforeAfterPreviewAsset(beforeRetryMeasured.result, processedAsset, `${jobId}-${index}-brows`);
+              editDurationMs += beforeRetryMeasured.durationMs;
+            }
+            await this.logEvent({
+              ...logBase,
+              event: 'image_provider_retry_succeeded',
+              status: 'ok',
+              durationMs: editDurationMs,
+              message: `asset=${index + 1}`,
+              payload: {
+                ...logBase.payload,
+                retryMode: 'compact_prompt',
+                pass: `${editPass}_retry`,
+              },
+            });
+          } catch (retryError) {
+            await this.logEvent({
+              ...logBase,
+              event: 'image_provider_retry_failed',
+              status: 'failed',
+              message: retryError?.message || `asset=${index + 1}`,
+              payload: {
+                ...logBase.payload,
+                retryMode: 'compact_prompt',
+                pass: `${editPass}_retry`,
+              },
+            });
+            throw retryError;
+          }
+        }
+        if (processedAsset) {
+          return {
+            originalTelegramFileId: fileId,
+            asset: processedAsset,
+          };
+        }
+        if (!degradedAccept) {
+          throw error;
+        }
+      const degradedAsset = await this.buildDegradedLocalWorkAsset(original);
+      await this.logEvent({
+        ...logBase,
+        event: 'image_provider_degraded_fallback_applied',
+        status: 'degraded',
+        message: error?.message || `asset=${index + 1}`,
+        payload: {
+          ...logBase.payload,
+          fallback: 'local_sharp',
+        },
+      });
+      return {
+        originalTelegramFileId: fileId,
+        asset: degradedAsset,
+      };
+    }
+    await this.logEvent({
+      ...logBase,
+      event: 'image_edit_completed',
+      status: 'ok',
+      durationMs: editDurationMs,
+      message: `asset=${index + 1}`,
+      payload: {
+        ...logBase.payload,
+        pass: editPass,
+        backgroundMode,
+      },
+    });
     return {
       originalTelegramFileId: fileId,
-      asset: reframeResult.images[0]
-        ? await this.resolveRemoteImage(reframeResult.images[0])
-        : firstPassAsset,
+      asset: processedAsset,
     };
   }
 
@@ -1660,14 +2445,57 @@ export class SalonBotService {
   }
 
   async logEventBestEffort(entry) {
-    this.logEvent(entry).catch(() => {});
+    const logger = typeof this.botLogger?.logBestEffort === 'function'
+      ? this.botLogger.logBestEffort.bind(this.botLogger)
+      : this.botLogger?.log?.bind(this.botLogger);
+    if (!logger) {
+      return;
+    }
+    logger(entry).catch(() => {});
   }
 
   getWorkModeStatusText(renderMode) {
     return USER_MESSAGES.generationQueued[renderMode] ?? USER_MESSAGES.workProcessingStarted;
   }
 
+  async upsertControlMessage(chatId, text, {
+    existingMessageId = null,
+    replyMarkup = null,
+  } = {}) {
+    if (existingMessageId) {
+      try {
+        const edited = await this.callTelegram('editMessageText', chatId, existingMessageId, text, {
+          reply_markup: replyMarkup,
+        });
+        return edited?.message_id ?? existingMessageId;
+      } catch (error) {
+        if (isTelegramMessageNotModifiedError(error)) {
+          return existingMessageId;
+        }
+        if (shouldReplaceTelegramControlMessage(error)) {
+          const message = await this.sendMessage(chatId, text, {
+            reply_markup: replyMarkup,
+          });
+          return message.message_id;
+        }
+        throw error;
+      }
+    }
+
+    const message = await this.sendMessage(chatId, text, {
+      reply_markup: replyMarkup,
+    });
+    return message.message_id;
+  }
+
   async updateRuntimeStatusMessage(runtime, text) {
+    if (runtime?.job_type === 'work') {
+      return this.upsertControlMessage(runtime.chat_id, text, {
+        existingMessageId: runtime?.text_message_id ?? null,
+        replyMarkup: { inline_keyboard: [] },
+      });
+    }
+
     if (!runtime?.text_message_id) {
       const message = await this.sendMessage(runtime.chat_id, text);
       return message.message_id;
@@ -1731,7 +2559,7 @@ export class SalonBotService {
       updated_at: nowIso(),
     });
 
-    await this.logEvent({
+    this.logEventBestEffort({
       event: 'generation_queued',
       stage: 'processing',
       chatId: runtime.chat_id,
@@ -1749,45 +2577,219 @@ export class SalonBotService {
       },
     });
 
+    const dispatchResult = await this.dispatchQueuedRuntimeActionBestEffort(runtime.job_id, action, {
+      chatId: runtime.chat_id,
+      userId: runtime.user_id,
+      queueId: nextPayload.queueId ?? '',
+      collectionId: runtime.collection_id ?? '',
+      sourceType: runtime.job_type,
+      renderMode: nextPayload.renderMode || '',
+      sourceAssetCount: nextPayload.sourceAssetCount ?? 0,
+    });
+    if (dispatchResult.dispatched) {
+      return {
+        ok: true,
+        queued: true,
+        inline: false,
+        dispatched: true,
+      };
+    }
+
     const result = await this.runQueuedGenerationJob(runtime.job_id, action);
     return {
       ok: true,
+      dispatched: false,
       queued: false,
       inline: true,
       result,
     };
   }
 
+  async dispatchQueuedRuntimeActionBestEffort(jobId, action, {
+    chatId = null,
+    userId = null,
+    queueId = '',
+    collectionId = '',
+    sourceType = '',
+    renderMode = '',
+    sourceAssetCount = 0,
+  } = {}) {
+    const skipReason = this.getWorkerDispatchSkipReason();
+    if (skipReason) {
+      this.logEventBestEffort({
+        event: 'worker_dispatch_skipped',
+        stage: 'processing',
+        chatId,
+        userId,
+        jobId,
+        queueId,
+        collectionId,
+        sourceType,
+        status: skipReason,
+        message: renderMode || action,
+        payload: {
+          action,
+          renderMode,
+          sourceAssetCount,
+          reason: skipReason,
+          workerPath: '/api/worker/runtime-action',
+        },
+      });
+      return { dispatched: false, reason: skipReason };
+    }
+    try {
+      await dispatchWorkerPayload({
+        env: this.env,
+        payload: { jobId, action },
+        workerPath: '/api/worker/runtime-action',
+      });
+      this.logEventBestEffort({
+        event: 'generation_dispatched',
+        stage: 'processing',
+        chatId,
+        userId,
+        jobId,
+        queueId,
+        collectionId,
+        sourceType,
+        status: action,
+        message: renderMode || action,
+        payload: {
+          action,
+          renderMode,
+          sourceAssetCount,
+          workerPath: '/api/worker/runtime-action',
+        },
+      });
+      return { dispatched: true };
+    } catch (error) {
+      if (this.shouldDisableWorkerDispatch(error)) {
+        this.workerDispatchDisabledReason = error.message;
+      }
+      this.logEventBestEffort({
+        level: 'ERROR',
+        event: 'worker_dispatch_failed',
+        stage: 'processing',
+        chatId,
+        userId,
+        jobId,
+        queueId,
+        collectionId,
+        sourceType,
+        status: 'failed',
+        message: error.message,
+        payload: {
+          action,
+          renderMode,
+          sourceAssetCount,
+          workerPath: '/api/worker/runtime-action',
+        },
+      });
+      return { dispatched: false, reason: error.message };
+    }
+  }
+
+  async dispatchCollectionFinalizeAsync(collectionId, {
+    chatId = null,
+    userId = null,
+    collectionIdForLog = '',
+    mediaGroupId = '',
+    count = 0,
+  } = {}) {
+    const skipReason = this.getWorkerDispatchSkipReason();
+    if (skipReason) {
+      this.logEventBestEffort({
+        event: 'collection_finalize_dispatch_skipped',
+        stage: 'collection',
+        chatId,
+        userId,
+        collectionId: collectionIdForLog || collectionId,
+        sourceType: 'work',
+        status: skipReason,
+        message: `count=${count}`,
+        payload: {
+          mediaGroupId,
+          count,
+          reason: skipReason,
+          workerPath: '/api/worker/collection-finalize',
+        },
+      });
+      return false;
+    }
+    try {
+      await dispatchWorkerPayload({
+        env: this.env,
+        payload: { collectionId },
+        workerPath: '/api/worker/collection-finalize',
+      });
+      this.logEventBestEffort({
+        event: 'collection_finalize_dispatched',
+        stage: 'collection',
+        chatId,
+        userId,
+        collectionId: collectionIdForLog || collectionId,
+        sourceType: 'work',
+        status: 'queued',
+        message: `count=${count}`,
+        payload: {
+          mediaGroupId,
+          count,
+        },
+      });
+      return true;
+    } catch (error) {
+      if (this.shouldDisableWorkerDispatch(error)) {
+        this.workerDispatchDisabledReason = error.message;
+      }
+      this.logEventBestEffort({
+        level: 'ERROR',
+        event: 'collection_finalize_dispatch_failed',
+        stage: 'error',
+        chatId,
+        userId,
+        collectionId: collectionIdForLog || collectionId,
+        sourceType: 'work',
+        status: 'failed',
+        message: error.message,
+        node: error.step ?? 'dispatch_collection_finalize',
+        payload: {
+          mediaGroupId,
+          count,
+        },
+      });
+      return false;
+    }
+  }
+
   async handleTelegramUpdate(update) {
     const normalized = normalizeTelegramUpdate(update);
-    const incomingIdem = computeIdempotencyKey('telegram_update', { updateId: normalized.updateId });
-    if (await this.repos.hasIdempotency(incomingIdem)) {
-      return { ok: true, duplicate: true };
-    }
-    await this.repos.recordIdempotency(
-      'telegram_update',
-      { updateId: normalized.updateId },
-      nowIso(),
-      addMinutes(new Date(), 1_440),
-    );
-
-    await this.logEvent({
-      event: 'incoming_update',
-      stage: normalized.kind === 'callback'
-        ? 'callback'
-        : normalized.kind === 'text'
-          ? 'message'
-          : normalized.kind === 'photo'
-            ? 'collection'
-            : 'command',
-      chatId: normalized.chatId,
-      userId: normalized.userId,
-      status: normalized.kind,
-      message: normalized.command ?? normalized.text ?? normalized.callbackData ?? '',
-      payload: { updateId: normalized.updateId },
-    });
-
     try {
+      const idempotency = await this.repos.recordIdempotency(
+        'telegram_update',
+        { updateId: normalized.updateId },
+        nowIso(),
+        addMinutes(new Date(), 1_440),
+      );
+      if (!idempotency.inserted) {
+        return { ok: true, duplicate: true };
+      }
+
+      this.logEventBestEffort({
+        event: 'incoming_update',
+        stage: normalized.kind === 'callback'
+          ? 'callback'
+          : normalized.kind === 'text'
+            ? 'message'
+            : normalized.kind === 'photo'
+              ? 'collection'
+              : 'command',
+        chatId: normalized.chatId,
+        userId: normalized.userId,
+        status: normalized.kind,
+        message: normalized.command ?? normalized.text ?? normalized.callbackData ?? '',
+        payload: { updateId: normalized.updateId },
+      });
+
       if (normalized.kind === 'command') {
         return await this.handleCommand(normalized);
       }
@@ -1802,6 +2804,9 @@ export class SalonBotService {
       }
       return { ok: true, ignored: true };
     } catch (error) {
+      if (isDuplicateIdempotencyError(error)) {
+        return { ok: true, duplicate: true };
+      }
       await this.logEvent({
         level: 'ERROR',
         event: 'update_failed',
@@ -1834,8 +2839,6 @@ export class SalonBotService {
         return this.openTopicLikePicker(normalized, 'topic');
       case '/stories':
         return this.openTopicLikePicker(normalized, 'stories');
-      case '/creative':
-        return this.openTopicLikePicker(normalized, 'creative');
       case '/slider':
         return this.openTopicLikePicker(normalized, 'slider');
       default:
@@ -2234,29 +3237,57 @@ export class SalonBotService {
   }
 
   async handleWorkCommand(normalized) {
-    const sessionId = `work:${normalized.chatId}`;
+    const sessionId = this.getWorkSessionId(normalized.chatId);
+    const existingSession = await this.repos.getSessionById(sessionId);
+    const existingPayload = this.parseWorkSessionPayload(existingSession);
+    if (existingPayload.tokenSetId) {
+      await this.repos.supersedeTokenSet(existingPayload.tokenSetId, nowIso());
+    }
+    const { tokenRows, tokensByAction, tokenSetId } = this.createCallbackSet({
+      jobId: this.getWorkSessionJobId(normalized.chatId),
+      revision: 0,
+      chatId: normalized.chatId,
+      actions: ['work_photo_type_normal', 'work_photo_type_studio', 'cancel'],
+    });
+    await this.repos.createCallbackTokens(tokenRows);
+    const { textMessageId } = await this.sendWorkPhotoTypePrompt({
+      chatId: normalized.chatId,
+      tokensByAction,
+    });
     await this.repos.upsertSession({
       session_id: sessionId,
       chat_id: normalized.chatId,
       user_id: normalized.userId,
       mode: 'work',
-      state: 'awaiting_assets',
+      state: 'awaiting_photo_type',
       active_job_id: '',
-      pending_payload_json: '',
+      pending_payload_json: JSON.stringify({
+        tokenSetId,
+        textMessageId,
+        photoType: '',
+        backgroundMode: '',
+        subjectType: '',
+        promptMode: 'normal',
+        browOutputMode: '',
+        collectionId: '',
+      }),
       expires_at: addMinutes(new Date(), WORK_SESSION_TTL_MINUTES),
       updated_at: nowIso(),
     });
-    await this.sendMessage(normalized.chatId, USER_MESSAGES.workStarted);
     this.logEventBestEffort({
       event: 'work_command_started',
       stage: 'command',
       chatId: normalized.chatId,
       userId: normalized.userId,
       sourceType: 'work',
-      status: 'awaiting_assets',
-      message: USER_MESSAGES.workWindowOpened,
+      status: 'awaiting_photo_type',
+      message: USER_MESSAGES.workPhotoTypeChoice,
     });
-    return { ok: true, command: '/work' };
+    return {
+      ok: true,
+      command: '/work',
+      resumed: existingSession?.state === 'awaiting_photo_type',
+    };
   }
 
   async handleTopicCommand(normalized) {
@@ -2459,10 +3490,11 @@ export class SalonBotService {
   async generateTopicLikeManifest({ jobType, prompts, sourceRow, jobId, revision }) {
     if (jobType === 'topic') {
       const { result, durationMs } = await measureDuration(() => this.openrouter.generateText({
-        systemPrompt: prompts.topic_post_generation,
-        userPrompt: this.buildTopicUserPrompt(sourceRow),
-        metadata: { source_type: 'topic', topic_id: sourceRow.topic_id, job_id: jobId, revision },
-      }));
+      systemPrompt: prompts.topic_post_generation,
+      userPrompt: this.buildTopicUserPrompt(sourceRow),
+      maxTokens: 700,
+      metadata: { source_type: 'topic', topic_id: sourceRow.topic_id, job_id: jobId, revision },
+    }));
       return {
         manifest: {
           captionText: this.formatTopicCaption(result.text, prompts.contact_block),
@@ -2476,6 +3508,7 @@ export class SalonBotService {
       systemPrompt: prompts[config.promptKeys.manifest],
       userPrompt: this.buildTopicUserPrompt(sourceRow),
       temperature: 0.7,
+      maxTokens: 1200,
       metadata: { source_type: jobType, topic_id: sourceRow.topic_id, job_id: jobId, revision },
     }));
 
@@ -2691,8 +3724,88 @@ export class SalonBotService {
     return { ok: true, command: config.command, jobId, queueId };
   }
   async handlePhoto(normalized) {
-    const workSession = await this.repos.getSessionByChatAndMode(normalized.chatId, 'work');
-    if (!workSession || workSession.state !== 'awaiting_assets') {
+    let workSession = await this.repos.getSessionByChatAndMode(normalized.chatId, 'work');
+    if (workSession?.state === 'awaiting_photo_type') {
+      const sessionPayload = this.parseWorkSessionPayload(workSession);
+      if (sessionPayload.tokenSetId) {
+        await this.repos.supersedeTokenSet(sessionPayload.tokenSetId, nowIso());
+      }
+      const textMessageId = await this.upsertControlMessage(normalized.chatId, USER_MESSAGES.workPhotoRequest, {
+        existingMessageId: sessionPayload.textMessageId ?? null,
+        replyMarkup: { inline_keyboard: [] },
+      });
+      await this.repos.upsertSession({
+        session_id: workSession.session_id,
+        chat_id: workSession.chat_id,
+        user_id: workSession.user_id,
+        mode: 'work',
+        state: 'awaiting_assets',
+        active_job_id: '',
+        pending_payload_json: JSON.stringify({
+          ...sessionPayload,
+          tokenSetId: '',
+          photoType: 'normal',
+          textMessageId,
+        }),
+        expires_at: addMinutes(new Date(), WORK_SESSION_TTL_MINUTES),
+        updated_at: nowIso(),
+      });
+      workSession = await this.repos.getSessionByChatAndMode(normalized.chatId, 'work');
+    }
+    const lateAlbumCollectionId = normalized.mediaGroupId
+      ? stableId('COL', `group:${normalized.chatId}:${normalized.mediaGroupId}`)
+      : null;
+    const lateAlbumCollection = lateAlbumCollectionId
+      ? await this.repos.getCollectionById(lateAlbumCollectionId)
+      : null;
+    const canResumeLateAlbum = Boolean(
+      normalized.mediaGroupId
+      && lateAlbumCollection
+      && ['collecting', 'awaiting_brow_output_mode', 'awaiting_render_mode', 'awaiting_background_mode', 'awaiting_cleanup_mode'].includes(String(lateAlbumCollection.status ?? ''))
+      && Number(lateAlbumCollection.count ?? 0) < 3
+      && (Date.now() - new Date(lateAlbumCollection.last_message_at ?? 0).getTime()) < 120_000
+    );
+
+    if ((!workSession || workSession.state !== 'awaiting_assets') && !canResumeLateAlbum) {
+      if (workSession?.state === 'awaiting_photo_type') {
+        const sessionPayload = this.parseWorkSessionPayload(workSession);
+        const tokenRows = sessionPayload.tokenSetId
+          ? await this.repos.listCallbackTokensByTokenSet(sessionPayload.tokenSetId)
+          : [];
+        const tokensByAction = Object.fromEntries(tokenRows.map((row) => [row.action, row.token]));
+        await this.sendWorkPhotoTypePrompt({
+          chatId: normalized.chatId,
+          tokensByAction,
+          existingMessageId: sessionPayload.textMessageId ?? null,
+        });
+        return { ok: true, ignored: true };
+      }
+      if (workSession?.state === 'awaiting_subject_type') {
+        const sessionPayload = this.parseWorkSessionPayload(workSession);
+        const tokenRows = sessionPayload.tokenSetId
+          ? await this.repos.listCallbackTokensByTokenSet(sessionPayload.tokenSetId)
+          : [];
+        const tokensByAction = Object.fromEntries(tokenRows.map((row) => [row.action, row.token]));
+        await this.sendWorkSubjectPrompt({
+          chatId: normalized.chatId,
+          tokensByAction,
+          existingMessageId: sessionPayload.textMessageId ?? null,
+        });
+        return { ok: true, ignored: true };
+      }
+      if (workSession?.state === 'awaiting_prompt_mode') {
+        const sessionPayload = this.parseWorkSessionPayload(workSession);
+        const tokenRows = sessionPayload.tokenSetId
+          ? await this.repos.listCallbackTokensByTokenSet(sessionPayload.tokenSetId)
+          : [];
+        const tokensByAction = Object.fromEntries(tokenRows.map((row) => [row.action, row.token]));
+        await this.sendWorkPromptModePrompt({
+          chatId: normalized.chatId,
+          tokensByAction,
+          existingMessageId: sessionPayload.textMessageId ?? null,
+        });
+        return { ok: true, ignored: true };
+      }
       await this.sendMessage(normalized.chatId, USER_MESSAGES.workBeforePhoto);
       return { ok: true, ignored: true };
     }
@@ -2707,11 +3820,38 @@ export class SalonBotService {
     const collectionLockKey = normalized.mediaGroupId
       ? `collection:${normalized.chatId}:${normalized.mediaGroupId}`
       : `collection:${normalized.chatId}:single`;
-    const { collection, created } = await this.withLocalLock(
+    const { collection, created, reopenedAwaitingRenderMode } = await this.withLocalLock(
       collectionLockKey,
       () => this.getOrCreateWorkCollection(normalized, asset),
     );
-    await this.logEvent({
+    if (reopenedAwaitingRenderMode) {
+      const lateRuntime = await this.repos.getRuntime(stableId('JOB', `work:${collection.collection_id}`));
+      if (lateRuntime) {
+        if (lateRuntime.active_callback_set_id) {
+          await this.repos.supersedeTokenSet(lateRuntime.active_callback_set_id, nowIso());
+        }
+        await this.repos.upsertRuntime({
+          job_id: lateRuntime.job_id,
+          job_type: lateRuntime.job_type,
+          chat_id: lateRuntime.chat_id,
+          user_id: lateRuntime.user_id,
+          topic_id: lateRuntime.topic_id ?? '',
+          collection_id: lateRuntime.collection_id ?? '',
+          active_revision: lateRuntime.active_revision,
+          runtime_status: 'collecting',
+          collage_message_id: toStoredText(lateRuntime.collage_message_id),
+          assets_message_ids_json: JSON.stringify(lateRuntime.assets_message_ids ?? []),
+          text_message_id: toStoredText(lateRuntime.text_message_id),
+          active_callback_set_id: '',
+          schedule_input_pending: 0,
+          lock_flags_json: JSON.stringify(lateRuntime.lock_flags ?? {}),
+          preview_payload_json: JSON.stringify(lateRuntime.preview_payload ?? {}),
+          draft_payload_json: JSON.stringify(lateRuntime.draft_payload ?? {}),
+          updated_at: nowIso(),
+        });
+      }
+    }
+    this.logEventBestEffort({
       event: created ? 'work_album_started' : 'collection_debounce_extended',
       stage: 'collection',
       chatId: normalized.chatId,
@@ -2725,7 +3865,7 @@ export class SalonBotService {
         count: collection.count,
       },
     });
-    await this.logEvent({
+    this.logEventBestEffort({
       event: 'photo_accepted',
       stage: 'collection',
       chatId: normalized.chatId,
@@ -2740,10 +3880,23 @@ export class SalonBotService {
         messageId: normalized.messageId,
       },
     });
+    const shouldAwaitFinalize = this.shouldAwaitInlineFinalize({
+      mediaGroupId: normalized.mediaGroupId,
+      collectionCount: collection.count,
+    });
     try {
-      // Vercel can freeze the invocation immediately after the webhook response,
-      // so finalization must complete inside a live request instead of a detached timer.
-      await this.scheduleCollectionFinalize(collection.collection_id);
+      if (shouldAwaitFinalize) {
+        const dispatched = await this.dispatchCollectionFinalizeAsync(collection.collection_id, {
+          chatId: normalized.chatId,
+          userId: normalized.userId,
+          collectionIdForLog: collection.collection_id,
+          mediaGroupId: normalized.mediaGroupId ?? '',
+          count: collection.count,
+        });
+        if (!dispatched) {
+          await this.scheduleCollectionFinalize(collection.collection_id);
+        }
+      }
     } catch (error) {
       this.logEventBestEffort({
         level: 'ERROR',
@@ -2811,6 +3964,18 @@ export class SalonBotService {
       });
     }
 
+    const isWorkSessionAction = tokenRow.job_id === this.getWorkSessionJobId(normalized.chatId);
+
+    if (isWorkSessionAction) {
+      await this.repos.markCallbackUsed(token, nowIso());
+      await this.answerCallback(normalized.callbackQueryId, USER_MESSAGES.actionCallbackAnswers[normalizedAction] || USER_MESSAGES.callbackUnknown);
+      return this.handleWorkSessionCallback({
+        normalized,
+        action: normalizedAction,
+        tokenRow,
+      });
+    }
+
     const runtime = await this.repos.getRuntime(tokenRow.job_id);
     const validation = validateCallbackToken({
       tokenRow: {
@@ -2866,9 +4031,26 @@ export class SalonBotService {
 
     let result;
     switch (normalizedAction) {
+      case 'work_subject_hair':
+      case 'work_subject_brows':
+        result = await this.handleWorkSubjectChoice(runtime, normalizedAction);
+        break;
       case 'render_mode_collage':
       case 'render_mode_separate':
         result = await this.startWorkGenerationFromMode(runtime, action === 'render_mode_collage' ? 'collage' : 'separate');
+        break;
+      case 'brow_output_before_after':
+      case 'brow_output_after_only':
+        result = await this.handleWorkBrowOutputChoice(runtime, normalizedAction);
+        break;
+      case 'background_mode_keep':
+      case 'background_mode_blur':
+      case 'background_mode_neutral':
+        result = await this.handleWorkBackgroundChoice(runtime, normalizedAction);
+        break;
+      case 'cleanup_on':
+      case 'cleanup_off':
+        result = await this.handleWorkCleanupChoice(runtime, normalizedAction);
         break;
       case 'version_prev':
         result = await this.changeViewedRevision(runtime, -1);
@@ -3047,13 +4229,18 @@ export class SalonBotService {
 
   async getOrCreateWorkCollection(normalized, asset) {
     const currentTime = nowIso();
+    const sessionId = this.getWorkSessionId(normalized.chatId);
+    const existingSession = await this.repos.getSessionById(sessionId);
+    const existingSessionPayload = this.parseWorkSessionPayload(existingSession);
     const collectionKey = normalized.mediaGroupId
       ? `group:${normalized.chatId}:${normalized.mediaGroupId}`
       : null;
+    let reopenedAwaitingChoice = false;
 
     let collection = null;
     if (collectionKey) {
       const collectionId = stableId('COL', collectionKey);
+      const existingCollection = await this.repos.getCollectionById(collectionId);
       collection = await this.repos.mergeAlbumCollection({
         collectionId,
         collectionKey,
@@ -3072,6 +4259,25 @@ export class SalonBotService {
           assetCount,
         }),
       });
+      if (
+        existingCollection
+        && ['awaiting_brow_output_mode', 'awaiting_render_mode', 'awaiting_background_mode', 'awaiting_cleanup_mode'].includes(String(existingCollection.status ?? ''))
+        && Number(existingCollection.count ?? 0) < 3
+        && Number(collection.count ?? 0) > Number(existingCollection.count ?? 0)
+      ) {
+        reopenedAwaitingChoice = true;
+        await this.repos.updateCollection({
+          collection_id: collection.collection_id,
+          status: 'collecting',
+          closed_by_job_id: '',
+          deadline_at: this.getCollectionDeadlineAt(currentTime, {
+            mediaGroupId: normalized.mediaGroupId,
+            assetCount: collection.count,
+          }),
+          updated_at: currentTime,
+        });
+        collection = await this.repos.getCollectionById(collection.collection_id);
+      }
     } else {
       const openCollection = await this.repos.getOpenCollectionForChat(normalized.chatId);
       if (
@@ -3102,13 +4308,16 @@ export class SalonBotService {
     }
 
     await this.repos.upsertSession({
-      session_id: `work:${normalized.chatId}`,
+      session_id: sessionId,
       chat_id: normalized.chatId,
       user_id: normalized.userId,
       mode: 'work',
       state: 'awaiting_assets',
       active_job_id: '',
-      pending_payload_json: JSON.stringify({ collectionId: collection.collection_id }),
+      pending_payload_json: JSON.stringify({
+        ...existingSessionPayload,
+        collectionId: collection.collection_id,
+      }),
       expires_at: addMinutes(currentTime, WORK_SESSION_TTL_MINUTES),
       updated_at: currentTime,
     });
@@ -3118,6 +4327,7 @@ export class SalonBotService {
         assets: safeJsonParse(collection.asset_refs_json, [asset]),
       },
       created: collection.count === 1,
+      reopenedAwaitingRenderMode: reopenedAwaitingChoice,
     };
   }
 
@@ -3147,23 +4357,38 @@ export class SalonBotService {
     const jobId = stableId('JOB', `work:${collection.collection_id}`);
     const queueId = stableId('QUE', jobId);
     const existingRuntime = await this.repos.getRuntime(jobId);
+    const session = await this.repos.getSessionById(this.getWorkSessionId(collection.chat_id));
+    const sessionPayload = this.parseWorkSessionPayload(session);
+    const promptMode = sessionPayload.promptMode
+      || existingRuntime?.draft_payload?.promptMode
+      || existingRuntime?.preview_payload?.promptMode
+      || 'normal';
+    const photoType = this.getWorkPhotoType(
+      sessionPayload.photoType
+      ?? existingRuntime?.draft_payload?.photoType
+      ?? existingRuntime?.preview_payload?.photoType,
+    );
+    const subjectType = this.getWorkSubjectType(sessionPayload.subjectType);
+    const sourceAssetCount = collection.assets.length;
+    const isSinglePhoto = sourceAssetCount === 1;
 
-    if (existingRuntime && !['awaiting_render_mode', 'collecting'].includes(existingRuntime.runtime_status)) {
+    if (existingRuntime && !['awaiting_subject_type', 'awaiting_brow_output_mode', 'awaiting_render_mode', 'awaiting_background_mode', 'awaiting_cleanup_mode', 'collecting'].includes(existingRuntime.runtime_status)) {
       return { ok: true, skipped: true, jobId, queueId };
     }
 
     await this.repos.closeCollection({
       collection_id: collection.collection_id,
-      status: 'awaiting_render_mode',
+      status: 'awaiting_subject_type',
       closed_by_job_id: jobId,
       updated_at: nowIso(),
     });
 
+    const actions = ['work_subject_hair', 'work_subject_brows', 'cancel'];
     const { tokenRows, tokensByAction, tokenSetId } = this.createCallbackSet({
       jobId,
       revision: 0,
       chatId: collection.chat_id,
-      actions: ['render_mode_collage', 'render_mode_separate', 'cancel'],
+      actions,
     });
     await this.repos.createCallbackTokens(tokenRows);
 
@@ -3178,8 +4403,14 @@ export class SalonBotService {
       topicId: '',
       collectionId: collection.collection_id,
       captionText: '',
-      renderMode: '',
+      photoType,
+      subjectType,
+      browOutputMode: '',
+      promptMode,
+      renderMode: isSinglePhoto ? 'separate' : '',
       finalRenderMode: '',
+      backgroundMode: photoType === 'studio' ? 'neutral' : '',
+      cleanupMode: 'off',
       sourceAssetCount: collection.assets.length,
       originalTelegramFileIds: collection.assets.map((asset) => asset.fileId),
       previewTelegramFileIds: [],
@@ -3187,10 +4418,10 @@ export class SalonBotService {
       createdAt: nowIso(),
     };
 
-    const promptMessage = await this.sendRenderModePrompt({
+    const promptMessage = await this.sendWorkSubjectPrompt({
       chatId: collection.chat_id,
       tokensByAction,
-      existingMessageId: existingRuntime?.text_message_id ?? null,
+      existingMessageId: existingRuntime?.text_message_id ?? sessionPayload.textMessageId ?? null,
     });
 
     await this.repos.upsertRuntime({
@@ -3201,7 +4432,7 @@ export class SalonBotService {
       topic_id: '',
       collection_id: collection.collection_id,
       active_revision: 0,
-      runtime_status: 'awaiting_render_mode',
+      runtime_status: 'awaiting_subject_type',
       collage_message_id: toStoredText(existingRuntime?.collage_message_id),
       assets_message_ids_json: JSON.stringify(existingRuntime?.assets_message_ids ?? []),
       text_message_id: toStoredText(promptMessage.textMessageId),
@@ -3212,10 +4443,10 @@ export class SalonBotService {
       draft_payload_json: JSON.stringify(draftPayload),
       updated_at: nowIso(),
     });
-    await this.repos.deleteSession(`work:${collection.chat_id}`);
+    await this.repos.deleteSession(this.getWorkSessionId(collection.chat_id));
 
-    await this.logEvent({
-      event: 'render_mode_requested',
+    this.logEventBestEffort({
+      event: 'work_subject_requested',
       stage: 'collection',
       chatId: collection.chat_id,
       userId: collection.user_id,
@@ -3223,11 +4454,14 @@ export class SalonBotService {
       queueId,
       collectionId: collection.collection_id,
       sourceType: 'work',
-      status: 'awaiting_render_mode',
+      status: 'awaiting_subject_type',
       message: `count=${collection.assets.length}`,
       payload: {
         mediaGroupId: collection.media_group_id ?? '',
         sourceAssetCount: collection.assets.length,
+        promptMode,
+        photoType,
+        subjectType,
       },
     });
 
@@ -3239,6 +4473,16 @@ export class SalonBotService {
     if (!collection) {
       throw new Error(`Collection not found for ${runtime.job_id}`);
     }
+    const previousPayload = runtime.draft_payload ?? runtime.preview_payload ?? {};
+    const subjectType = this.getWorkSubjectType(previousPayload.subjectType);
+    const preferredBackgroundMode = this.getPreferredWorkBackgroundMode(previousPayload);
+    const nextPayload = {
+      ...previousPayload,
+      renderMode,
+      browOutputMode: subjectType === 'brows' ? (previousPayload.browOutputMode || '') : '',
+      backgroundMode: preferredBackgroundMode,
+      cleanupMode: 'off',
+    };
     await this.logEvent({
       event: 'render_mode_selected',
       stage: 'collection',
@@ -3255,9 +4499,513 @@ export class SalonBotService {
         mediaGroupId: collection.media_group_id ?? '',
       },
     });
-    return this.queueRuntimeGeneration(runtime, {
+    if (subjectType === 'brows') {
+      return this.promptWorkBrowOutputChoice(runtime, {
+        nextPayload,
+        collection,
+      });
+    }
+    if (preferredBackgroundMode === 'neutral') {
+      return this.queueInitialWorkGeneration(runtime, {
+        nextPayload,
+        runtimeStatus: 'awaiting_background_mode',
+        collection,
+        collectionStatus: 'awaiting_background_mode',
+      });
+    }
+    return this.promptWorkBackgroundChoice(runtime, {
+      nextPayload,
+      collection,
+    });
+  }
+
+  async handleWorkSessionCallback({ normalized, action, tokenRow }) {
+    const sessionId = this.getWorkSessionId(normalized.chatId);
+    const session = await this.repos.getSessionById(sessionId);
+    const sessionPayload = this.parseWorkSessionPayload(session);
+    if (
+      !session
+      || !['awaiting_photo_type', 'awaiting_subject_type', 'awaiting_prompt_mode'].includes(String(session.state ?? ''))
+      || sessionPayload.tokenSetId !== tokenRow.token_set_id
+    ) {
+      await this.answerCallback(normalized.callbackQueryId, USER_MESSAGES.callbackUseLatestPreview);
+      return { ok: false, staleWizard: true };
+    }
+    if (action === 'cancel') {
+      await this.repos.supersedeTokenSet(tokenRow.token_set_id, nowIso());
+      await this.repos.deleteSession(sessionId);
+      if (sessionPayload.textMessageId) {
+        await this.deleteMessageSafe(normalized.chatId, sessionPayload.textMessageId);
+      }
+      return { ok: true, cancelled: true };
+    }
+    if (session.state === 'awaiting_photo_type') {
+      const photoType = action === 'work_photo_type_studio' ? 'studio' : 'normal';
+      await this.repos.supersedeTokenSet(tokenRow.token_set_id, nowIso());
+      const photoRequest = await this.upsertControlMessage(normalized.chatId, USER_MESSAGES.workPhotoRequest, {
+        existingMessageId: sessionPayload.textMessageId ?? normalized.messageId ?? null,
+        replyMarkup: { inline_keyboard: [] },
+      });
+      await this.repos.upsertSession({
+        session_id: sessionId,
+        chat_id: normalized.chatId,
+        user_id: normalized.userId,
+        mode: 'work',
+        state: 'awaiting_assets',
+        active_job_id: '',
+        pending_payload_json: JSON.stringify({
+          ...sessionPayload,
+          tokenSetId: '',
+          textMessageId: photoRequest,
+          photoType,
+          backgroundMode: photoType === 'studio' ? 'neutral' : '',
+          browOutputMode: '',
+        }),
+        expires_at: addMinutes(new Date(), WORK_SESSION_TTL_MINUTES),
+        updated_at: nowIso(),
+      });
+      return { ok: true, photoType };
+    }
+    if (session.state === 'awaiting_subject_type') {
+      const subjectType = action === 'work_subject_brows' ? 'brows' : 'hair';
+      await this.repos.supersedeTokenSet(tokenRow.token_set_id, nowIso());
+      const { tokenRows, tokensByAction, tokenSetId } = this.createCallbackSet({
+        jobId: this.getWorkSessionJobId(normalized.chatId),
+        revision: 0,
+        chatId: normalized.chatId,
+        actions: ['work_prompt_mode_normal', 'work_prompt_mode_test', 'cancel'],
+      });
+      await this.repos.createCallbackTokens(tokenRows);
+      const promptMessage = await this.sendWorkPromptModePrompt({
+        chatId: normalized.chatId,
+        tokensByAction,
+        existingMessageId: sessionPayload.textMessageId ?? normalized.messageId ?? null,
+      });
+      await this.repos.upsertSession({
+        session_id: sessionId,
+        chat_id: normalized.chatId,
+        user_id: normalized.userId,
+        mode: 'work',
+        state: 'awaiting_prompt_mode',
+        active_job_id: '',
+        pending_payload_json: JSON.stringify({
+          ...sessionPayload,
+          tokenSetId,
+          subjectType,
+          browOutputMode: subjectType === 'brows' ? 'after_only' : '',
+          textMessageId: promptMessage.textMessageId,
+        }),
+        expires_at: addMinutes(new Date(), WORK_SESSION_TTL_MINUTES),
+        updated_at: nowIso(),
+      });
+      return { ok: true, subjectType };
+    }
+    const promptMode = action === 'work_prompt_mode_test' ? 'test' : 'normal';
+    const photoRequest = await this.upsertControlMessage(normalized.chatId, USER_MESSAGES.workPhotoRequest, {
+      existingMessageId: sessionPayload.textMessageId ?? normalized.messageId ?? null,
+      replyMarkup: { inline_keyboard: [] },
+    });
+    await this.repos.upsertSession({
+      session_id: sessionId,
+      chat_id: normalized.chatId,
+      user_id: normalized.userId,
+      mode: 'work',
+      state: 'awaiting_assets',
+      active_job_id: '',
+      pending_payload_json: JSON.stringify({
+        ...sessionPayload,
+        tokenSetId: '',
+        promptMode,
+        textMessageId: photoRequest,
+        browOutputMode: '',
+      }),
+      expires_at: addMinutes(new Date(), WORK_SESSION_TTL_MINUTES),
+      updated_at: nowIso(),
+    });
+    return { ok: true, promptMode };
+  }
+
+  async handleWorkSubjectChoice(runtime, action) {
+    const previousPayload = runtime.draft_payload ?? runtime.preview_payload ?? {};
+    const collection = await this.repos.getCollectionById(runtime.collection_id);
+    const subjectType = action === 'work_subject_brows' ? 'brows' : 'hair';
+    const sourceAssetCount = Number(collection?.assets?.length ?? previousPayload.sourceAssetCount ?? 1);
+    const isSinglePhoto = sourceAssetCount <= 1;
+    const preferredBackgroundMode = this.getPreferredWorkBackgroundMode(previousPayload);
+    const nextPayload = {
+      ...previousPayload,
+      subjectType,
+      promptMode: 'normal',
+      browOutputMode: subjectType === 'brows' ? (previousPayload.browOutputMode || 'after_only') : '',
+      renderMode: isSinglePhoto ? 'separate' : (previousPayload.renderMode || ''),
+      backgroundMode: preferredBackgroundMode,
+      cleanupMode: 'off',
+    };
+
+    await this.logEvent({
+      event: 'work_subject_selected',
+      stage: 'collection',
+      chatId: runtime.chat_id,
+      userId: runtime.user_id,
+      jobId: runtime.job_id,
+      queueId: runtime.preview_payload?.queueId ?? runtime.draft_payload?.queueId ?? '',
+      collectionId: runtime.collection_id,
+      sourceType: 'work',
+      status: subjectType,
+      message: subjectType,
+      payload: {
+        sourceAssetCount,
+      },
+    });
+
+    if (!isSinglePhoto) {
+      return this.promptWorkRenderModeChoice(runtime, {
+        nextPayload,
+        collection,
+        subjectType,
+      });
+    }
+    if (subjectType === 'brows') {
+      return this.promptWorkBrowOutputChoice(runtime, {
+        nextPayload,
+        collection,
+      });
+    }
+    if (preferredBackgroundMode === 'neutral') {
+      return this.queueInitialWorkGeneration(runtime, {
+        nextPayload,
+        runtimeStatus: 'awaiting_background_mode',
+        collection,
+        collectionStatus: 'awaiting_background_mode',
+      });
+    }
+    return this.promptWorkBackgroundChoice(runtime, {
+      nextPayload,
+      collection,
+      subjectType,
+    });
+  }
+
+  async handleWorkBrowOutputChoice(runtime, action) {
+    const previousPayload = runtime.draft_payload ?? runtime.preview_payload ?? {};
+    const collection = await this.repos.getCollectionById(runtime.collection_id);
+    const browOutputMode = action === 'brow_output_before_after' ? 'before_after' : 'after_only';
+    const preferredBackgroundMode = this.getPreferredWorkBackgroundMode(previousPayload);
+    const nextPayload = {
+      ...previousPayload,
+      subjectType: 'brows',
+      browOutputMode,
+      backgroundMode: preferredBackgroundMode,
+      cleanupMode: previousPayload.cleanupMode ?? 'off',
+    };
+    const sourceAssetCount = Number(collection?.assets?.length ?? previousPayload.sourceAssetCount ?? 1);
+
+    await this.logEvent({
+      event: 'brow_output_mode_selected',
+      stage: 'collection',
+      chatId: runtime.chat_id,
+      userId: runtime.user_id,
+      jobId: runtime.job_id,
+      queueId: runtime.preview_payload?.queueId ?? runtime.draft_payload?.queueId ?? '',
+      collectionId: runtime.collection_id,
+      sourceType: 'work',
+      status: browOutputMode,
+      message: browOutputMode,
+      payload: {
+        sourceAssetCount,
+      },
+    });
+
+    if (preferredBackgroundMode === 'neutral') {
+      return this.queueInitialWorkGeneration(runtime, {
+        nextPayload,
+        runtimeStatus: 'awaiting_background_mode',
+        collection,
+        collectionStatus: 'awaiting_background_mode',
+      });
+    }
+    return this.promptWorkBackgroundChoice(runtime, {
+      nextPayload,
+      collection,
+    });
+  }
+
+  async handleWorkBackgroundChoice(runtime, action) {
+    const previousPayload = runtime.draft_payload ?? runtime.preview_payload ?? {};
+    const collection = await this.repos.getCollectionById(runtime.collection_id);
+    const backgroundMode = action === 'background_mode_neutral'
+      ? 'neutral'
+      : action === 'background_mode_keep'
+        ? 'keep'
+        : 'blur';
+    const nextPayload = {
+      ...previousPayload,
+      photoType: backgroundMode === 'neutral'
+        ? 'studio'
+        : (previousPayload.photoType || 'normal'),
+      backgroundMode,
+      cleanupMode: backgroundMode === 'neutral' ? 'off' : (previousPayload.cleanupMode ?? 'off'),
+    };
+    if (backgroundMode === 'neutral') {
+      return this.queueInitialWorkGeneration(runtime, {
+        nextPayload,
+        runtimeStatus: 'awaiting_background_mode',
+        collection,
+        collectionStatus: 'awaiting_background_mode',
+      });
+    }
+
+    if (collection) {
+      await this.repos.updateCollection({
+        collection_id: collection.collection_id,
+        status: 'awaiting_cleanup_mode',
+        closed_by_job_id: runtime.job_id,
+        deadline_at: collection.deadline_at,
+        updated_at: nowIso(),
+      });
+    }
+    const { tokenRows, tokensByAction, tokenSetId } = this.createCallbackSet({
+      jobId: runtime.job_id,
+      revision: 0,
+      chatId: runtime.chat_id,
+      actions: ['cleanup_on', 'cleanup_off', 'cancel'],
+    });
+    if (runtime.active_callback_set_id) {
+      await this.repos.supersedeTokenSet(runtime.active_callback_set_id, nowIso());
+    }
+    await this.repos.createCallbackTokens(tokenRows);
+    const promptMessage = await this.sendWorkCleanupPrompt({
+      chatId: runtime.chat_id,
+      tokensByAction,
+      existingMessageId: runtime.text_message_id ?? null,
+    });
+    await this.repos.upsertRuntime({
+      job_id: runtime.job_id,
+      job_type: runtime.job_type,
+      chat_id: runtime.chat_id,
+      user_id: runtime.user_id,
+      topic_id: runtime.topic_id ?? '',
+      collection_id: runtime.collection_id ?? '',
+      active_revision: runtime.active_revision,
+      runtime_status: 'awaiting_cleanup_mode',
+      collage_message_id: toStoredText(runtime.collage_message_id),
+      assets_message_ids_json: JSON.stringify(runtime.assets_message_ids ?? []),
+      text_message_id: toStoredText(promptMessage.textMessageId),
+      active_callback_set_id: toStoredText(tokenSetId),
+      schedule_input_pending: 0,
+      lock_flags_json: JSON.stringify(runtime.lock_flags ?? {}),
+      preview_payload_json: JSON.stringify(nextPayload),
+      draft_payload_json: JSON.stringify(nextPayload),
+      updated_at: nowIso(),
+    });
+    return { ok: true, awaiting: 'cleanup_mode' };
+  }
+
+  async handleWorkCleanupChoice(runtime, action) {
+    const previousPayload = runtime.draft_payload ?? runtime.preview_payload ?? {};
+    const nextPayload = {
+      ...previousPayload,
+      cleanupMode: action === 'cleanup_on' ? 'on' : 'off',
+    };
+    return this.queueInitialWorkGeneration(runtime, {
+      nextPayload,
+      runtimeStatus: 'awaiting_cleanup_mode',
+      collection: await this.repos.getCollectionById(runtime.collection_id),
+      collectionStatus: 'awaiting_cleanup_mode',
+    });
+  }
+
+  async updateWorkRuntimePayload(runtime, { nextPayload, runtimeStatus = null }) {
+    await this.repos.upsertRuntime({
+      job_id: runtime.job_id,
+      job_type: runtime.job_type,
+      chat_id: runtime.chat_id,
+      user_id: runtime.user_id,
+      topic_id: runtime.topic_id ?? '',
+      collection_id: runtime.collection_id ?? '',
+      active_revision: runtime.active_revision,
+      runtime_status: runtimeStatus ?? runtime.runtime_status,
+      collage_message_id: toStoredText(runtime.collage_message_id),
+      assets_message_ids_json: JSON.stringify(runtime.assets_message_ids ?? []),
+      text_message_id: toStoredText(runtime.text_message_id),
+      active_callback_set_id: toStoredText(runtime.active_callback_set_id),
+      schedule_input_pending: 0,
+      lock_flags_json: JSON.stringify(runtime.lock_flags ?? {}),
+      preview_payload_json: JSON.stringify(nextPayload),
+      draft_payload_json: JSON.stringify(nextPayload),
+      updated_at: nowIso(),
+    });
+  }
+
+  async promptWorkRenderModeChoice(runtime, { nextPayload, collection, subjectType = 'hair' } = {}) {
+    const { tokenRows, tokensByAction, tokenSetId } = this.createCallbackSet({
+      jobId: runtime.job_id,
+      revision: 0,
+      chatId: runtime.chat_id,
+      actions: ['render_mode_collage', 'render_mode_separate', 'cancel'],
+    });
+    if (runtime.active_callback_set_id) {
+      await this.repos.supersedeTokenSet(runtime.active_callback_set_id, nowIso());
+    }
+    await this.repos.createCallbackTokens(tokenRows);
+    const promptMessage = await this.sendRenderModePrompt({
+      chatId: runtime.chat_id,
+      tokensByAction,
+      existingMessageId: runtime.text_message_id ?? null,
+    });
+    await this.repos.upsertRuntime({
+      job_id: runtime.job_id,
+      job_type: runtime.job_type,
+      chat_id: runtime.chat_id,
+      user_id: runtime.user_id,
+      topic_id: runtime.topic_id ?? '',
+      collection_id: runtime.collection_id ?? '',
+      active_revision: runtime.active_revision,
+      runtime_status: 'awaiting_render_mode',
+      collage_message_id: toStoredText(runtime.collage_message_id),
+      assets_message_ids_json: JSON.stringify(runtime.assets_message_ids ?? []),
+      text_message_id: toStoredText(promptMessage.textMessageId),
+      active_callback_set_id: toStoredText(tokenSetId),
+      schedule_input_pending: 0,
+      lock_flags_json: JSON.stringify(runtime.lock_flags ?? {}),
+      preview_payload_json: JSON.stringify(nextPayload),
+      draft_payload_json: JSON.stringify(nextPayload),
+      updated_at: nowIso(),
+    });
+    if (collection) {
+      await this.repos.updateCollection({
+        collection_id: collection.collection_id,
+        status: 'awaiting_render_mode',
+        closed_by_job_id: runtime.job_id,
+        deadline_at: collection.deadline_at,
+        updated_at: nowIso(),
+      });
+    }
+    return { ok: true, awaiting: 'render_mode', subjectType };
+  }
+
+  async promptWorkBrowOutputChoice(runtime, { nextPayload, collection } = {}) {
+    const { tokenRows, tokensByAction, tokenSetId } = this.createCallbackSet({
+      jobId: runtime.job_id,
+      revision: 0,
+      chatId: runtime.chat_id,
+      actions: ['brow_output_before_after', 'brow_output_after_only', 'cancel'],
+    });
+    if (runtime.active_callback_set_id) {
+      await this.repos.supersedeTokenSet(runtime.active_callback_set_id, nowIso());
+    }
+    await this.repos.createCallbackTokens(tokenRows);
+    const promptMessage = await this.sendWorkBrowOutputPrompt({
+      chatId: runtime.chat_id,
+      tokensByAction,
+      existingMessageId: runtime.text_message_id ?? null,
+    });
+    await this.repos.upsertRuntime({
+      job_id: runtime.job_id,
+      job_type: runtime.job_type,
+      chat_id: runtime.chat_id,
+      user_id: runtime.user_id,
+      topic_id: runtime.topic_id ?? '',
+      collection_id: runtime.collection_id ?? '',
+      active_revision: runtime.active_revision,
+      runtime_status: 'awaiting_brow_output_mode',
+      collage_message_id: toStoredText(runtime.collage_message_id),
+      assets_message_ids_json: JSON.stringify(runtime.assets_message_ids ?? []),
+      text_message_id: toStoredText(promptMessage.textMessageId),
+      active_callback_set_id: toStoredText(tokenSetId),
+      schedule_input_pending: 0,
+      lock_flags_json: JSON.stringify(runtime.lock_flags ?? {}),
+      preview_payload_json: JSON.stringify(nextPayload),
+      draft_payload_json: JSON.stringify(nextPayload),
+      updated_at: nowIso(),
+    });
+    if (collection) {
+      await this.repos.updateCollection({
+        collection_id: collection.collection_id,
+        status: 'awaiting_brow_output_mode',
+        closed_by_job_id: runtime.job_id,
+        deadline_at: collection.deadline_at,
+        updated_at: nowIso(),
+      });
+    }
+    return { ok: true, awaiting: 'brow_output_mode' };
+  }
+
+  async promptWorkBackgroundChoice(runtime, { nextPayload, collection, subjectType = '' } = {}) {
+    const actions = this.getWorkBackgroundActions(nextPayload);
+    const { tokenRows, tokensByAction, tokenSetId } = this.createCallbackSet({
+      jobId: runtime.job_id,
+      revision: 0,
+      chatId: runtime.chat_id,
+      actions,
+    });
+    if (runtime.active_callback_set_id) {
+      await this.repos.supersedeTokenSet(runtime.active_callback_set_id, nowIso());
+    }
+    await this.repos.createCallbackTokens(tokenRows);
+    const promptMessage = await this.sendWorkBackgroundPrompt({
+      chatId: runtime.chat_id,
+      tokensByAction,
+      existingMessageId: runtime.text_message_id ?? null,
+      includeStudioOption: actions.includes('background_mode_neutral'),
+    });
+    await this.repos.upsertRuntime({
+      job_id: runtime.job_id,
+      job_type: runtime.job_type,
+      chat_id: runtime.chat_id,
+      user_id: runtime.user_id,
+      topic_id: runtime.topic_id ?? '',
+      collection_id: runtime.collection_id ?? '',
+      active_revision: runtime.active_revision,
+      runtime_status: 'awaiting_background_mode',
+      collage_message_id: toStoredText(runtime.collage_message_id),
+      assets_message_ids_json: JSON.stringify(runtime.assets_message_ids ?? []),
+      text_message_id: toStoredText(promptMessage.textMessageId),
+      active_callback_set_id: toStoredText(tokenSetId),
+      schedule_input_pending: 0,
+      lock_flags_json: JSON.stringify(runtime.lock_flags ?? {}),
+      preview_payload_json: JSON.stringify(nextPayload),
+      draft_payload_json: JSON.stringify(nextPayload),
+      updated_at: nowIso(),
+    });
+    if (collection) {
+      await this.repos.updateCollection({
+        collection_id: collection.collection_id,
+        status: 'awaiting_background_mode',
+        closed_by_job_id: runtime.job_id,
+        deadline_at: collection.deadline_at,
+        updated_at: nowIso(),
+      });
+    }
+    return { ok: true, awaiting: 'background_mode', subjectType };
+  }
+
+  async queueInitialWorkGeneration(runtime, {
+    nextPayload,
+    runtimeStatus,
+    collection = null,
+    collectionStatus = runtimeStatus,
+  } = {}) {
+    if (collection && collectionStatus) {
+      await this.repos.updateCollection({
+        collection_id: collection.collection_id,
+        status: collectionStatus,
+        closed_by_job_id: runtime.job_id,
+        deadline_at: collection.deadline_at,
+        updated_at: nowIso(),
+      });
+    }
+    await this.updateWorkRuntimePayload(runtime, {
+      nextPayload,
+      runtimeStatus,
+    });
+    return this.queueRuntimeGeneration({
+      ...runtime,
+      draft_payload: nextPayload,
+      preview_payload: nextPayload,
+    }, {
       action: 'generate_initial',
-      renderMode,
+      renderMode: nextPayload.renderMode || 'separate',
     });
   }
 
@@ -3284,10 +5032,12 @@ export class SalonBotService {
       viewRevision: nextRevision.revision,
     };
     const currentRevisionEntry = history[currentIndex] ?? null;
-    const shouldSwapMedia = (
-      JSON.stringify(nextRevision.previewTelegramFileIds ?? [])
-      !== JSON.stringify(currentRevisionEntry?.previewTelegramFileIds ?? [])
-    );
+    const shouldSwapMedia = payload?.jobType === 'work'
+      ? false
+      : (
+        JSON.stringify(nextRevision.previewTelegramFileIds ?? [])
+        !== JSON.stringify(currentRevisionEntry?.previewTelegramFileIds ?? [])
+      );
     const presentation = shouldSwapMedia
       ? await this.presentPreviewRevision({
         chatId: runtime.chat_id,
@@ -3360,18 +5110,109 @@ export class SalonBotService {
     };
   }
 
+  getWorkSessionId(chatId) {
+    return `work:${chatId}`;
+  }
+
+  getWorkSessionJobId(chatId) {
+    return stableId('JOB', `work-session:${chatId}`);
+  }
+
+  getWorkPhotoType(value) {
+    return String(value ?? '') === 'studio' ? 'studio' : 'normal';
+  }
+
+  getPreferredWorkBackgroundMode(payload = {}) {
+    return String(payload.backgroundMode ?? '') === 'neutral'
+      || this.getWorkPhotoType(payload.photoType) === 'studio'
+      ? 'neutral'
+      : '';
+  }
+
+  hasExplicitWorkPhotoType(payload = {}) {
+    const value = String(payload.photoType ?? '');
+    return value === 'normal' || value === 'studio';
+  }
+
+  getWorkBackgroundActions(payload = {}) {
+    const actions = ['background_mode_keep', 'background_mode_blur'];
+    if (!this.hasExplicitWorkPhotoType(payload)) {
+      actions.push('background_mode_neutral');
+    }
+    actions.push('cancel');
+    return actions;
+  }
+
+  parseWorkSessionPayload(session) {
+    return safeJsonParse(session?.pending_payload_json, {}) ?? {};
+  }
+
+  async sendWorkPhotoTypePrompt({ chatId, tokensByAction, existingMessageId = null }) {
+    const text = [USER_MESSAGES.workPhotoTypeChoice, USER_MESSAGES.workPhotoTypeChoiceHint].join('\n');
+    const textMessageId = await this.upsertControlMessage(chatId, text, {
+      existingMessageId,
+      replyMarkup: buildWorkPhotoTypeKeyboard(tokensByAction),
+    });
+    return { textMessageId };
+  }
+
+  async sendWorkSubjectPrompt({ chatId, tokensByAction, existingMessageId = null }) {
+    const text = [USER_MESSAGES.workSubjectChoice, USER_MESSAGES.workSubjectChoiceHint].join('\n');
+    const textMessageId = await this.upsertControlMessage(chatId, text, {
+      existingMessageId,
+      replyMarkup: buildWorkSubjectKeyboard(tokensByAction),
+    });
+    return { textMessageId };
+  }
+
+  async sendWorkPromptModePrompt({ chatId, tokensByAction, existingMessageId = null }) {
+    const text = [USER_MESSAGES.workPromptModeChoice, USER_MESSAGES.workPromptModeHint].join('\n');
+    const textMessageId = await this.upsertControlMessage(chatId, text, {
+      existingMessageId,
+      replyMarkup: buildWorkPromptModeKeyboard(tokensByAction),
+    });
+    return { textMessageId };
+  }
+
   async sendRenderModePrompt({ chatId, tokensByAction, existingMessageId = null }) {
     const text = [USER_MESSAGES.workModeChoice, USER_MESSAGES.workModeChoiceHint].join('\n');
-    if (existingMessageId) {
-      const message = await this.callTelegram('editMessageText', chatId, existingMessageId, text, {
-        reply_markup: buildRenderModeKeyboard(tokensByAction),
-      });
-      return { textMessageId: message.message_id ?? existingMessageId };
-    }
-    const message = await this.sendMessage(chatId, text, {
-      reply_markup: buildRenderModeKeyboard(tokensByAction),
+    const textMessageId = await this.upsertControlMessage(chatId, text, {
+      existingMessageId,
+      replyMarkup: buildRenderModeKeyboard(tokensByAction),
     });
-    return { textMessageId: message.message_id };
+    return { textMessageId };
+  }
+
+  async sendWorkBrowOutputPrompt({ chatId, tokensByAction, existingMessageId = null }) {
+    const text = [USER_MESSAGES.workBrowOutputChoice, USER_MESSAGES.workBrowOutputChoiceHint].join('\n');
+    const textMessageId = await this.upsertControlMessage(chatId, text, {
+      existingMessageId,
+      replyMarkup: buildWorkBrowOutputKeyboard(tokensByAction),
+    });
+    return { textMessageId };
+  }
+
+  async sendWorkBackgroundPrompt({
+    chatId,
+    tokensByAction,
+    existingMessageId = null,
+    includeStudioOption = true,
+  }) {
+    const text = [USER_MESSAGES.workBackgroundChoice, USER_MESSAGES.workBackgroundChoiceHint].join('\n');
+    const textMessageId = await this.upsertControlMessage(chatId, text, {
+      existingMessageId,
+      replyMarkup: buildWorkBackgroundKeyboard(tokensByAction, { includeStudioOption }),
+    });
+    return { textMessageId };
+  }
+
+  async sendWorkCleanupPrompt({ chatId, tokensByAction, existingMessageId = null }) {
+    const text = [USER_MESSAGES.workCleanupChoice, USER_MESSAGES.workCleanupChoiceHint].join('\n');
+    const textMessageId = await this.upsertControlMessage(chatId, text, {
+      existingMessageId,
+      replyMarkup: buildWorkCleanupKeyboard(tokensByAction),
+    });
+    return { textMessageId };
   }
 
   async sendPreviewAlbum({ chatId, assets, jobId, revision }) {
@@ -3387,6 +5228,41 @@ export class SalonBotService {
     };
   }
 
+  async upsertPreviewAlbum({
+    chatId,
+    assets,
+    jobId,
+    revision,
+    existingMessageIds = [],
+  }) {
+    const reusableMessageIds = Array.isArray(existingMessageIds)
+      ? existingMessageIds.filter(Boolean)
+      : [];
+    if (reusableMessageIds.length === assets.length && assets.length > 0) {
+      const editedMessages = [];
+      for (const [index, asset] of assets.entries()) {
+        const edited = await this.callTelegram('editMessageMedia', chatId, reusableMessageIds[index], {
+          type: 'photo',
+          media: this.buildTelegramMediaAsset(asset, jobId, index),
+        });
+        editedMessages.push(edited);
+      }
+      return {
+        assetsMessageIds: reusableMessageIds.map((messageId, index) => editedMessages[index]?.message_id ?? messageId),
+        previewTelegramFileIds: this.extractPreviewTelegramFileIds(
+          editedMessages,
+          `preview:${jobId}:${revision}`,
+        ),
+      };
+    }
+
+    for (const messageId of reusableMessageIds) {
+      await this.deleteMessageSafe(chatId, messageId);
+    }
+
+    return this.sendPreviewAlbum({ chatId, assets, jobId, revision });
+  }
+
   async presentRevisionTextOnly({
     chatId,
     payload,
@@ -3398,15 +5274,29 @@ export class SalonBotService {
     const totalRevisions = history.length;
     const canPrev = history.some((entry) => entry.revision < revisionEntry.revision);
     const canNext = history.some((entry) => entry.revision > revisionEntry.revision);
-    const keyboard = this.buildPreviewKeyboardForRuntime(tokensByAction, { canPrev, canNext }, payload.jobType ?? runtime?.job_type ?? 'work');
+    const jobType = payload.jobType ?? runtime?.job_type ?? 'work';
+    const keyboard = this.buildPreviewKeyboardForRuntime(tokensByAction, { canPrev, canNext }, jobType);
+    const controlText = buildControlMessageText({
+      caption: revisionEntry.captionText,
+      revision: revisionEntry.revision,
+      totalRevisions,
+      renderMode: revisionEntry.finalRenderMode,
+    });
+
+    if (jobType === 'work') {
+      const controlMessageId = await this.upsertControlMessage(chatId, controlText, {
+        existingMessageId: runtime?.text_message_id ?? null,
+        replyMarkup: keyboard,
+      });
+      return {
+        collageMessageId: runtime?.collage_message_id ?? null,
+        textMessageId: controlMessageId,
+        assetsMessageIds: runtime?.assets_message_ids ?? [],
+        previewTelegramFileIds: revisionEntry.previewTelegramFileIds,
+      };
+    }
 
     if (revisionEntry.finalRenderMode === 'separate') {
-      const controlText = buildControlMessageText({
-        caption: revisionEntry.captionText,
-        revision: revisionEntry.revision,
-        totalRevisions,
-        renderMode: revisionEntry.finalRenderMode,
-      });
       const edited = await this.callTelegram('editMessageText', chatId, runtime.text_message_id, controlText, {
         reply_markup: keyboard,
       });
@@ -3484,15 +5374,91 @@ export class SalonBotService {
     const totalRevisions = history.length;
     const canPrev = history.some((entry) => entry.revision < revisionEntry.revision);
     const canNext = history.some((entry) => entry.revision > revisionEntry.revision);
-    const keyboard = this.buildPreviewKeyboardForRuntime(tokensByAction, { canPrev, canNext }, payload.jobType ?? runtime?.job_type ?? 'work');
+    const jobType = payload.jobType ?? runtime?.job_type ?? 'work';
+    const keyboard = this.buildPreviewKeyboardForRuntime(tokensByAction, { canPrev, canNext }, jobType);
+    const controlText = buildControlMessageText({
+      caption: revisionEntry.captionText,
+      revision: revisionEntry.revision,
+      totalRevisions,
+      renderMode: revisionEntry.finalRenderMode,
+    });
+
+    if (jobType === 'work') {
+      if (revisionEntry.finalRenderMode === 'separate') {
+        const albumAssets = assets?.length
+          ? assets
+          : this.assertReusableTelegramFileIds(
+            revisionEntry.previewTelegramFileIds,
+            `present_preview_revision:${payload.jobId}:${revisionEntry.revision}`,
+          ).map((telegramFileId) => ({ telegramFileId }));
+
+        const album = await this.upsertPreviewAlbum({
+          chatId,
+          assets: albumAssets,
+          jobId: payload.jobId,
+          revision: revisionEntry.revision,
+          existingMessageIds: runtime?.assets_message_ids ?? [],
+        });
+
+        if (replaceModePrompt && runtime?.text_message_id) {
+          await this.deleteMessageSafe(chatId, runtime.text_message_id);
+        }
+
+        const controlMessageId = await this.upsertControlMessage(chatId, controlText, {
+          existingMessageId: replaceModePrompt ? null : (runtime?.text_message_id ?? null),
+          replyMarkup: keyboard,
+        });
+
+        return {
+          collageMessageId: null,
+          textMessageId: controlMessageId,
+          assetsMessageIds: album.assetsMessageIds,
+          previewTelegramFileIds: album.previewTelegramFileIds,
+        };
+      }
+
+      const previewAsset = assets?.[0]
+        ?? { telegramFileId: this.assertReusableTelegramFileIds(
+          revisionEntry.previewTelegramFileIds,
+          `present_preview_revision:${payload.jobId}:${revisionEntry.revision}`,
+        )[0] };
+
+      let mediaMessageId = runtime?.collage_message_id ?? null;
+      let sentMessage = null;
+      if (mediaMessageId) {
+        const edited = await this.callTelegram('editMessageMedia', chatId, mediaMessageId, {
+          type: 'photo',
+          media: this.buildTelegramMediaAsset(previewAsset, payload.jobId, 0),
+        });
+        sentMessage = edited;
+        mediaMessageId = edited?.message_id ?? mediaMessageId;
+      } else {
+        const message = await this.callTelegram('sendPhoto', chatId, this.buildTelegramMediaAsset(previewAsset, payload.jobId, 0));
+        sentMessage = message;
+        mediaMessageId = message.message_id;
+      }
+
+      if (replaceModePrompt && runtime?.text_message_id) {
+        await this.deleteMessageSafe(chatId, runtime.text_message_id);
+      }
+
+      const controlMessageId = await this.upsertControlMessage(chatId, controlText, {
+        existingMessageId: replaceModePrompt ? null : (runtime?.text_message_id ?? null),
+        replyMarkup: keyboard,
+      });
+
+      return {
+        collageMessageId: mediaMessageId,
+        textMessageId: controlMessageId,
+        assetsMessageIds: [mediaMessageId],
+        previewTelegramFileIds: this.extractPreviewTelegramFileIds(
+          [sentMessage],
+          `present_preview_revision:${payload.jobId}:${revisionEntry.revision}`,
+        ),
+      };
+    }
 
     if (revisionEntry.finalRenderMode === 'separate') {
-      const controlText = buildControlMessageText({
-        caption: revisionEntry.captionText,
-        revision: revisionEntry.revision,
-        totalRevisions,
-        renderMode: revisionEntry.finalRenderMode,
-      });
       let controlMessageId = runtime?.text_message_id ?? null;
       if (controlMessageId) {
         const edited = await this.callTelegram('editMessageText', chatId, controlMessageId, controlText, {
@@ -3673,10 +5639,23 @@ export class SalonBotService {
   async processWorkCollection(collection, { runtime = null, renderMode = 'collage' } = {}) {
     const jobId = runtime?.job_id ?? stableId('JOB', `work:${collection.collection_id}`);
     const queueId = runtime?.draft_payload?.queueId ?? runtime?.preview_payload?.queueId ?? stableId('QUE', jobId);
-    const prompts = await this.promptConfig.refresh();
+    const revision = Math.max(1, Number(runtime?.active_revision ?? 0) + 1);
+    const payload = runtime?.draft_payload ?? runtime?.preview_payload ?? {};
+    const effectiveRenderMode = renderMode || payload.renderMode || 'collage';
+    const subjectType = this.getWorkSubjectType(payload.subjectType);
+    const browOutputMode = this.getBrowOutputMode(payload.browOutputMode);
+    const promptMode = payload.promptMode || 'normal';
+    const backgroundMode = payload.backgroundMode || (collection.assets.length === 1 ? 'keep' : '');
+    const cleanupMode = payload.cleanupMode || 'off';
+    const prompts = await this.resolveWorkPrompts({
+      jobId,
+      revision,
+      sourceAssetCount: collection.assets.length,
+      renderMode: effectiveRenderMode,
+      subjectType,
+    });
     const previousPayload = runtime?.draft_payload ?? runtime?.preview_payload ?? null;
     const previousHistory = this.getRevisionHistory(previousPayload);
-    const revision = Math.max(1, Number(runtime?.active_revision ?? 0) + 1);
 
     await this.repos.closeCollection({
       collection_id: collection.collection_id,
@@ -3714,23 +5693,28 @@ export class SalonBotService {
       queueId,
       collectionId: collection.collection_id,
       sourceType: 'work',
-      status: renderMode,
+      status: effectiveRenderMode,
       message: `assets=${collection.assets.length}`,
       payload: {
         mediaGroupId: collection.media_group_id ?? '',
         sourceAssetCount: collection.assets.length,
-        renderMode,
+        renderMode: effectiveRenderMode,
+        subjectType,
+        browOutputMode,
+        promptMode,
+        backgroundMode,
+        cleanupMode,
       },
     });
     let workingRuntime = runtime;
     if (workingRuntime) {
-      const controlMessageId = await this.updateRuntimeStatusMessage(workingRuntime, USER_MESSAGES.workEnhancingImages);
+      const controlMessageId = await this.updateRuntimeStatusMessage(workingRuntime, USER_MESSAGES.workAnalyzingPhotos);
       workingRuntime = {
         ...workingRuntime,
         text_message_id: controlMessageId,
       };
     } else {
-      await this.sendProgress(collection.chat_id, USER_MESSAGES.workEnhancingImages);
+      await this.sendProgress(collection.chat_id, USER_MESSAGES.workAnalyzingPhotos);
     }
 
     const downloadStartedAt = Date.now();
@@ -3746,9 +5730,39 @@ export class SalonBotService {
       prompts,
       jobId,
       revision,
+      subjectType,
     });
-    const processedAssets = await Promise.all(
-      collection.assets.map((asset, index) => this.processSingleWorkAsset({
+    await this.logEvent({
+      event: 'consistency_extracted',
+      stage: 'processing',
+      chatId: collection.chat_id,
+      userId: collection.user_id,
+      jobId,
+      queueId,
+      collectionId: collection.collection_id,
+      sourceType: 'work',
+      status: 'ok',
+      message: consistencyNotes ? 'locked_facts_ready' : 'single_asset_or_empty',
+        payload: {
+          model: this.getWorkTextModelId(),
+          sourceAssetCount: consistencyInputs.length,
+          renderMode,
+          subjectType,
+          verdict: consistencyNotes.slice(0, 400),
+        },
+      });
+    if (workingRuntime) {
+      const controlMessageId = await this.updateRuntimeStatusMessage(workingRuntime, USER_MESSAGES.workEnhancingImages);
+      workingRuntime = {
+        ...workingRuntime,
+        text_message_id: controlMessageId,
+      };
+    } else {
+      await this.sendProgress(collection.chat_id, USER_MESSAGES.workEnhancingImages);
+    }
+    const processedAssets = [];
+    for (const [index, asset] of collection.assets.entries()) {
+      const processedAsset = await this.processSingleWorkAsset({
         fileId: asset.fileId,
         prompts,
         jobId,
@@ -3756,8 +5770,48 @@ export class SalonBotService {
         revision,
         consistencyNotes,
         originalAsset: consistencyInputs[index] ?? null,
-      })),
-    );
+          renderMode: effectiveRenderMode,
+          promptMode,
+          subjectType,
+          browOutputMode,
+          backgroundMode,
+          cleanupMode,
+        sourceAssetCount: collection.assets.length,
+        logContext: {
+          chatId: collection.chat_id,
+          userId: collection.user_id,
+          queueId,
+          collectionId: collection.collection_id,
+        },
+      });
+      processedAssets.push(processedAsset);
+    }
+    if (
+      processedAssets.length !== collection.assets.length
+      || processedAssets.some((item) => !item?.asset?.buffer)
+    ) {
+      await this.logEvent({
+        level: 'ERROR',
+        event: 'work_asset_missing_output',
+        stage: 'processing',
+        chatId: collection.chat_id,
+        userId: collection.user_id,
+        jobId,
+        queueId,
+        collectionId: collection.collection_id,
+        sourceType: 'work',
+        status: 'failed',
+        message: `expected=${collection.assets.length} actual=${processedAssets.length}`,
+        payload: {
+          renderMode,
+          sourceAssetCount: collection.assets.length,
+        },
+      });
+      const error = new Error(`Processed work asset count mismatch for ${jobId}`);
+      error.step = 'work_asset_missing_output';
+      error.userMessage = 'Не получилось собрать все фото после обработки. Попробуй ещё раз.';
+      throw error;
+    }
     const originalTelegramFileIds = processedAssets.map((item) => item.originalTelegramFileId);
     const enhancedAssets = processedAssets.map((item) => item.asset);
     await this.logEvent({
@@ -3786,26 +5840,34 @@ export class SalonBotService {
       status: 'ok',
       durationMs: Date.now() - imageStartedAt,
       message: `files=${enhancedAssets.length}`,
-      payload: {
-        model: this.env.imageModelId,
-        passes: ['enhance', 'reframe'],
-        sourceAssetCount: enhancedAssets.length,
-        renderMode,
-        consistencyNotes,
-      },
-    });
+        payload: {
+          model: this.env.imageModelId,
+          passes: ['edit'],
+          sourceAssetCount: enhancedAssets.length,
+          renderMode,
+          subjectType,
+          consistencyNotes,
+        },
+      });
 
     let previewAssets = enhancedAssets;
     let finalRenderMode = renderMode === 'separate' && enhancedAssets.length > 1 ? 'separate' : 'single';
     if (renderMode === 'collage' && enhancedAssets.length > 1) {
-      const finalPreviewRender = await this.buildFinalWorkPreviewAsset(
-        enhancedAssets,
-        `${jobId}-${revision}`,
-        prompts,
-        consistencyNotes,
-      );
-      previewAssets = [finalPreviewRender.asset];
-      finalRenderMode = finalPreviewRender.finalRenderMode;
+        const finalPreviewRender = await this.buildFinalWorkPreviewAsset(
+          enhancedAssets,
+          `${jobId}-${revision}`,
+          prompts,
+          consistencyNotes,
+          {
+            backgroundMode,
+            cleanupMode,
+            promptMode,
+            subjectType,
+            browOutputMode,
+          },
+        );
+        previewAssets = [finalPreviewRender.asset];
+        finalRenderMode = finalPreviewRender.finalRenderMode;
       await this.logEvent({
         event: 'collage_built',
         stage: 'preview',
@@ -3823,6 +5885,29 @@ export class SalonBotService {
         },
       });
     }
+    if (renderMode === 'separate' && previewAssets.length !== collection.assets.length) {
+      await this.logEvent({
+        level: 'ERROR',
+        event: 'work_asset_missing_output',
+        stage: 'preview',
+        chatId: collection.chat_id,
+        userId: collection.user_id,
+        jobId,
+        queueId,
+        collectionId: collection.collection_id,
+        sourceType: 'work',
+        status: 'failed',
+        message: `separate_preview_count=${previewAssets.length}`,
+        payload: {
+          renderMode,
+          sourceAssetCount: collection.assets.length,
+        },
+      });
+      const error = new Error(`Separate preview asset count mismatch for ${jobId}`);
+      error.step = 'work_asset_missing_output';
+      error.userMessage = 'Не получилось подготовить все фото для результата. Попробуй ещё раз.';
+      throw error;
+    }
 
     if (workingRuntime) {
       const controlMessageId = await this.updateRuntimeStatusMessage(workingRuntime, USER_MESSAGES.workPreparingText);
@@ -3834,21 +5919,21 @@ export class SalonBotService {
       await this.sendProgress(collection.chat_id, USER_MESSAGES.workPreparingText);
     }
     const captionStartedAt = Date.now();
-    const captionImageUrls = this.buildWorkCaptionImageUrls(enhancedAssets);
-    const caption = this.formatCaptionWithContact((await this.openrouter.generateText({
-      systemPrompt: prompts.work_caption_generation,
-      userPrompt: this.buildWorkCaptionUserPrompt(enhancedAssets.length),
+    const captionImageUrls = await this.buildWorkCaptionImageUrls(enhancedAssets);
+    const { text: caption, fallback: captionFallback } = await this.generateWorkCaptionText({
+      prompts,
+      sourceAssetCount: enhancedAssets.length,
       imageUrls: captionImageUrls,
-      temperature: 0.9,
-      model: this.getWorkTextModelId(),
-      metadata: {
-        source_type: 'work',
-        job_id: jobId,
-        model: this.getWorkTextModelId(),
-        source_asset_count: enhancedAssets.length,
-        render_mode: renderMode,
-      },
-    })).text, prompts.contact_block);
+      jobId,
+      revision,
+          renderMode,
+          chatId: collection.chat_id,
+          userId: collection.user_id,
+          queueId,
+          collectionId: collection.collection_id,
+          subjectType,
+          browOutputMode,
+        });
     await this.logEvent({
       event: 'caption_generated',
       stage: 'processing',
@@ -3865,6 +5950,7 @@ export class SalonBotService {
         model: this.getWorkTextModelId(),
         sourceAssetCount: enhancedAssets.length,
         renderMode,
+        fallback: captionFallback,
       },
     });
     if (workingRuntime) {
@@ -3889,6 +5975,8 @@ export class SalonBotService {
       topicId: '',
       collectionId: collection.collection_id,
       captionText: caption,
+      subjectType,
+      browOutputMode,
       renderMode,
       finalRenderMode,
       sourceAssetCount: enhancedAssets.length,
@@ -4077,25 +6165,24 @@ export class SalonBotService {
               return { buffer: original.buffer, mimeType: original.mimeType };
             }),
           );
-        workCaptionImageUrls = this.buildWorkCaptionImageUrls(captionAssets);
+        workCaptionImageUrls = await this.buildWorkCaptionImageUrls(captionAssets);
       }
       if (runtime.job_type === 'work') {
-        const nextCaption = await this.openrouter.generateText({
-          systemPrompt: prompts.work_caption_generation,
-          userPrompt: this.buildWorkCaptionUserPrompt(
-            payload.sourceAssetCount || payload.originalTelegramFileIds?.length || payload.previewTelegramFileIds?.length || 1,
-          ),
+        const { text: nextCaption } = await this.generateWorkCaptionText({
+          prompts,
+          sourceAssetCount: payload.sourceAssetCount || payload.originalTelegramFileIds?.length || payload.previewTelegramFileIds?.length || 1,
           imageUrls: workCaptionImageUrls,
-          temperature: 0.9,
-          model: this.getWorkTextModelId(),
-          metadata: {
-            source_type: runtime.job_type,
-            job_id: jobId,
-            revision,
-            model: this.getWorkTextModelId(),
-          },
+          jobId,
+          revision,
+          renderMode: payload.renderMode ?? payload.finalRenderMode ?? 'collage',
+          subjectType: this.getWorkSubjectType(payload.subjectType),
+          browOutputMode: this.getBrowOutputMode(payload.browOutputMode),
+          chatId: runtime.chat_id,
+          userId: runtime.user_id,
+          queueId: payload.queueId ?? '',
+          collectionId: runtime.collection_id ?? '',
         });
-        payload.captionText = this.formatCaptionWithContact(nextCaption.text, prompts.contact_block);
+        payload.captionText = nextCaption;
       } else {
         const { manifest } = await this.generateTopicLikeManifest({
           jobType: runtime.job_type,
@@ -4117,21 +6204,89 @@ export class SalonBotService {
     }
 
     if (shouldRegenerateImages && runtime.job_type === 'work') {
-      const regeneratedAssets = await Promise.all(
-        (payload.originalTelegramFileIds ?? []).map((fileId, index) => this.processSingleWorkAsset({
+      const regenerationOriginals = await Promise.all(
+        (payload.originalTelegramFileIds ?? []).map(async (fileId) => {
+          const original = await this.downloadTelegramFile(fileId);
+          return { buffer: original.buffer, mimeType: original.mimeType };
+        }),
+      );
+      const regenerationConsistencyNotes = await this.extractAlbumConsistencyNotes({
+        assets: regenerationOriginals,
+        prompts,
+        jobId,
+        revision,
+        subjectType: this.getWorkSubjectType(payload.subjectType),
+      });
+      const regeneratedAssets = [];
+      for (const [index, fileId] of (payload.originalTelegramFileIds ?? []).entries()) {
+        const regeneratedAsset = await this.processSingleWorkAsset({
           fileId,
           prompts,
           jobId,
           index,
           revision,
-        })),
-      );
+          consistencyNotes: regenerationConsistencyNotes,
+          originalAsset: regenerationOriginals[index] ?? null,
+          renderMode: payload.renderMode ?? payload.finalRenderMode ?? 'collage',
+          promptMode: payload.promptMode || 'normal',
+          subjectType: this.getWorkSubjectType(payload.subjectType),
+          browOutputMode: this.getBrowOutputMode(payload.browOutputMode),
+          backgroundMode: payload.backgroundMode || '',
+          cleanupMode: payload.cleanupMode || 'off',
+          sourceAssetCount: payload.originalTelegramFileIds?.length ?? regenerationOriginals.length ?? 1,
+          logContext: {
+            chatId: runtime.chat_id,
+            userId: runtime.user_id,
+            queueId: payload.queueId ?? '',
+            collectionId: runtime.collection_id,
+          },
+        });
+        regeneratedAssets.push(regeneratedAsset);
+      }
+      if (
+        regeneratedAssets.length !== (payload.originalTelegramFileIds ?? []).length
+        || regeneratedAssets.some((item) => !item?.asset?.buffer)
+      ) {
+        await this.logEvent({
+          level: 'ERROR',
+          event: 'work_asset_missing_output',
+          stage: 'processing',
+          chatId: runtime.chat_id,
+          userId: runtime.user_id,
+          jobId,
+          queueId: payload.queueId ?? '',
+          collectionId: runtime.collection_id,
+          sourceType: 'work',
+          status: 'failed',
+          message: `expected=${payload.originalTelegramFileIds?.length ?? 0} actual=${regeneratedAssets.length}`,
+          payload: {
+            action,
+            renderMode: payload.renderMode ?? payload.finalRenderMode ?? 'collage',
+          },
+        });
+        const error = new Error(`Regenerated work asset count mismatch for ${jobId}`);
+        error.step = 'work_asset_missing_output';
+        error.userMessage = 'Не получилось повторно собрать все фото. Попробуй ещё раз.';
+        throw error;
+      }
       const regeneratedBuffers = regeneratedAssets.map((item) => item.asset);
       if ((payload.renderMode ?? payload.finalRenderMode) === 'separate' && regeneratedBuffers.length > 1) {
         regeneratedFinalRenderMode = 'separate';
         previewAssets = regeneratedBuffers;
       } else if (regeneratedBuffers.length > 1) {
-        const finalPreviewRender = await this.buildFinalWorkPreviewAsset(regeneratedBuffers, `${jobId}-${revision}`, prompts);
+        const finalPreviewRender = await this.buildFinalWorkPreviewAsset(
+          regeneratedBuffers,
+          `${jobId}-${revision}`,
+          prompts,
+          consistencyNotes,
+          {
+            backgroundMode: payload.backgroundMode || '',
+            cleanupMode: payload.cleanupMode || 'off',
+            promptMode: payload.promptMode || 'normal',
+            subjectType: this.getWorkSubjectType(payload.subjectType),
+            browOutputMode: this.getBrowOutputMode(payload.browOutputMode),
+          },
+        );
         regeneratedFinalRenderMode = finalPreviewRender.finalRenderMode;
         previewAssets = [finalPreviewRender.asset];
       } else {
@@ -4382,6 +6537,14 @@ export class SalonBotService {
     return this.runQueuedGenerationJob(jobId, action);
   }
 
+  async handleCollectionFinalizeAction(payload = {}) {
+    const collectionId = String(payload.collectionId ?? '').trim();
+    if (!collectionId) {
+      return { ok: false, error: 'invalid_collection_finalize_payload' };
+    }
+    return this.scheduleCollectionFinalize(collectionId);
+  }
+
   async runQueuedGenerationJob(jobId, action) {
     const runtime = await this.repos.getRuntime(jobId);
     if (!runtime) {
@@ -4536,13 +6699,13 @@ export class SalonBotService {
   }
 
   async scheduleCollectionFinalize(collectionId) {
-    await delay(this.getCollectionDebounceWaitMs());
     const collection = await this.repos.getCollectionById(collectionId);
     if (!collection || collection.status !== 'collecting') {
       return { ok: true, skipped: true };
     }
-    if (new Date(collection.deadline_at).getTime() > Date.now()) {
-      return { ok: true, waiting: true };
+    const waitMs = Math.max(0, new Date(collection.deadline_at).getTime() - Date.now()) + 250;
+    if (waitMs > 0) {
+      await delay(waitMs);
     }
     const lockKey = `collection-finalize:${collection.collection_id}`;
     const acquired = await this.repos.acquirePublishLock({

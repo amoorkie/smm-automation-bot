@@ -77,6 +77,22 @@ function mergeCollectionRecords(rows = []) {
   });
 }
 
+function selectLatestRow(rows = []) {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return null;
+  }
+  return [...rows]
+    .sort((left, right) => {
+      const leftId = Number(left?.id ?? 0);
+      const rightId = Number(right?.id ?? 0);
+      if (leftId !== rightId) {
+        return leftId - rightId;
+      }
+      return Number(left?.__rowNumber ?? 0) - Number(right?.__rowNumber ?? 0);
+    })
+    .at(-1);
+}
+
 function mergeAssets(rowsOrAssets = [], extraAssets = []) {
   const merged = new Map();
   for (const entry of rowsOrAssets) {
@@ -184,8 +200,9 @@ export function createRepositories(sheets) {
     }) {
       const matching = await queryMany(SHEET_NAMES.workCollections, {
         eq: { collection_id: collectionId },
+        orderBy: [{ column: 'id', ascending: true }],
       });
-      const newest = matching.at(-1) ?? null;
+      const newest = selectLatestRow(matching);
       const mergedAssets = mergeAssets(matching, [asset]);
       const deadlineAt = typeof buildDeadlineAt === 'function'
         ? buildDeadlineAt(mergedAssets.length)
@@ -223,12 +240,15 @@ export function createRepositories(sheets) {
         );
       }
 
-      const refreshed = await queryMany(SHEET_NAMES.workCollections, {
-        eq: { collection_id: collectionId },
-      });
-      if (refreshed.length > 1) {
-        const latest = refreshed.at(-1);
-        const dedupedAssets = mergeAssets(refreshed, []);
+      const rowsForDedup = newest
+        ? matching
+        : await queryMany(SHEET_NAMES.workCollections, {
+          eq: { collection_id: collectionId },
+          orderBy: [{ column: 'id', ascending: true }],
+        });
+      if (rowsForDedup.length > 1) {
+        const latest = selectLatestRow(rowsForDedup);
+        const dedupedAssets = mergeAssets(rowsForDedup, []);
         await sheets.updateRowByNumber(
           SHEET_NAMES.workCollections,
           latest.__rowNumber,
@@ -240,13 +260,22 @@ export function createRepositories(sheets) {
           },
           SHEET_HEADERS[SHEET_NAMES.workCollections],
         );
-        const duplicateRows = refreshed
+        const duplicateRows = rowsForDedup
           .filter((row) => row.__rowNumber !== latest.__rowNumber)
           .map((row) => row.__rowNumber);
         await sheets.deleteRowsByNumbers(SHEET_NAMES.workCollections, duplicateRows);
+        return rowToCollection({
+          ...latest,
+          ...canonical,
+          asset_refs_json: JSON.stringify(dedupedAssets),
+          count: dedupedAssets.length,
+        });
       }
 
-      return this.getCollectionById(collectionId);
+      return rowToCollection({
+        ...(newest ?? {}),
+        ...canonical,
+      });
     },
     async getOpenCollectionForChat(chatId) {
       const row = await queryOne(SHEET_NAMES.workCollections, {
@@ -256,7 +285,10 @@ export function createRepositories(sheets) {
       return rowToCollection(row);
     },
     async listDueCollections(nowIso) {
-      const rows = await sheets.getRows(SHEET_NAMES.workCollections);
+      const rows = await queryMany(SHEET_NAMES.workCollections, {
+        eq: { status: 'collecting' },
+        orderBy: [{ column: 'deadline_at', ascending: true }],
+      });
       const grouped = rows.reduce((accumulator, row) => {
         if (!accumulator.has(row.collection_id)) {
           accumulator.set(row.collection_id, []);
@@ -270,8 +302,10 @@ export function createRepositories(sheets) {
         .sort((left, right) => String(left.deadline_at).localeCompare(String(right.deadline_at)));
     },
     async closeCollection(record) {
-      const rows = await sheets.getRows(SHEET_NAMES.workCollections);
-      const existing = rows.filter((row) => row.collection_id === record.collection_id).at(-1);
+      const existing = await queryOne(SHEET_NAMES.workCollections, {
+        eq: { collection_id: record.collection_id },
+        orderBy: [{ column: 'id', ascending: false }],
+      });
       if (!existing) {
         return;
       }
@@ -362,24 +396,25 @@ export function createRepositories(sheets) {
 
     async recordIdempotency(scope, payload, nowIso, expiresAt) {
       const idemKey = computeIdempotencyKey(scope, payload);
-      const existing = await queryOne(SHEET_NAMES.idempotencyKeys, {
-        eq: { idem_key: idemKey },
-      });
-      if (existing) {
-        return { idemKey, inserted: false };
+      try {
+        await sheets.appendRow(
+          SHEET_NAMES.idempotencyKeys,
+          {
+            idem_key: idemKey,
+            scope,
+            payload_hash: JSON.stringify(payload),
+            created_at: nowIso,
+            expires_at: expiresAt,
+          },
+          SHEET_HEADERS[SHEET_NAMES.idempotencyKeys],
+        );
+        return { idemKey, inserted: true };
+      } catch (error) {
+        if (/duplicate key|already exists|23505|unique constraint|violates unique/i.test(String(error?.message ?? ''))) {
+          return { idemKey, inserted: false };
+        }
+        throw error;
       }
-      await sheets.appendRow(
-        SHEET_NAMES.idempotencyKeys,
-        {
-          idem_key: idemKey,
-          scope,
-          payload_hash: JSON.stringify(payload),
-          created_at: nowIso,
-          expires_at: expiresAt,
-        },
-        SHEET_HEADERS[SHEET_NAMES.idempotencyKeys],
-      );
-      return { idemKey, inserted: true };
     },
     async hasIdempotency(idemKey) {
       return Boolean(await queryOne(SHEET_NAMES.idempotencyKeys, {

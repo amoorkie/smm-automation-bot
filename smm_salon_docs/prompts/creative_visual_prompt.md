@@ -10,6 +10,8 @@ Create one light, funny, salon-related image that can carry a short joke.
 
 - Format: `1080x1920`
 - Keep the visual simple and readable.
+- When color accents are useful, prefer the salon brand palette `#CE6BD6` and `#A21A92`.
+- Let those two colors carry the main accent logic instead of random bright hues.
 - Prefer object-led or scene-led humor.
 - Do not depend on a perfect portrait.
 - Do not use a finished hairstyle as the core joke.

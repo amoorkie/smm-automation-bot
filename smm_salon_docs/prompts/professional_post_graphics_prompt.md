@@ -82,6 +82,9 @@ Do not change the floor pattern, mirror shapes, chair placement, or furniture st
 
 The scene should feel like it was photographed on an iPhone in this exact salon, not in a similar salon and not in a perfect studio.
 
+When color accents are useful, prefer the salon brand palette with main colors `#CE6BD6` and `#A21A92`.
+Use these colors carefully in products, towels, accessories, reflections, or subtle decor accents instead of random accent colors.
+
 The safest variation is a different camera angle, crop, distance, or focus point inside the same salon.
 If the topic needs a subject detail, make a closer shot inside the same room instead of creating a new location.
 
@@ -108,6 +111,7 @@ Style rules:
 - natural light behavior
 - believable textures
 - slight everyday imperfectness
+- restrained use of brand accent colors `#CE6BD6` and `#A21A92`
 - no glossy ad finish
 - no uncanny generated perfection
 - no heavy retouch

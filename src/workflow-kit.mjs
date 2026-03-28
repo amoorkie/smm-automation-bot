@@ -1,12 +1,18 @@
 const ISO_DATETIME_RE = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})$/;
 
 export const LOCKED_PROMPT_KEYS = [
-  'work_image_enhancement_master',
-  'work_image_enhancement_short',
-  'work_image_reframe_master',
+  'work_album_consistency_extraction',
+  'work_image_edit_keep',
+  'work_image_edit_blur',
+  'work_image_edit_neutral',
+  'work_brow_consistency_extraction',
+  'work_brow_edit_keep',
+  'work_brow_edit_blur',
+  'work_brow_edit_neutral',
   'work_collage_generation',
-  'work_image_enhancement_negative',
+  'work_brow_collage_generation',
   'work_caption_generation',
+  'work_brow_caption_generation',
   'topic_post_generation',
   'topic_image_generation',
   'help_message',
@@ -291,6 +297,7 @@ export function buildOpenRouterTextPayload({
   userPrompt,
   imageUrls = [],
   temperature = 0.7,
+  maxTokens = null,
   metadata = {},
 }) {
   const messages = [];
@@ -310,13 +317,17 @@ export function buildOpenRouterTextPayload({
     messages.push({ role: 'user', content: userPrompt });
   }
 
-  return {
+  const payload = {
     model,
     temperature,
     stream: false,
     messages,
     metadata,
   };
+  if (Number.isFinite(Number(maxTokens)) && Number(maxTokens) > 0) {
+    payload.max_tokens = Number(maxTokens);
+  }
+  return payload;
 }
 
 export function buildOpenRouterImagePayload({
@@ -324,7 +335,9 @@ export function buildOpenRouterImagePayload({
   prompt,
   imageUrls = [],
   imageConfig = {},
+  maxTokens = null,
   metadata = {},
+  provider = null,
 }) {
   const content = [{ type: 'text', text: prompt }];
   for (const url of imageUrls) {
@@ -334,7 +347,7 @@ export function buildOpenRouterImagePayload({
     });
   }
 
-  return {
+  const payload = {
     model,
     stream: false,
     modalities: ['image', 'text'],
@@ -347,6 +360,13 @@ export function buildOpenRouterImagePayload({
     image_config: imageConfig,
     metadata,
   };
+  if (provider && typeof provider === 'object') {
+    payload.provider = provider;
+  }
+  if (Number.isFinite(Number(maxTokens)) && Number(maxTokens) > 0) {
+    payload.max_tokens = Number(maxTokens);
+  }
+  return payload;
 }
 
 export function parseOpenRouterTextResponse(response) {

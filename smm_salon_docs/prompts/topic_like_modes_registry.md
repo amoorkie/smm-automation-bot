@@ -13,10 +13,6 @@ This registry groups every canonical prompt doc used by the topic-like content s
   - manifest: [stories_manifest_prompt.md](./stories_manifest_prompt.md)
   - visuals: [stories_visual_prompt.md](./stories_visual_prompt.md)
 
-- `/creative`
-  - manifest: [creative_manifest_prompt.md](./creative_manifest_prompt.md)
-  - visuals: [creative_visual_prompt.md](./creative_visual_prompt.md)
-
 - `/slider`
   - manifest: [slider_manifest_prompt.md](./slider_manifest_prompt.md)
   - visuals: [slider_visual_prompt.md](./slider_visual_prompt.md)
@@ -37,7 +33,6 @@ This registry groups every canonical prompt doc used by the topic-like content s
 - product choice
 - heat protection
 - client habits
-- light salon humor for creative mode
 
 ## What Not To Do
 
