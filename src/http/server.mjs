@@ -5,6 +5,11 @@ import { isWorkerRequestAuthorized } from './worker-dispatch.mjs';
 export function createServer({ env, service, bot }) {
   const app = Fastify({ logger: true });
 
+  function registerWorkerRoute(path, handler) {
+    app.post(path, handler);
+    app.post(`/api${path}`, handler);
+  }
+
   app.get('/healthz', async () => ({ ok: true }));
   app.get('/readyz', async () => ({ ok: true, timezone: env.appTimezone, disabled: env.botDisabled }));
   app.get('/cron/finalize', async (_request, reply) => {
@@ -22,7 +27,7 @@ export function createServer({ env, service, bot }) {
     return { ok: true };
   });
 
-  app.post('/worker/telegram-update', async (request, reply) => {
+  registerWorkerRoute('/worker/telegram-update', async (request, reply) => {
     if (env.botDisabled) {
       return reply.status(503).send({ ok: false, error: 'bot_disabled' });
     }
@@ -33,7 +38,7 @@ export function createServer({ env, service, bot }) {
     return reply.send({ ok: true, result });
   });
 
-  app.post('/worker/runtime-action', async (request, reply) => {
+  registerWorkerRoute('/worker/runtime-action', async (request, reply) => {
     if (env.botDisabled) {
       return reply.status(503).send({ ok: false, error: 'bot_disabled' });
     }
@@ -44,7 +49,7 @@ export function createServer({ env, service, bot }) {
     return reply.send({ ok: true, result });
   });
 
-  app.post('/worker/collection-finalize', async (request, reply) => {
+  registerWorkerRoute('/worker/collection-finalize', async (request, reply) => {
     if (env.botDisabled) {
       return reply.status(503).send({ ok: false, error: 'bot_disabled' });
     }

@@ -1508,6 +1508,60 @@ test('/work starts with photo type choice and opens awaiting_assets only after s
   assert.ok(allSentTexts(ctx.bot).includes(USER_MESSAGES.workPhotoRequest));
 });
 
+test('subject choice keeps preselected test prompt mode on the runtime payload', async () => {
+  const ctx = createService();
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 1871,
+    message: { message_id: 1871, text: '/work', chat: { id: 611 }, from: { id: 61 } },
+  });
+  await chooseWorkPhotoType(ctx, {
+    chatId: 611,
+    userId: 61,
+    action: 'work_photo_type_normal',
+    updateId: 1872,
+    callbackId: 'cb-work-photo-type-test-mode',
+  });
+  await ctx.service.handleTelegramUpdate({
+    update_id: 1873,
+    message: {
+      message_id: 1873,
+      chat: { id: 611 },
+      from: { id: 61 },
+      photo: [
+        { file_id: 'test-mode-photo-small', file_unique_id: 'test-mode-photo-small-u', width: 100, height: 100 },
+        { file_id: 'test-mode-photo-large', file_unique_id: 'test-mode-photo-large-u', width: 1000, height: 1000 },
+      ],
+    },
+  });
+
+  await expireOnlyCollection(ctx);
+  await ctx.service.runCollectionFinalizer();
+
+  const runtimeRow = (await ctx.store.getRows(TABLE_NAMES.jobRuntimeCache))[0];
+  await ctx.repos.upsertRuntime({
+    ...runtimeRow,
+    preview_payload_json: JSON.stringify({
+      ...JSON.parse(runtimeRow.preview_payload_json),
+      promptMode: 'test',
+    }),
+    draft_payload_json: JSON.stringify({
+      ...JSON.parse(runtimeRow.draft_payload_json),
+      promptMode: 'test',
+    }),
+  });
+
+  await chooseHairSubjectIfNeeded(ctx, {
+    chatId: 611,
+    userId: 61,
+    updateId: 1874,
+    callbackId: 'cb-work-subject-hair-test-mode',
+  });
+
+  const runtime = await ctx.repos.getRuntime(runtimeRow.job_id);
+  assert.equal(runtime.draft_payload.promptMode, 'test');
+});
+
 test('single-photo studio flow skips background choice and starts generation right after subject selection', async () => {
   const ctx = createService();
 

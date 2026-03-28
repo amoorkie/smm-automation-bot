@@ -4635,7 +4635,7 @@ export class SalonBotService {
     const nextPayload = {
       ...previousPayload,
       subjectType,
-      promptMode: 'normal',
+      promptMode: previousPayload.promptMode || 'normal',
       browOutputMode: subjectType === 'brows' ? (previousPayload.browOutputMode || 'after_only') : '',
       renderMode: isSinglePhoto ? 'separate' : (previousPayload.renderMode || ''),
       backgroundMode: preferredBackgroundMode,

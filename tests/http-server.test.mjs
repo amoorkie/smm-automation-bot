@@ -138,3 +138,46 @@ test('collection finalize worker route requires auth token and executes finalize
     await server.stop();
   }
 });
+
+test('api-prefixed worker aliases execute the same handlers', async () => {
+  const context = createContext();
+  const server = createServer(context);
+
+  try {
+    const headers = {
+      'x-anita-worker-token': createWorkerAuthToken(context.env),
+    };
+
+    const telegram = await server.app.inject({
+      method: 'POST',
+      url: '/api/worker/telegram-update',
+      payload: { update_id: 30 },
+      headers,
+    });
+    assert.equal(telegram.statusCode, 200);
+
+    const runtime = await server.app.inject({
+      method: 'POST',
+      url: '/api/worker/runtime-action',
+      payload: { jobId: 'JOB-30', action: 'generate_initial' },
+      headers,
+    });
+    assert.equal(runtime.statusCode, 200);
+
+    const finalize = await server.app.inject({
+      method: 'POST',
+      url: '/api/worker/collection-finalize',
+      payload: { collectionId: 'COL-30' },
+      headers,
+    });
+    assert.equal(finalize.statusCode, 200);
+
+    assert.deepEqual(context.calls, [
+      { update_id: 30 },
+      { worker: { jobId: 'JOB-30', action: 'generate_initial' } },
+      { finalize: { collectionId: 'COL-30' } },
+    ]);
+  } finally {
+    await server.stop();
+  }
+});

@@ -75,15 +75,17 @@ export class PromptConfigService {
     }
 
     const required = [...REQUIRED_WORK_PROMPT_KEYS];
-    const fallbackKeys = required.filter((key) => !supabaseKeys.has(key));
+    const resolvedKeys = required.filter((key) => !isPlaceholderPromptValue(key, prompts[key]));
+    const fallbackKeys = resolvedKeys.filter((key) => !supabaseKeys.has(key));
+    const missingRequiredKeys = required.filter((key) => !resolvedKeys.includes(key));
 
     this.cache = {
       value: prompts,
       meta: {
         requiredWorkKeys: required,
-        supabaseWorkKeys: required.filter((key) => supabaseKeys.has(key)),
+        supabaseWorkKeys: resolvedKeys.filter((key) => supabaseKeys.has(key)),
         fallbackWorkKeys: fallbackKeys,
-        missingRequiredWorkKeys: fallbackKeys,
+        missingRequiredWorkKeys: missingRequiredKeys,
       },
       expiresAt: Date.now() + this.cacheTtlMs,
     };
@@ -100,13 +102,16 @@ export class PromptConfigService {
     const meta = this.cache?.meta ?? {};
     const requiredKeys = getRequiredWorkPromptKeys(subjectType);
     const supabaseKeys = new Set(meta.supabaseWorkKeys ?? []);
-    const fallbackKeys = requiredKeys.filter((key) => !supabaseKeys.has(key));
+    const fallbackKeySet = new Set(meta.fallbackWorkKeys ?? []);
+    const missingKeySet = new Set(meta.missingRequiredWorkKeys ?? []);
+    const fallbackKeys = requiredKeys.filter((key) => fallbackKeySet.has(key));
+    const missingRequiredKeys = requiredKeys.filter((key) => missingKeySet.has(key));
     return {
       requiredKeys,
       supabaseKeys: requiredKeys.filter((key) => supabaseKeys.has(key)),
       fallbackKeys,
-      missingRequiredKeys: [...fallbackKeys],
-      hasMissingRequiredKeys: Boolean(fallbackKeys.length),
+      missingRequiredKeys,
+      hasMissingRequiredKeys: Boolean(missingRequiredKeys.length),
     };
   }
 }
