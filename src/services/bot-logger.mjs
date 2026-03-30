@@ -21,7 +21,7 @@ function sanitizePayload(value) {
 }
 
 export class BotLogger {
-  constructor({ workflow = 'anita_bot_service', store = null, tableName = TABLE_NAMES.botLogs } = {}) {
+  constructor({ workflow = 'smm_automation_bot', store = null, tableName = TABLE_NAMES.botLogs } = {}) {
     this.workflow = workflow;
     this.store = store;
     this.tableName = tableName;

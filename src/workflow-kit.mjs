@@ -105,7 +105,7 @@ export function buildBotLogEntry({
   ts = new Date().toISOString(),
   level = 'INFO',
   event,
-  workflow = 'anita_bot_service',
+  workflow = 'smm_automation_bot',
   executionId = null,
   chatId = null,
   userId = null,
