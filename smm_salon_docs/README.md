@@ -1,6 +1,6 @@
 # SMM Salon Bot Docs
 
-Этот каталог является каноническим source of truth для текущего runtime и продуктового контракта `ANITA-BOT`.
+Этот каталог является каноническим source of truth для текущего runtime и продуктового контракта `SMM Automation Bot`.
 
 ## Роль каталога
 

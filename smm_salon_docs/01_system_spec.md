@@ -1,4 +1,4 @@
-# ANITA Bot System Spec
+# SMM Automation Bot System Spec
 
 ## 1. Scope
 

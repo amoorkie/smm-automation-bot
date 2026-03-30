@@ -30,7 +30,7 @@ For communication:
 - give short human-readable progress updates during longer work
 - do not dump raw command output when a concise summary is enough
 
-Project-specific context for ANITA-BOT:
+Project-specific context for SMM Automation Bot:
 - this project is a Telegram bot service for salon SMM automation
 - the runtime is Node.js ESM
 - main entrypoints are `src/index.mjs` and `src/app.mjs`
