@@ -8,6 +8,8 @@ coverage/
 dist/
 *.log
 generated/
+output/
+tmp/
 
 .vercel
 .serena/

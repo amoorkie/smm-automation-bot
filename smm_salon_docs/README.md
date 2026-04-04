@@ -1,4 +1,4 @@
-# SMM Salon Bot Docs
+# SMM Automation Bot Docs
 
 Этот каталог является каноническим source of truth для текущего runtime и продуктового контракта `SMM Automation Bot`.
 

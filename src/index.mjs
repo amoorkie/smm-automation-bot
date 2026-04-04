@@ -13,7 +13,7 @@ async function main() {
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
   await app.start();
-  console.log(`ANITA bot service listening on port ${app.env.port}`);
+  console.log(`SMM Automation Bot listening on port ${app.env.port}`);
 }
 
 main().catch((error) => {

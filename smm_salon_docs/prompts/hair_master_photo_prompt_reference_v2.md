@@ -1,7 +1,6 @@
-# AI Photo Processing Prompt v2 — Hair / Brows / Beauty Portfolio
+# Photo Processing Prompt Reference v2 — Hair / Brows / Beauty Portfolio
 
-Нормализованная UTF-8 копия исходного файла из:
-`C:\Users\amoor\Downloads\hair_master_ai_prompt_v2.md`
+Нормализованный reference-документ для image prompt family.
 
 Этот документ используется как reference material для image prompt family:
 - `work_image_enhancement_master`

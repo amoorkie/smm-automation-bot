@@ -1298,7 +1298,7 @@ test('handlePhoto falls back to inline finalize when worker dispatch is unavaila
 test('dispatchCollectionFinalizeAsync skips self worker dispatch on protected vercel host', async () => {
   const ctx = createService({
     envOverrides: {
-      webhookBaseUrl: 'https://anita-bot-service-qro74qq9t-amoorkie-gmailcoms-projects.vercel.app',
+      webhookBaseUrl: 'https://smm-automation-bot-qro74qq9t-amoorkie-gmailcoms-projects.vercel.app',
       webhookBaseUrlDerivedFromDeploymentUrl: true,
       internalWorkerDispatchEnabled: true,
     },
@@ -2015,7 +2015,7 @@ test('queueRuntimeGeneration dispatches worker action and skips inline generatio
 test('queueRuntimeGeneration skips worker self-dispatch on protected vercel host and runs inline', async () => {
   const ctx = createService({
     envOverrides: {
-      webhookBaseUrl: 'https://anita-bot-service-qro74qq9t-amoorkie-gmailcoms-projects.vercel.app',
+      webhookBaseUrl: 'https://smm-automation-bot-qro74qq9t-amoorkie-gmailcoms-projects.vercel.app',
       webhookBaseUrlDerivedFromDeploymentUrl: true,
       internalWorkerDispatchEnabled: true,
     },
@@ -2058,7 +2058,7 @@ test('queueRuntimeGeneration skips worker self-dispatch on protected vercel host
 test('queueRuntimeGeneration skips worker dispatch when only protected deployment url is available', async () => {
   const ctx = createService({
     envOverrides: {
-      webhookBaseUrl: 'https://anita-bot-service-qro74qq9t-amoorkie-gmailcoms-projects.vercel.app',
+      webhookBaseUrl: 'https://smm-automation-bot-qro74qq9t-amoorkie-gmailcoms-projects.vercel.app',
       webhookBaseUrlDerivedFromDeploymentUrl: true,
       internalWorkerDispatchEnabled: true,
     },
