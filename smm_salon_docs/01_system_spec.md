@@ -338,5 +338,4 @@ Worker endpoints защищены заголовком:
 1. код и тесты;
 2. этот system spec;
 3. bootstrap и env example;
-4. `memory_bank`;
-5. legacy/reference artifacts.
+4. legacy/reference artifacts.

@@ -20,10 +20,6 @@
   - `../src/`
   - `../api/`
   - `../tests/`
-- Operational memory:
-  - `../memory_bank/`
-  - этот каталог тоже должен быть актуальным, но он не должен конкурировать с этим README и system spec по runtime-утверждениям.
-
 ## Статус подпапок
 
 - `config/`:
@@ -49,7 +45,6 @@
 3. `03_roadmap_and_doc_governance.md`
 4. `config/.env.example`
 5. `../supabase/schema.sql`
-6. `../memory_bank/README.md`
 
 ## Active runtime summary
 

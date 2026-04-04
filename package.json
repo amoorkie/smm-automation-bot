@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "SMM Automation Bot for salon Telegram workflows.",
+  "description": "Telegram-бот для автоматизации SMM-потока салона красоты.",
   "scripts": {
     "start": "node ./src/index.mjs",
     "dev": "node ./src/index.mjs",

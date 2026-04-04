@@ -12,7 +12,5 @@ output/
 tmp/
 
 .vercel
-.serena/
-memory_bank/
 .tmp_topics.xlsx
 tmp_story_manifest_prompt.txt

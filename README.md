@@ -1,15 +1,40 @@
 # SMM Automation Bot
 
-Telegram bot for salon SMM automation.
+SMM Automation Bot - Telegram-бот для салона, который собирает контент-пайплайн в одном интерфейсе: от фото работы и темы поста до готового превью для публикации.
 
-The service helps a salon operator prepare preview-ready content inside Telegram:
-- `/work` for before/after work posts from 1 to 3 photos
-- `/topic` for expert post generation from a curated topic queue
-- `/stories` for vertical story previews
-- `/creative` for single-image promo concepts from curated ideas
-- `/slider` for multi-slide carousel previews
+Проект задуман как прикладной продукт для малого бьюти-бизнеса, где владелец или администратор работает прямо из Telegram и не тратит время на отдельную админку, ручную сборку карточек и постоянное переключение между сервисами.
 
-## Stack
+## Что решает продукт
+
+- сокращает путь от исходника до готового контента;
+- стандартизирует визуальную подачу работ, stories и каруселей;
+- даёт быстрый контент-поток из подготовленных очередей тем и идей;
+- удерживает оператора внутри Telegram-сценария без отдельного back office.
+
+## Основные сценарии
+
+- `/work` - подготовка поста по работе мастера из 1-3 фото;
+- `/topic` - экспертный пост по подготовленной теме;
+- `/stories` - вертикальные stories-превью;
+- `/creative` - промо-идея в формате одного визуала;
+- `/slider` - карусель из нескольких слайдов.
+
+## Как устроен продукт
+
+- Telegram используется как основной пользовательский интерфейс;
+- Supabase хранит очереди контента, runtime-состояние и служебные данные;
+- OpenRouter отвечает за текстовую и визуальную генерацию;
+- Vercel используется как runtime для webhook, worker-route и cron-задач;
+- `sharp`, `satori` и `resvg` собирают итоговые изображения и превью.
+
+## Почему это интересный кейс
+
+- продуктовый UX собран вокруг реального операционного сценария салона, а не вокруг абстрактной CMS;
+- `/work` сочетает пошаговый wizard, генерацию, превью и revision-controls в одном чате;
+- контентные режимы работают через очереди тем и идей, а не через хаотичные ручные запросы;
+- runtime адаптирован под serverless-ограничения Vercel и тяжёлые media-flow внутри Telegram.
+
+## Стек
 
 - Node.js ESM
 - Fastify
@@ -17,46 +42,46 @@ The service helps a salon operator prepare preview-ready content inside Telegram
 - Supabase
 - Vercel
 - OpenRouter
-- sharp + satori/resvg for image composition
+- sharp + satori/resvg
 
-## Project Structure
+## Структура репозитория
 
-- `src/` application runtime
-- `api/` Vercel handlers
-- `supabase/schema.sql` storage contract
-- `tests/` runtime and contract tests
-- `smm_salon_docs/` canonical product and runtime documentation
+- `src/` - runtime приложения и основная orchestration-логика;
+- `api/` - Vercel handlers для webhook, worker и health routes;
+- `supabase/schema.sql` - контракт таблиц и storage-структуры;
+- `tests/` - runtime, contract и docs-тесты;
+- `smm_salon_docs/` - каноническая документация по продукту и runtime.
 
-## Local Run
+## Быстрый запуск
 
-1. Copy env values from `smm_salon_docs/config/.env.example`.
-2. Install dependencies:
+1. Скопировать переменные окружения из `smm_salon_docs/config/.env.example`.
+2. Установить зависимости:
 
 ```bash
 npm install
 ```
 
-3. Start the app:
+3. Запустить локально:
 
 ```bash
 npm run dev
 ```
 
-## Validation
+## Проверка
 
 ```bash
 npm test
 ```
 
-## Deployment
+## Деплой
 
-The service is designed for Vercel. Runtime bootstrap, routes, and env contract are documented in:
+Проект рассчитан на Vercel. Актуальный runtime-контракт и bootstrap описаны в:
 
 - `smm_salon_docs/01_system_spec.md`
 - `smm_salon_docs/02_bot_service_bootstrap.md`
 
-## Notes
+## Важно
 
-- Source content tables are stored in Supabase.
-- Contact block and prompt overrides are managed through `prompt_templates`.
-- The bot is optimized around Telegram-first operator workflows rather than a separate admin UI.
+- продукт ориентирован на Telegram-first workflow;
+- основной источник бизнес-данных и очередей контента - Supabase;
+- prompt overrides и контактный блок управляются через `prompt_templates`.

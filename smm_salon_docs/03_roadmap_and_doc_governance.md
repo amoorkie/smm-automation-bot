@@ -6,9 +6,6 @@
 
 - `smm_salon_docs/`:
   - canonical runtime and product contract
-- `memory_bank/`:
-  - current operational memory
-  - decisions, progress, open items
 - `src/`, `api/`, `tests/`, `supabase/schema.sql`:
   - implementation truth
 - `schemas/`, `samples/`, `sheets_templates/`:
@@ -35,8 +32,7 @@
 
 1. исправить кодовую или тестовую правду, если проблема в реализации;
 2. затем синхронно обновить `smm_salon_docs/`;
-3. затем обновить `memory_bank/`;
-4. historical записи не переписывать, а supersede-ить новой записью.
+3. historical записи не переписывать, а supersede-ить новой записью.
 
 ### 1.4 Legacy policy
 
@@ -49,7 +45,6 @@
 - commands surface синхронизирован с кодом;
 - topic-like modes описаны как current product surface;
 - bootstrap приведен к реальным Supabase tables и routes;
-- `memory_bank` больше не должен конкурировать с runtime spec;
 - docs-contract tests покрывают минимальные инварианты синхронизации.
 
 ## 3. Near-term roadmap
@@ -84,6 +79,5 @@
 
 - `npm test` green;
 - core docs не расходятся с runtime commands, tables, routes и callback actions;
-- `memory_bank` не повторяет устаревший active contract;
 - legacy artifacts имеют явную маркировку;
 - новый инженер может начать с `README -> system spec -> bootstrap -> roadmap` без скрытых противоречий.

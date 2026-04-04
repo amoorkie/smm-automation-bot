@@ -151,17 +151,18 @@ test('core docs reflect the active command and action surface', async () => {
 });
 
 test('current docs no longer describe Google SQLite or old env tails as active runtime', async () => {
-  const projectContext = await readRepoFile('memory_bank', 'project_context.md');
-  const openItems = await readRepoFile('memory_bank', 'open_items.md');
+  const spec = await readRepoFile('smm_salon_docs', '01_system_spec.md');
+  const roadmap = await readRepoFile('smm_salon_docs', '03_roadmap_and_doc_governance.md');
+  const docsReadme = await readRepoFile('smm_salon_docs', 'README.md');
 
-  assert.doesNotMatch(projectContext, /Google Sheets store business data/u);
-  assert.doesNotMatch(projectContext, /Google Drive stores originals/u);
-  assert.doesNotMatch(projectContext, /SQLite stores runtime state/u);
-  assert.doesNotMatch(projectContext, /better-sqlite3/u);
-  assert.doesNotMatch(projectContext, /- `\/creative`$/mu);
+  for (const text of [spec, roadmap, docsReadme]) {
+    assert.doesNotMatch(text, /Google Sheets store business data/u);
+    assert.doesNotMatch(text, /Google Drive stores originals/u);
+    assert.doesNotMatch(text, /SQLite stores runtime state/u);
+    assert.doesNotMatch(text, /better-sqlite3/u);
+  }
 
-  assert.doesNotMatch(openItems, /MASTER_CONTACT_PHONE/u);
-  assert.doesNotMatch(openItems, /\/api\/cron\/deliver/u);
-  assert.match(openItems, /publish semantics/u);
-  assert.match(openItems, /story_topics/u);
+  assert.doesNotMatch(spec, /\/api\/cron\/deliver/u);
+  assert.match(roadmap, /publish/i);
+  assert.match(spec, /story_topics/u);
 });
