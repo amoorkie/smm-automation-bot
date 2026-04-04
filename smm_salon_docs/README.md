@@ -1,42 +1,38 @@
 # SMM Automation Bot Docs
 
-Этот каталог является каноническим source of truth для текущего runtime и продуктового контракта `SMM Automation Bot`.
+Этот каталог хранит публичную техническую документацию по продукту и текущему runtime-контракту `SMM Automation Bot`.
 
-## Роль каталога
+## Зачем нужен этот каталог
 
-- здесь лежит актуальный runtime/product contract;
-- здесь фиксируются env, storage, routes, flows и bootstrap;
-- любые изменения commands, env, tables, callbacks, routes и logging должны обновляться здесь в том же change set, что и код.
+- здесь зафиксированы продуктовые сценарии, env-контракт, storage и маршруты;
+- здесь лежит bootstrap для запуска и деплоя;
+- изменения runtime surface должны обновляться здесь в том же change set, что и код.
 
-## Что считать истиной
+## Что считать источником истины
 
-- Канонический runtime contract:
+- Основной runtime contract:
   - `01_system_spec.md`
   - `02_bot_service_bootstrap.md`
   - `03_roadmap_and_doc_governance.md`
   - `config/.env.example`
   - `../supabase/schema.sql`
-- Каноническая реализация:
+- Реализация:
   - `../src/`
   - `../api/`
   - `../tests/`
+
 ## Статус подпапок
 
 - `config/`:
-  - current
-  - входной env contract для runtime
+  - актуальный env contract для runtime.
 - `prompts/`:
-  - current
-  - prompt registry и prompt references для topic-like режимов
+  - актуальные prompt references и registry для продуктовых режимов.
 - `samples/`:
-  - current, но reference-only
-  - sample seeds и headers для import/bootstrap
+  - reference-only примеры seed-файлов и заголовков.
 - `schemas/`:
-  - mixed
-  - часть файлов является reference schema, а не authoritative runtime validation; см. `schemas/README.md`
+  - mixed; часть файлов является reference schema, а не authoritative runtime validation.
 - `sheets_templates/`:
-  - current as import/reference templates
-  - authoritative column contract все равно задается кодом и `supabase/schema.sql`; см. `sheets_templates/README.md`
+  - import/reference templates; реальный колонночный контракт задаётся кодом и `supabase/schema.sql`.
 
 ## Рекомендуемый порядок чтения
 
@@ -46,7 +42,7 @@
 4. `config/.env.example`
 5. `../supabase/schema.sql`
 
-## Active runtime summary
+## Краткое summary по runtime
 
 - Hosting: Vercel
 - User interface: Telegram
@@ -54,19 +50,19 @@
 - AI provider: OpenRouter
 - Local server: Fastify
 - Bot framework: grammy
-- Operational logs:
+- Logs:
   - primary sink: structured JSON lines in stdout/stderr
-  - secondary durable sink: `bot_logs` table in Supabase
+  - secondary durable sink: `bot_logs` in Supabase
 
-## Update rule
+## Правило обновления
 
-Если меняется что-то из списка ниже, этот каталог обязан обновиться в том же PR/change set:
+Если меняется что-то из списка ниже, документация в этом каталоге должна обновляться в том же change set:
 
-- commands
-- `/work` UX
-- topic-like modes
-- callback actions
-- env contract
-- Supabase tables / columns
-- Fastify or Vercel routes
-- logging contract
+- commands;
+- `/work` UX;
+- topic-like modes;
+- callback actions;
+- env contract;
+- Supabase tables / columns;
+- Fastify or Vercel routes;
+- logging contract.
