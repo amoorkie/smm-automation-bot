@@ -69,7 +69,7 @@ export function loadEnv(source = process.env) {
     ownerChatId: parseNullableChatId(source.OWNER_CHAT_ID),
     botDisabled: parseBoolean(source.BOT_DISABLED, false),
     internalWorkerDispatchEnabled: parseBoolean(source.INTERNAL_WORKER_DISPATCH_ENABLED, false),
-    topicSourceStatusMutationsEnabled: parseBoolean(source.TOPIC_SOURCE_STATUS_MUTATIONS_ENABLED, false),
+    topicSourceStatusMutationsEnabled: parseBoolean(source.TOPIC_SOURCE_STATUS_MUTATIONS_ENABLED, true),
   };
 }
 

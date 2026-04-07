@@ -2899,6 +2899,93 @@ test('publish_confirm marks source row as published', async () => {
   assert.equal((await ctx.store.getRows(TABLE_NAMES.contentQueue))[0].status, 'published');
 });
 
+test('published slider topic is excluded from the picker on the next open', async () => {
+  const ctx = createService({
+    initialTables: {
+      [TABLE_NAMES.sliderTopics]: [
+        {
+          topic_id: 'SL-PUBLISHED',
+          title: 'Тема, которую подтвердили',
+          brief: 'Проверка исключения опубликованной темы из picker.',
+          tags: 'slider,published',
+          priority: '1',
+          status: 'ready',
+          reserved_by: '',
+          reserved_at: '',
+          reservation_expires_at: '',
+          last_job_id: '',
+          last_published_at: '',
+          notes: '',
+        },
+        {
+          topic_id: 'SL-READY',
+          title: 'Тема, которая должна остаться',
+          brief: 'Проверка следующего открытия picker.',
+          tags: 'slider,ready',
+          priority: '2',
+          status: 'ready',
+          reserved_by: '',
+          reserved_at: '',
+          reservation_expires_at: '',
+          last_job_id: '',
+          last_published_at: '',
+          notes: '',
+        },
+      ],
+    },
+  });
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 610,
+    message: { message_id: 610, text: '/slider', chat: { id: 610 }, from: { id: 610 } },
+  });
+  const pickToken = await pickCallbackTokenByPrefix(ctx, 'pick_source_');
+  assert.ok(pickToken);
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 611,
+    callback_query: {
+      id: 'cb-slider-published-pick',
+      data: `pick_source_0_0:${pickToken}`,
+      from: { id: 610 },
+      message: { message_id: 610, chat: { id: 610 } },
+    },
+  });
+
+  const runtime = await ctx.repos.getRuntime((await ctx.store.getRows(TABLE_NAMES.contentQueue))[0].job_id);
+  const publishToken = await pickCallbackToken(ctx, 'publish_confirm');
+  assert.ok(publishToken);
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 612,
+    callback_query: {
+      id: 'cb-slider-published-confirm',
+      data: `publish_confirm:${publishToken}`,
+      from: { id: 610 },
+      message: { message_id: runtime.text_message_id ?? runtime.collage_message_id, chat: { id: 610 } },
+    },
+  });
+
+  const rows = await ctx.store.getRows(TABLE_NAMES.sliderTopics);
+  assert.equal(rows.find((row) => row.topic_id === 'SL-PUBLISHED')?.status, 'published');
+  assert.equal(rows.find((row) => row.topic_id === 'SL-READY')?.status, 'ready');
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 613,
+    message: { message_id: 613, text: '/slider', chat: { id: 610 }, from: { id: 610 } },
+  });
+
+  const latestPicker = [...ctx.bot.sent]
+    .reverse()
+    .find((item) => item.type === 'message' || item.type === 'edit_message_text');
+  assert.ok(latestPicker);
+  const pickerLabels = (latestPicker.extra?.reply_markup?.inline_keyboard ?? [])
+    .flat()
+    .map((button) => String(button?.text ?? ''));
+  assert.ok(pickerLabels.some((label) => label.includes('Тема, которая должна остаться')));
+  assert.ok(!pickerLabels.some((label) => label.includes('Тема, которую подтвердили')));
+});
+
 test('topic-like modes do not mutate source rows in QA mode after pick, regenerate, cancel, and publish', async () => {
   const modes = [
     { command: '/topic', table: TABLE_NAMES.expertTopics, topicId: 'TP-QA', title: 'Проверка /topic' },
