@@ -2839,6 +2839,8 @@ export class SalonBotService {
         return this.openTopicLikePicker(normalized, 'topic');
       case '/stories':
         return this.openTopicLikePicker(normalized, 'stories');
+      case '/creative':
+        return this.openTopicLikePicker(normalized, 'creative');
       case '/slider':
         return this.openTopicLikePicker(normalized, 'slider');
       default:
