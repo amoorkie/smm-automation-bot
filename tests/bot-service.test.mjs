@@ -2504,6 +2504,66 @@ test('stories and slider modes create expected preview shapes', async () => {
   }
 });
 
+test('slider retries visual generation once with a compact prompt when the provider returns no images', async () => {
+  const ctx = createService({
+    initialTables: {
+      [TABLE_NAMES.sliderTopics]: [{
+        topic_id: 'SL-RETRY',
+        title: 'Проверка ретрая слайдера',
+        brief: 'Проверка compact prompt retry для visual generation.',
+        tags: 'slider,retry',
+        priority: '1',
+        status: 'ready',
+        reserved_by: '',
+        reserved_at: '',
+        reservation_expires_at: '',
+        last_job_id: '',
+        last_published_at: '',
+        notes: '',
+      }],
+    },
+  });
+
+  let imageAttempts = 0;
+  const fallbackImage = await sharp({
+    create: {
+      width: 1080,
+      height: 1920,
+      channels: 3,
+      background: '#b7926f',
+    },
+  }).jpeg().toBuffer();
+  ctx.openrouter.generateImages = async (payload) => {
+    imageAttempts += 1;
+    if (imageAttempts === 1) {
+      const error = new Error('openrouter returned no images');
+      error.name = 'ProviderEmptyResultError';
+      throw error;
+    }
+    return { images: [`data:image/jpeg;base64,${fallbackImage.toString('base64')}`] };
+  };
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 1450,
+    message: { message_id: 1450, text: '/slider', chat: { id: 1450 }, from: { id: 45 } },
+  });
+  const pickToken = await pickCallbackTokenByPrefix(ctx, 'pick_source_');
+  assert.ok(pickToken);
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 1451,
+    callback_query: {
+      id: 'cb-slider-visual-retry',
+      data: `pick_source_0_0:${pickToken}`,
+      from: { id: 45 },
+      message: { message_id: 1450, chat: { id: 1450 } },
+    },
+  });
+
+  assert.equal(imageAttempts, 2);
+  assert.ok(ctx.bot.sent.some((item) => item.type === 'media_group'));
+});
+
 test('slider fallback renders dense practical slides for basic home care', async () => {
   const ctx = createService({
     initialTables: {

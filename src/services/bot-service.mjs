@@ -470,6 +470,10 @@ export class SalonBotService {
   }
 
   isRecoverableWorkImageProviderFailure(error) {
+    return this.isRecoverableImageProviderFailure(error);
+  }
+
+  isRecoverableImageProviderFailure(error) {
     if (!error) {
       return false;
     }
@@ -3447,18 +3451,59 @@ export class SalonBotService {
       `Tags: ${Array.isArray(sourceRow.tags) ? sourceRow.tags.join(', ') : sourceRow.tags ?? ''}`,
       `Manifest summary: ${visualSummary}`,
     ].join('\n');
-
-    const imageResult = await this.openrouter.generateImages({
-      prompt: visualPrompt,
-      imageConfig: { aspect_ratio: '9:16' },
-      metadata: {
-        source_type: jobType,
-        topic_id: sourceRow.topic_id,
-        job_id: jobId,
-        revision,
-        model: this.env.imageModelId,
-      },
-    });
+    const compactVisualPrompt = [
+      prompts[config.promptKeys.visual],
+      `Title: ${sourceRow.title ?? ''}`,
+      `Tags: ${Array.isArray(sourceRow.tags) ? sourceRow.tags.join(', ') : sourceRow.tags ?? ''}`,
+      'Return one clean 9:16 background image only.',
+      'No text, no collage, no grid, no poster layout.',
+    ].join('\n');
+    const imageMetadata = {
+      source_type: jobType,
+      topic_id: sourceRow.topic_id,
+      job_id: jobId,
+      revision,
+      model: this.env.imageModelId,
+    };
+    let imageResult;
+    try {
+      imageResult = await this.openrouter.generateImages({
+        prompt: visualPrompt,
+        imageConfig: { aspect_ratio: '9:16' },
+        metadata: imageMetadata,
+      });
+    } catch (error) {
+      if (!this.isRecoverableImageProviderFailure(error)) {
+        throw error;
+      }
+      this.logEventBestEffort({
+        event: 'topic_like_visual_retry_started',
+        stage: 'processing',
+        chatId: sourceRow.chat_id ?? '',
+        userId: sourceRow.user_id ?? '',
+        jobId,
+        sourceType: jobType,
+        status: 'retrying',
+        message: error?.message ?? sourceRow.title ?? '',
+        payload: { retryMode: 'compact_prompt', revision },
+      });
+      imageResult = await this.openrouter.generateImages({
+        prompt: compactVisualPrompt,
+        imageConfig: { aspect_ratio: '9:16' },
+        metadata: { ...imageMetadata, retry_mode: 'compact_prompt' },
+      });
+      this.logEventBestEffort({
+        event: 'topic_like_visual_retry_succeeded',
+        stage: 'processing',
+        chatId: sourceRow.chat_id ?? '',
+        userId: sourceRow.user_id ?? '',
+        jobId,
+        sourceType: jobType,
+        status: 'ok',
+        message: sourceRow.title ?? '',
+        payload: { retryMode: 'compact_prompt', revision },
+      });
+    }
       const backgroundSource = imageResult.images[0];
       const backgroundAsset = backgroundSource ? await this.resolveRemoteImage(backgroundSource) : null;
       const backgroundStyle = this.pickStoryBackgroundStyle(`${jobType}|${sourceRow.title}|${revision}`);
