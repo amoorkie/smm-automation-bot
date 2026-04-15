@@ -3775,13 +3775,39 @@ test('work caption prompt keeps focus on client result and avoids repetitive mas
   const ctx = createService();
 
   const hairPrompt = ctx.service.buildWorkCaptionUserPrompt(1, { subjectType: 'hair' });
-  const browPrompt = ctx.service.buildWorkCaptionUserPrompt(1, { subjectType: 'brows', browOutputMode: 'after_only' });
+  const browPrompt = ctx.service.buildWorkCaptionUserPrompt(1, {
+    subjectType: 'brows',
+    browOutputMode: 'after_only',
+    revision: 2,
+    variationSeed: 'JOB-BROW-V2',
+  });
 
   assert.match(hairPrompt, /результате для клиента/u);
   assert.match(browPrompt, /результате для клиента/u);
   assert.match(hairPrompt, /Не повторяй формулировки вроде "люблю"/u);
   assert.match(browPrompt, /Не повторяй формулировки вроде "люблю"/u);
   assert.match(hairPrompt, /иногда достаточно 2 коротких строк/u);
+  assert.match(browPrompt, /Не начинай текст|Начни с результата|Сделай первый заход/u);
+  assert.match(browPrompt, /Это новая версия текста для той же работы/u);
+});
+
+test('brow fallback caption uses deterministic variation instead of one fixed template', () => {
+  const ctx = createService();
+
+  const first = ctx.service.buildFallbackWorkCaption(1, {
+    subjectType: 'brows',
+    browOutputMode: 'after_only',
+    variationSeed: 'JOB-BROW-1',
+  });
+  const second = ctx.service.buildFallbackWorkCaption(1, {
+    subjectType: 'brows',
+    browOutputMode: 'after_only',
+    variationSeed: 'JOB-BROW-2',
+  });
+
+  assert.notEqual(first, second);
+  assert.match(first, /бров/u);
+  assert.match(second, /бров/u);
 });
 
 test('bot logger writes structured rows into bot_logs', async () => {

@@ -220,6 +220,17 @@ function toStoredText(value) {
   return String(value);
 }
 
+function selectDeterministicVariant(options, seed) {
+  const items = Array.isArray(options) ? options.filter(Boolean) : [];
+  if (items.length === 0) {
+    return '';
+  }
+  const token = stableId('VAR', String(seed ?? ''));
+  const hashPart = token.split('-').pop() ?? '00';
+  const index = Number.parseInt(hashPart.slice(-2), 16) % items.length;
+  return items[index];
+}
+
 const PINNED_WORK_TEXT_MODEL_ID = 'openai/gpt-5.4';
 const MODEL_IMAGE_MAX_DIMENSION = 1280;
 const MODEL_IMAGE_JPEG_QUALITY = 82;
@@ -306,17 +317,67 @@ export class SalonBotService {
     return '';
   }
 
-  buildFallbackWorkCaption(sourceAssetCount = 1, { subjectType = 'hair', browOutputMode = 'after_only' } = {}) {
+  buildFallbackWorkCaption(
+    sourceAssetCount = 1,
+    {
+      subjectType = 'hair',
+      browOutputMode = 'after_only',
+      variationSeed = '',
+    } = {},
+  ) {
     if (subjectType === 'brows') {
+      const seed = `${variationSeed}:${browOutputMode}:${sourceAssetCount}`;
       if (browOutputMode === 'before_after') {
-        return 'Показываю брови до и после ✨\nФорму и насыщенность вывела аккуратно, чтобы результат выглядел чисто, ровно и естественно.';
+        return selectDeterministicVariant([
+          'Показываю брови до и после ✨\nАккуратно вывела форму и насыщенность, чтобы результат выглядел чище, ровнее и естественнее.',
+          'Здесь хорошо читается разница до и после ✨\nФорму собрала аккуратно, чтобы взгляд выглядел мягче и опрятнее.',
+          'Собрала брови до и после в один результат ✨\nРазница заметна по форме и общему впечатлению: всё стало чище и спокойнее.',
+          'Показываю, как меняется бровь до и после ✨\nФорма стала ровнее и аккуратнее, но при этом осталась естественной.',
+        ], seed);
       }
-      return 'Показываю готовый результат по бровям ✨\nСделала форму чище и аккуратнее, чтобы взгляд смотрелся мягко и собранно.';
+      return selectDeterministicVariant([
+        'Показываю готовый результат по бровям ✨\nСделала форму чище и аккуратнее, чтобы взгляд смотрелся мягко и собранно.',
+        'Вот такой получился итог по бровям ✨\nФорма стала ровнее, а общий взгляд выглядит спокойнее и аккуратнее.',
+        'Готовый результат по бровям ✨\nПодчистила форму и насыщенность так, чтобы всё выглядело естественно и собрано.',
+        'Показываю брови после работы ✨\nСделала результат чище по форме и мягче по общему впечатлению.',
+      ], seed);
     }
     if (Number(sourceAssetCount) > 1) {
       return 'Показываю работу с нескольких ракурсов ✨\nФорма и силуэт читаются чище, а волосы выглядят аккуратно и собранно.';
     }
     return 'Аккуратная работа с формой и текстурой ✨\nСделала образ чище и выразительнее, чтобы волосы выглядели ухоженно и легко читались в кадре.';
+  }
+
+  buildBrowCaptionVariationGuidance({
+    sourceAssetCount = 1,
+    browOutputMode = 'after_only',
+    revision = null,
+    variationSeed = '',
+  } = {}) {
+    const focus = selectDeterministicVariant([
+      'Сделай акцент на том, что взгляд стал аккуратнее и собраннее.',
+      'Сделай акцент на чистой форме и спокойном естественном результате.',
+      'Сделай акцент на мягкости результата без тяжёлой или жёсткой подачи.',
+      'Сделай акцент на том, как брови собирают общий образ клиента.',
+      'Сделай акцент на ровности формы и аккуратном визуальном впечатлении.',
+    ], `${variationSeed}:focus:${browOutputMode}:${sourceAssetCount}`);
+    const opening = selectDeterministicVariant([
+      'Не начинай текст со слов "Показываю" или "Вот такой результат".',
+      'Начни с результата или впечатления, а не с технического объявления работы.',
+      'Сделай первый заход через ощущение от результата, а не через перечисление действий мастера.',
+      'Начни текст не с услуги, а с того, как теперь выглядит взгляд или форма.',
+    ], `${variationSeed}:opening:${browOutputMode}:${sourceAssetCount}`);
+    const rhythm = selectDeterministicVariant([
+      'Сделай ритм фраз спокойным и разговорным, без одинаковых конструкций.',
+      'Собери текст коротко, но не шаблонно: другая лексика и другой заход обязательны.',
+      'Избегай одинакового ритма и повторяющихся формулировок между версиями.',
+      'Сформулируй текст заметно иначе по лексике и структуре, даже если смысл близкий.',
+    ], `${variationSeed}:rhythm:${browOutputMode}:${sourceAssetCount}`);
+    const revisionRule = Number(revision) > 1
+      ? 'Это новая версия текста для той же работы. Сформулируй заметно иначе предыдущей версии: другой первый заход, другой словарь и другой акцент без потери смысла.'
+      : 'Даже в первой версии избегай универсального шаблона, который одинаково подходит к любой работе по бровям.';
+
+    return [focus, opening, rhythm, revisionRule].join('\n');
   }
 
   async generateWorkCaptionText({
@@ -338,7 +399,12 @@ export class SalonBotService {
         systemPrompt: subjectType === 'brows'
           ? (prompts.work_brow_caption_generation ?? DEFAULT_PROMPTS.work_brow_caption_generation)
           : (prompts.work_caption_generation ?? DEFAULT_PROMPTS.work_caption_generation),
-        userPrompt: this.buildWorkCaptionUserPrompt(sourceAssetCount, { subjectType, browOutputMode }),
+        userPrompt: this.buildWorkCaptionUserPrompt(sourceAssetCount, {
+          subjectType,
+          browOutputMode,
+          revision,
+          variationSeed: `${jobId}:${collectionId}:${queueId}:${renderMode}`,
+        }),
         imageUrls,
         temperature: 0.9,
         maxTokens: 220,
@@ -385,7 +451,11 @@ export class SalonBotService {
       });
       return {
         text: this.formatCaptionWithContact(
-          this.buildFallbackWorkCaption(sourceAssetCount, { subjectType, browOutputMode }),
+          this.buildFallbackWorkCaption(sourceAssetCount, {
+            subjectType,
+            browOutputMode,
+            variationSeed: `${jobId}:${collectionId}:${queueId}:${renderMode}:${revision}`,
+          }),
           prompts.contact_block,
         ),
         fallback: true,
@@ -397,7 +467,15 @@ export class SalonBotService {
     return appendTopicOutro(text, contactBlock);
   }
 
-  buildWorkCaptionUserPrompt(assetCount, { subjectType = 'hair', browOutputMode = 'after_only' } = {}) {
+  buildWorkCaptionUserPrompt(
+    assetCount,
+    {
+      subjectType = 'hair',
+      browOutputMode = 'after_only',
+      revision = null,
+      variationSeed = '',
+    } = {},
+  ) {
     if (subjectType === 'brows') {
       return [
         `Сделай готовый короткий пост к работе мастера по бровям. Количество фото: ${assetCount}.`,
@@ -411,6 +489,12 @@ export class SalonBotService {
         'Главный акцент делай на результате для клиента, а не на предпочтениях мастера.',
         'Не повторяй формулировки вроде "люблю", "обожаю", "именно так я люблю" и похожие обороты. Такие фразы допустимы редко и только если действительно к месту.',
         'Добавь живую человеческую подачу без канцелярита.',
+        this.buildBrowCaptionVariationGuidance({
+          sourceAssetCount: assetCount,
+          browOutputMode,
+          revision,
+          variationSeed,
+        }),
         'Контактный блок добавлять не нужно.',
       ].join('\n');
     }
