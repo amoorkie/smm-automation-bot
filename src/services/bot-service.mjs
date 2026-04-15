@@ -380,6 +380,29 @@ export class SalonBotService {
     return [focus, opening, rhythm, revisionRule].join('\n');
   }
 
+  buildBrowCaptionSystemPrompt(
+    basePrompt,
+    {
+      sourceAssetCount = 1,
+      browOutputMode = 'after_only',
+      revision = null,
+      variationSeed = '',
+    } = {},
+  ) {
+    return [
+      String(basePrompt ?? '').trim(),
+      'Обязательное правило: не своди разные работы по бровям к одному и тому же шаблону.',
+      'Меняй первый заход, лексику, ритм и угол подачи между похожими работами.',
+      'Не начинай каждый текст одинаково и не повторяй типовые фразы про "аккуратную форму" в одной и той же конструкции.',
+      this.buildBrowCaptionVariationGuidance({
+        sourceAssetCount,
+        browOutputMode,
+        revision,
+        variationSeed,
+      }),
+    ].filter(Boolean).join('\n');
+  }
+
   async generateWorkCaptionText({
     prompts,
     sourceAssetCount = 1,
@@ -395,15 +418,24 @@ export class SalonBotService {
     collectionId = '',
   }) {
     try {
+      const variationSeed = `${jobId}:${collectionId}:${queueId}:${renderMode}`;
       const result = await this.openrouter.generateText({
         systemPrompt: subjectType === 'brows'
-          ? (prompts.work_brow_caption_generation ?? DEFAULT_PROMPTS.work_brow_caption_generation)
+          ? this.buildBrowCaptionSystemPrompt(
+            prompts.work_brow_caption_generation ?? DEFAULT_PROMPTS.work_brow_caption_generation,
+            {
+              sourceAssetCount,
+              browOutputMode,
+              revision,
+              variationSeed,
+            },
+          )
           : (prompts.work_caption_generation ?? DEFAULT_PROMPTS.work_caption_generation),
         userPrompt: this.buildWorkCaptionUserPrompt(sourceAssetCount, {
           subjectType,
           browOutputMode,
           revision,
-          variationSeed: `${jobId}:${collectionId}:${queueId}:${renderMode}`,
+          variationSeed,
         }),
         imageUrls,
         temperature: 0.9,

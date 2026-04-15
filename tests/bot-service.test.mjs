@@ -3810,6 +3810,37 @@ test('brow fallback caption uses deterministic variation instead of one fixed te
   assert.match(second, /бров/u);
 });
 
+test('brow caption system prompt keeps mandatory anti-template rules even with prompt override', async () => {
+  const ctx = createService();
+  let capturedPayload = null;
+  ctx.openrouter.generateText = async (payload) => {
+    capturedPayload = payload;
+    return { text: 'Тестовый текст' };
+  };
+
+  await ctx.service.generateWorkCaptionText({
+    prompts: {
+      ...ctx.prompts,
+      work_brow_caption_generation: 'Кастомный brow prompt из хранилища.',
+    },
+    sourceAssetCount: 1,
+    imageUrls: ['https://example.com/brow.jpg'],
+    subjectType: 'brows',
+    browOutputMode: 'after_only',
+    jobId: 'JOB-BROW-SYSTEM',
+    revision: 2,
+    renderMode: 'separate',
+    chatId: 55,
+    userId: 77,
+    queueId: 'QUE-BROW-SYSTEM',
+    collectionId: 'COL-BROW-SYSTEM',
+  });
+
+  assert.match(capturedPayload.systemPrompt, /Кастомный brow prompt из хранилища/u);
+  assert.match(capturedPayload.systemPrompt, /не своди разные работы по бровям к одному и тому же шаблону/u);
+  assert.match(capturedPayload.systemPrompt, /Это новая версия текста для той же работы/u);
+});
+
 test('bot logger writes structured rows into bot_logs', async () => {
   const store = new FakeStore();
   const logger = new BotLogger({ store });
