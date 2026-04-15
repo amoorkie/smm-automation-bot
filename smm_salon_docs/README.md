@@ -13,9 +13,10 @@
 - Основной runtime contract:
   - `01_system_spec.md`
   - `02_bot_service_bootstrap.md`
-  - `03_roadmap_and_doc_governance.md`
-  - `config/.env.example`
-  - `../supabase/schema.sql`
+- `03_roadmap_and_doc_governance.md`
+- `04_folder_queue_automation.md`
+- `config/.env.example`
+- `../supabase/schema.sql`
 - Реализация:
   - `../src/`
   - `../api/`
@@ -39,8 +40,9 @@
 1. `01_system_spec.md`
 2. `02_bot_service_bootstrap.md`
 3. `03_roadmap_and_doc_governance.md`
-4. `config/.env.example`
-5. `../supabase/schema.sql`
+4. `04_folder_queue_automation.md`
+5. `config/.env.example`
+6. `../supabase/schema.sql`
 
 ## Краткое summary по runtime
 

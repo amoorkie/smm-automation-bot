@@ -9,7 +9,9 @@
     "dev": "node ./src/index.mjs",
     "test": "node --test \"tests/*.test.mjs\"",
     "check": "node --test \"tests/*.test.mjs\"",
-    "sync:creative-ideas": "node ./scripts/sync-creative-ideas.mjs"
+    "sync:creative-ideas": "node ./scripts/sync-creative-ideas.mjs",
+    "folder:queue": "node ./scripts/process-folder-queue.mjs",
+    "folder:queue:test-task": "powershell -ExecutionPolicy Bypass -File ./scripts/register-folder-queue-test-task.ps1"
   },
   "dependencies": {
     "@resvg/resvg-js": "^2.6.2",

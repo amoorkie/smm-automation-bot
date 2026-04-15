@@ -71,6 +71,18 @@ npm run dev
 npm test
 ```
 
+## Локальная automation для фото
+
+В репозитории есть MVP локальной файловой очереди для фото работ. Он рассчитан на Windows-папки вроде `В обработку / В работе / Новое / Обработано`, использует тот же image+caption pipeline, что и основной бот, и может запускаться по расписанию через `Task Scheduler`.
+
+Для тестового прогона на `+5 минут`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\register-folder-queue-test-task.ps1 -RootDir "C:\Users\amoor\Desktop\PHOTO\Анита" -DelayMinutes 5
+```
+
+Подробности и маршрут rollback описаны в `smm_salon_docs/04_folder_queue_automation.md`.
+
 ## Деплой
 
 Проект рассчитан на запуск в Vercel. Основные runtime-правила и bootstrap-описание лежат в `smm_salon_docs/`.
