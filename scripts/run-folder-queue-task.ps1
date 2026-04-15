@@ -4,7 +4,8 @@ param(
   [switch]$TestMode = $true,
   [switch]$Rollback = $true,
   [int]$RollbackDelaySeconds = 120,
-  [string]$BackgroundMode = 'keep'
+  [string]$BackgroundMode = 'neutral',
+  [string]$PhotoType = 'studio'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -27,7 +28,9 @@ $arguments = @(
   '--root',
   $resolvedRootDir,
   '--background',
-  $BackgroundMode
+  $BackgroundMode,
+  '--photo-type',
+  $PhotoType
 )
 
 if ($TestMode) {

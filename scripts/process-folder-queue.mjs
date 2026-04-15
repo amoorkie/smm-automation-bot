@@ -6,6 +6,7 @@ import {
   buildFolderQueueGeneratedName,
   buildFolderQueueTestName,
   detectFolderQueueSubjectType,
+  FOLDER_QUEUE_CATEGORIES,
   FOLDER_QUEUE_STATE_DIRS,
   isSupportedFolderQueueImage,
 } from '../src/folder-queue.mjs';
@@ -23,7 +24,8 @@ function parseArgs(argv = []) {
     chatId: '',
     mode: 'test',
     marker: 'TEST',
-    backgroundMode: 'keep',
+    backgroundMode: '',
+    photoType: 'studio',
     rollbackDelaySeconds: 120,
   };
 
@@ -55,6 +57,11 @@ function parseArgs(argv = []) {
       index += 1;
       continue;
     }
+    if (token === '--photo-type' && value) {
+      options.photoType = value;
+      index += 1;
+      continue;
+    }
     if (token === '--rollback-delay-sec' && value) {
       options.rollbackDelaySeconds = Number.parseInt(value, 10);
       index += 1;
@@ -67,14 +74,21 @@ function parseArgs(argv = []) {
   if (!['test', 'live'].includes(String(options.mode))) {
     throw new Error(`Unsupported --mode value: ${options.mode}`);
   }
-  if (!['keep', 'neutral', 'blur'].includes(String(options.backgroundMode))) {
-    throw new Error(`Unsupported --background value: ${options.backgroundMode}`);
+  if (!['studio', 'normal'].includes(String(options.photoType))) {
+    throw new Error(`Unsupported --photo-type value: ${options.photoType}`);
+  }
+  const effectiveBackgroundMode = options.backgroundMode || (options.photoType === 'studio' ? 'neutral' : 'keep');
+  if (!['keep', 'neutral', 'blur'].includes(String(effectiveBackgroundMode))) {
+    throw new Error(`Unsupported --background value: ${effectiveBackgroundMode}`);
   }
   if (!Number.isInteger(options.rollbackDelaySeconds) || options.rollbackDelaySeconds < 0) {
     throw new Error(`Invalid --rollback-delay-sec value: ${options.rollbackDelaySeconds}`);
   }
 
-  return options;
+  return {
+    ...options,
+    backgroundMode: effectiveBackgroundMode,
+  };
 }
 
 function sleep(ms) {
@@ -96,6 +110,16 @@ async function fileExists(targetPath) {
 
 async function ensureDirectory(targetPath) {
   await fs.mkdir(targetPath, { recursive: true });
+}
+
+async function ensureFolderQueueStructure(rootDir) {
+  for (const stageDir of Object.values(FOLDER_QUEUE_STATE_DIRS)) {
+    const stageRoot = path.join(rootDir, stageDir);
+    await ensureDirectory(stageRoot);
+    for (const category of FOLDER_QUEUE_CATEGORIES) {
+      await ensureDirectory(path.join(stageRoot, category));
+    }
+  }
 }
 
 async function listFolderCandidates(rootDir) {
@@ -203,6 +227,8 @@ async function rollbackTestArtifacts({
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  await ensureFolderQueueStructure(args.rootDir);
+
   const context = await createRuntimeContext();
   const chatId = args.chatId || context.env.ownerChatId;
   if (!chatId) {
@@ -216,6 +242,8 @@ async function main() {
       status: 'empty',
       rootDir: args.rootDir,
       mode: args.mode,
+      photoType: args.photoType,
+      backgroundMode: args.backgroundMode,
     });
     await context.service.sendMessage(chatId, `Folder queue пуста.\nОтчёт: ${reportPath}`);
     return;
@@ -224,10 +252,10 @@ async function main() {
   const candidate = candidates[0];
   const subjectType = detectFolderQueueSubjectType(candidate.categoryPath);
   const inProgressName = args.mode === 'test'
-    ? buildFolderQueueTestName(candidate.fileName, args.marker)
+    ? buildFolderQueueTestName(candidate.fileName, { photoType: args.photoType })
     : candidate.fileName;
   const generatedName = args.mode === 'test'
-    ? buildFolderQueueGeneratedName(candidate.fileName, args.marker)
+    ? buildFolderQueueGeneratedName(candidate.fileName, { photoType: args.photoType })
     : candidate.fileName;
 
   const inProgressRoot = buildStatePath(args.rootDir, FOLDER_QUEUE_STATE_DIRS.inProgress, candidate.categoryPath);
@@ -257,6 +285,8 @@ async function main() {
     marker: args.marker,
     category: candidate.categoryPath,
     subjectType,
+    photoType: args.photoType,
+    backgroundMode: args.backgroundMode,
     sourceFileName: candidate.fileName,
     sourcePath: originalIncomingPath,
     inProgressPath,
@@ -274,7 +304,9 @@ async function main() {
         `Файл: ${candidate.fileName}`,
         `Категория: ${candidate.categoryPath || 'без категории'}`,
         `Режим: ${args.mode}`,
-        `Маршрут: "В обработку" -> "В работе"`,
+        `Тип фото: ${args.photoType}`,
+        `Background mode: ${args.backgroundMode}`,
+        'Маршрут: "В обработку" -> "В работе"',
       ].join('\n'),
     );
 
@@ -350,7 +382,7 @@ async function main() {
         `${args.marker} готовый результат.`,
         `Категория: ${candidate.categoryPath || 'без категории'}`,
         `Файл: ${generatedName}`,
-        `Маршрут: "В работе" -> "Обработано", результат -> "Новое"`,
+        'Маршрут: "В работе" -> "Обработано", результат -> "Новое"',
       ].join('\n'),
     );
 

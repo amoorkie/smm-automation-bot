@@ -3,7 +3,8 @@ param(
   [string]$RootDir = '',
   [int]$DelayMinutes = 5,
   [int]$RollbackDelaySeconds = 120,
-  [string]$BackgroundMode = 'keep'
+  [string]$BackgroundMode = 'neutral',
+  [string]$PhotoType = 'studio'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -19,8 +20,8 @@ $resolvedRootDir = if ($RootDir) {
   throw 'RootDir is required.'
 }
 $runAt = (Get-Date).AddMinutes($DelayMinutes)
-$taskCommand = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`" -RootDir `"$resolvedRootDir`" -TestMode -Rollback -RollbackDelaySeconds $RollbackDelaySeconds -BackgroundMode $BackgroundMode"
-$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`" -RootDir `"$resolvedRootDir`" -TestMode -Rollback -RollbackDelaySeconds $RollbackDelaySeconds -BackgroundMode $BackgroundMode"
+$taskCommand = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`" -RootDir `"$resolvedRootDir`" -TestMode -Rollback -RollbackDelaySeconds $RollbackDelaySeconds -BackgroundMode $BackgroundMode -PhotoType $PhotoType"
+$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`" -RootDir `"$resolvedRootDir`" -TestMode -Rollback -RollbackDelaySeconds $RollbackDelaySeconds -BackgroundMode $BackgroundMode -PhotoType $PhotoType"
 $trigger = New-ScheduledTaskTrigger -Once -At $runAt
 
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Force | Out-Null
