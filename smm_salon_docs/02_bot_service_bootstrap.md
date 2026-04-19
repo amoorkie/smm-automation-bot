@@ -77,6 +77,14 @@ Reference seed лежит в [prompt_config_seed_sample.csv](/A:/ANITA-BOT/smm_s
 - `INTERNAL_WORKER_DISPATCH_ENABLED`
 - `TOPIC_SOURCE_STATUS_MUTATIONS_ENABLED`
 - `WEBHOOK_BASE_URL`
+- `VK_ACCESS_TOKEN`
+- `VK_COMMUNITY_ACCESS_TOKEN`
+- `VK_GROUP_ID`
+- `VK_PUBLISH_ENABLED`
+- `VK_CLIENT_ID`
+- `VK_CLIENT_SECRET`
+- `VK_OAUTH_REDIRECT_URI`
+- `VK_OAUTH_SCOPE`
 - `PORT`
 
 Примечания:
@@ -125,6 +133,8 @@ Reference seed лежит в [prompt_config_seed_sample.csv](/A:/ANITA-BOT/smm_s
 
 - `GET /api/healthz`
 - `GET /api/readyz`
+- `GET /api/vk/oauth/start`
+- `GET /api/vk/oauth/callback`
 - `POST /api/telegram/webhook`
 
 ### Internal/worker
@@ -136,6 +146,13 @@ Reference seed лежит в [prompt_config_seed_sample.csv](/A:/ANITA-BOT/smm_s
 - `POST /api/worker/collection-finalize`
 
 Worker endpoints требуют `x-anita-worker-token`.
+
+VK OAuth endpoints публичные и нужны только для выпуска свежего user token через задеплоенный сервер:
+
+- открыть `/api/vk/oauth/start`
+- подтвердить доступ в VK
+- скопировать возвращенный токен в `VK_ACCESS_TOKEN`
+- сделать production redeploy
 
 ## 8. Scheduler notes
 

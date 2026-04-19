@@ -60,6 +60,10 @@ test('env example stays aligned with current env contract', async () => {
     'VK_COMMUNITY_ACCESS_TOKEN',
     'VK_GROUP_ID',
     'VK_PUBLISH_ENABLED',
+    'VK_CLIENT_ID',
+    'VK_CLIENT_SECRET',
+    'VK_OAUTH_REDIRECT_URI',
+    'VK_OAUTH_SCOPE',
   ];
 
   for (const key of [...requiredKeys, ...optionalKeys]) {

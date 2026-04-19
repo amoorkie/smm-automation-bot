@@ -1,13 +1,35 @@
 import Fastify from 'fastify';
 import { isRetryableHttpError, withRetry } from '../services/resilience.mjs';
+import VkOAuthService from '../services/vk-oauth.mjs';
 import { isWorkerRequestAuthorized } from './worker-dispatch.mjs';
+import { renderVkOAuthErrorPage, renderVkOAuthSuccessPage } from './vk-oauth-page.mjs';
 
 export function createServer({ env, service, bot }) {
   const app = Fastify({ logger: true });
+  const vkOAuth = new VkOAuthService({
+    clientId: env.vkClientId,
+    clientSecret: env.vkClientSecret,
+    redirectUri: env.vkOAuthRedirectUri,
+    scope: env.vkOAuthScope,
+  });
 
   function registerWorkerRoute(path, handler) {
     app.post(path, handler);
     app.post(`/api${path}`, handler);
+  }
+
+  function registerPublicGetRoute(path, handler) {
+    app.get(path, handler);
+    app.get(`/api${path}`, handler);
+  }
+
+  function resolveBaseUrl(request) {
+    if (env.webhookBaseUrl) {
+      return env.webhookBaseUrl.replace(/\/+$/u, '');
+    }
+    const protocol = request.headers['x-forwarded-proto'] ?? request.protocol ?? 'http';
+    const host = request.headers['x-forwarded-host'] ?? request.headers.host;
+    return host ? `${protocol}://${host}` : '';
   }
 
   app.get('/healthz', async () => ({ ok: true }));
@@ -25,6 +47,43 @@ export function createServer({ env, service, bot }) {
     }
     await service.runCleanup();
     return { ok: true };
+  });
+
+  registerPublicGetRoute('/vk/oauth/start', async (request, reply) => {
+    try {
+      return reply.redirect(vkOAuth.buildAuthorizeUrl({ baseUrl: resolveBaseUrl(request) }));
+    } catch (error) {
+      return reply
+        .status(error.statusCode ?? 500)
+        .type('text/html; charset=utf-8')
+        .send(renderVkOAuthErrorPage(error));
+    }
+  });
+
+  registerPublicGetRoute('/vk/oauth/callback', async (request, reply) => {
+    reply.header('cache-control', 'no-store');
+    try {
+      if (request.query?.error) {
+        const error = new Error(String(request.query.error_description || request.query.error));
+        error.code = String(request.query.error);
+        error.statusCode = 400;
+        throw error;
+      }
+
+      const token = await vkOAuth.exchangeCode({
+        code: request.query?.code,
+        state: request.query?.state,
+        baseUrl: resolveBaseUrl(request),
+      });
+      return reply
+        .type('text/html; charset=utf-8')
+        .send(renderVkOAuthSuccessPage(token));
+    } catch (error) {
+      return reply
+        .status(error.statusCode ?? 500)
+        .type('text/html; charset=utf-8')
+        .send(renderVkOAuthErrorPage(error));
+    }
   });
 
   registerWorkerRoute('/worker/telegram-update', async (request, reply) => {

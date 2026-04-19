@@ -283,6 +283,8 @@ Structured log entry использует поля:
 - `GET /readyz`
 - `GET /cron/finalize`
 - `GET /cron/cleanup`
+- `GET /vk/oauth/start`
+- `GET /vk/oauth/callback`
 - `POST /telegram/webhook`
 - `POST /worker/telegram-update`
 - `POST /worker/runtime-action`
@@ -294,12 +296,20 @@ Structured log entry использует поля:
 - `GET /api/readyz`
 - `GET /api/cron/finalize`
 - `GET /api/cron/cleanup`
+- `GET /api/vk/oauth/start`
+- `GET /api/vk/oauth/callback`
 - `POST /api/telegram/webhook`
 - `POST /api/worker/telegram-update`
 - `POST /api/worker/runtime-action`
 - `POST /api/worker/collection-finalize`
 
-### 9.3 Worker auth
+### 9.3 VK OAuth
+
+`GET /api/vk/oauth/start` отправляет владельца салона в VK OAuth code flow.
+`GET /api/vk/oauth/callback` меняет `code` на сервере и возвращает пользовательский токен для `VK_ACCESS_TOKEN`.
+Это нужно, когда токен, полученный в браузере, привязан к IP браузера и падает на Vercel с `access_token was given to another ip address`.
+
+### 9.4 Worker auth
 
 Worker endpoints защищены заголовком:
 
@@ -328,6 +338,18 @@ Worker endpoints защищены заголовком:
   - если пусто, runtime пытается вывести base URL из `VERCEL_URL`
 - `PORT`
   - local default: `3000`
+- `VK_ACCESS_TOKEN`
+  - пользовательский токен для VK photo upload/save вызовов
+- `VK_COMMUNITY_ACCESS_TOKEN`
+  - токен сообщества для VK `wall.post`
+- `VK_GROUP_ID`
+- `VK_PUBLISH_ENABLED`
+- `VK_CLIENT_ID`
+- `VK_CLIENT_SECRET`
+- `VK_OAUTH_REDIRECT_URI`
+  - production-значение должно вести на `/api/vk/oauth/callback`
+- `VK_OAUTH_SCOPE`
+  - default: `photos,wall`
 
 В текущем контракте нет `MASTER_CONTACT_PHONE`.
 

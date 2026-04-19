@@ -181,3 +181,57 @@ test('api-prefixed worker aliases execute the same handlers', async () => {
     await server.stop();
   }
 });
+
+test('vk oauth start route redirects to VK code flow', async () => {
+  const context = createContext({
+    env: {
+      vkClientId: '54547064',
+      vkClientSecret: 'secret',
+      vkOAuthRedirectUri: 'https://bot.example.com/api/vk/oauth/callback',
+    },
+  });
+  const server = createServer(context);
+
+  try {
+    const response = await server.app.inject({
+      method: 'GET',
+      url: '/api/vk/oauth/start',
+      headers: { host: 'bot.example.com' },
+    });
+
+    assert.equal(response.statusCode, 302);
+    const location = new URL(response.headers.location);
+    assert.equal(location.origin + location.pathname, 'https://oauth.vk.com/authorize');
+    assert.equal(location.searchParams.get('client_id'), '54547064');
+    assert.equal(location.searchParams.get('redirect_uri'), 'https://bot.example.com/api/vk/oauth/callback');
+    assert.equal(location.searchParams.get('response_type'), 'code');
+  } finally {
+    await server.stop();
+  }
+});
+
+test('vk oauth callback returns html error without code', async () => {
+  const context = createContext({
+    env: {
+      vkClientId: '54547064',
+      vkClientSecret: 'secret',
+      vkOAuthRedirectUri: 'https://bot.example.com/api/vk/oauth/callback',
+    },
+  });
+  const server = createServer(context);
+
+  try {
+    const response = await server.app.inject({
+      method: 'GET',
+      url: '/api/vk/oauth/callback',
+      headers: { host: 'bot.example.com' },
+    });
+
+    assert.equal(response.statusCode, 400);
+    assert.match(response.headers['content-type'], /text\/html/u);
+    assert.equal(response.headers['cache-control'], 'no-store');
+    assert.match(response.body, /vk_oauth_no_code/u);
+  } finally {
+    await server.stop();
+  }
+});

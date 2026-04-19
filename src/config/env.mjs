@@ -93,6 +93,10 @@ export function loadEnv(source = process.env) {
     vkCommunityAccessToken: parseOptionalString(source.VK_COMMUNITY_ACCESS_TOKEN),
     vkGroupId: parseVkGroupId(source.VK_GROUP_ID),
     vkPublishEnabled: parseBoolean(source.VK_PUBLISH_ENABLED, false),
+    vkClientId: parseOptionalString(source.VK_CLIENT_ID),
+    vkClientSecret: parseOptionalString(source.VK_CLIENT_SECRET),
+    vkOAuthRedirectUri: parseOptionalString(source.VK_OAUTH_REDIRECT_URI),
+    vkOAuthScope: parseOptionalString(source.VK_OAUTH_SCOPE),
   };
 }
 
