@@ -33,6 +33,25 @@ function parseBoolean(value, fallback = false) {
   return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
 }
 
+function parseOptionalString(value) {
+  if (value === undefined || value === null) {
+    return '';
+  }
+  return String(value).trim();
+}
+
+function parseVkGroupId(value) {
+  const normalized = parseOptionalString(value);
+  if (!normalized) {
+    return '';
+  }
+  const match = normalized.match(/(?:vk\.com\/)?(?:club|public)?(\d+)/iu);
+  if (match?.[1]) {
+    return match[1];
+  }
+  return normalized.replace(/^-+/u, '');
+}
+
 export function loadEnv(source = process.env) {
   const explicitWebhookBaseUrl = typeof source.WEBHOOK_BASE_URL === 'string' && source.WEBHOOK_BASE_URL.trim()
     ? source.WEBHOOK_BASE_URL.trim()
@@ -70,6 +89,9 @@ export function loadEnv(source = process.env) {
     botDisabled: parseBoolean(source.BOT_DISABLED, false),
     internalWorkerDispatchEnabled: parseBoolean(source.INTERNAL_WORKER_DISPATCH_ENABLED, false),
     topicSourceStatusMutationsEnabled: parseBoolean(source.TOPIC_SOURCE_STATUS_MUTATIONS_ENABLED, true),
+    vkCommunityAccessToken: parseOptionalString(source.VK_ACCESS_TOKEN ?? source.VK_COMMUNITY_ACCESS_TOKEN),
+    vkGroupId: parseVkGroupId(source.VK_GROUP_ID),
+    vkPublishEnabled: parseBoolean(source.VK_PUBLISH_ENABLED, false),
   };
 }
 

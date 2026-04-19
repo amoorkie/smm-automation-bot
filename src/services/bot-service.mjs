@@ -259,6 +259,7 @@ export class SalonBotService {
     openrouter,
     promptConfig,
     botLogger,
+    vkPublisher = null,
   }) {
     this.env = env;
     this.bot = bot;
@@ -267,6 +268,7 @@ export class SalonBotService {
     this.openrouter = openrouter;
     this.promptConfig = promptConfig;
     this.botLogger = botLogger;
+    this.vkPublisher = vkPublisher;
     this.localLocks = new Map();
     this.sourceReclaimState = new Map();
     this.workerDispatchDisabledReason = '';
@@ -3807,7 +3809,7 @@ export class SalonBotService {
       jobId,
       revision,
       chatId: normalized.chatId,
-      actions: ['version_prev', 'version_next', 'regenerate_images', 'regenerate_text', 'regenerate_all', 'publish_confirm', 'cancel'],
+      actions: this.getDraftPreviewActions(jobType),
     });
     await this.repos.createCallbackTokens(tokenRows);
 
@@ -5273,6 +5275,15 @@ export class SalonBotService {
     };
   }
 
+  getDraftPreviewActions(jobType) {
+    const actions = ['version_prev', 'version_next', 'regenerate_images', 'regenerate_text', 'regenerate_all'];
+    if (jobType !== 'work') {
+      actions.push('publish_confirm');
+    }
+    actions.push('cancel');
+    return actions;
+  }
+
   getWorkSessionId(chatId) {
     return `work:${chatId}`;
   }
@@ -6165,7 +6176,7 @@ export class SalonBotService {
       jobId,
       revision,
       chatId: collection.chat_id,
-      actions: ['version_prev', 'version_next', 'regenerate_images', 'regenerate_text', 'regenerate_all', 'cancel'],
+      actions: this.getDraftPreviewActions('work'),
     });
     if (runtime?.active_callback_set_id) {
       await this.repos.supersedeTokenSet(runtime.active_callback_set_id, nowIso());
@@ -6505,7 +6516,7 @@ export class SalonBotService {
       jobId,
       revision,
       chatId: runtime.chat_id,
-      actions: ['version_prev', 'version_next', 'regenerate_images', 'regenerate_text', 'regenerate_all', 'cancel'],
+      actions: this.getDraftPreviewActions(runtime.job_type),
     });
     await this.repos.supersedeTokenSet(runtime.active_callback_set_id, nowIso());
     await this.repos.createCallbackTokens(tokenRows);
@@ -6589,26 +6600,127 @@ export class SalonBotService {
     return { ok: true, revision };
   }
 
-  async markDraftPublished(runtime) {
-    const startedAt = Date.now();
-    const queueRow = await this.getQueueRowByJobId(runtime.job_id);
-    if (queueRow) {
-      await this.store.updateRowByNumber(
-        SHEET_NAMES.contentQueue,
-        queueRow.__rowNumber,
-        {
-          ...queueRow,
-          status: 'published',
-          updated_at: nowIso(),
-        },
-        SHEET_HEADERS[SHEET_NAMES.contentQueue],
-      );
+  getDraftPayload(runtime) {
+    return runtime?.draft_payload ?? runtime?.preview_payload ?? {};
+  }
+
+  getNextPublishAttempt(queueRow) {
+    return Math.max(0, Number(queueRow?.publish_attempt_count ?? 0)) + 1;
+  }
+
+  serializePublishRawResponse(rawResponse) {
+    if (!rawResponse) {
+      return '';
+    }
+    try {
+      return JSON.stringify(rawResponse);
+    } catch {
+      return '';
+    }
+  }
+
+  async appendPublishLog({
+    queueId = '',
+    jobId = '',
+    channel = '',
+    status = '',
+    attemptNo = 0,
+    vkOwnerId = '',
+    vkPostId = '',
+    vkAttachmentIds = [],
+    providerErrorCode = '',
+    providerErrorMessage = '',
+    rawResponse = null,
+    createdAt = nowIso(),
+  } = {}) {
+    await this.store.appendRow(
+      SHEET_NAMES.publishLog,
+      {
+        publish_id: stableId('PUB', `${jobId}:${attemptNo}:${status}:${createdAt}`),
+        queue_id: queueId,
+        job_id: jobId,
+        channel,
+        status,
+        attempt_no: String(attemptNo),
+        vk_owner_id: toStoredText(vkOwnerId),
+        vk_post_id: toStoredText(vkPostId),
+        vk_attachment_ids: JSON.stringify(vkAttachmentIds ?? []),
+        provider_error_code: toStoredText(providerErrorCode),
+        provider_error_message: toStoredText(providerErrorMessage),
+        raw_response_ref: this.serializePublishRawResponse(rawResponse),
+        created_at: createdAt,
+      },
+      SHEET_HEADERS[SHEET_NAMES.publishLog],
+    );
+  }
+
+  async updateQueuePublishState(queueRow, {
+    status = queueRow?.status ?? '',
+    publishChannel = queueRow?.publish_channel ?? 'telegram',
+    vkPostId = queueRow?.vk_post_id ?? '',
+    attemptNo = Number(queueRow?.publish_attempt_count ?? 0),
+    lastPublishAttemptAt = queueRow?.last_publish_attempt_at ?? '',
+    lastErrorCode = '',
+    lastErrorMessage = '',
+    updatedAt = nowIso(),
+  } = {}) {
+    if (!queueRow) {
+      return null;
+    }
+    const nextRow = {
+      ...queueRow,
+      status,
+      publish_channel: publishChannel,
+      vk_post_id: toStoredText(vkPostId),
+      publish_attempt_count: String(attemptNo),
+      last_publish_attempt_at: toStoredText(lastPublishAttemptAt),
+      last_error_code: toStoredText(lastErrorCode),
+      last_error_message: toStoredText(lastErrorMessage),
+      updated_at: updatedAt,
+    };
+    await this.store.updateRowByNumber(
+      SHEET_NAMES.contentQueue,
+      queueRow.__rowNumber,
+      nextRow,
+      SHEET_HEADERS[SHEET_NAMES.contentQueue],
+    );
+    return nextRow;
+  }
+
+  async refreshDraftPreviewCallbacks(runtime, payload = this.getDraftPayload(runtime)) {
+    const revisionEntry = this.getViewedRevision(payload);
+    if (!revisionEntry) {
+      return runtime;
     }
 
-    const sourceSheet = runtime.lock_flags?.source_sheet ?? this.getTopicLikeSourceSheet(runtime.job_type);
-    if (sourceSheet && runtime.topic_id) {
-      await this.markSourceRowPublished(sourceSheet, runtime.topic_id, runtime.job_id);
+    const { tokenRows, tokensByAction, tokenSetId } = this.createCallbackSet({
+      jobId: runtime.job_id,
+      revision: revisionEntry.revision,
+      chatId: runtime.chat_id,
+      actions: this.getDraftPreviewActions(runtime.job_type),
+    });
+    if (runtime.active_callback_set_id) {
+      await this.repos.supersedeTokenSet(runtime.active_callback_set_id, nowIso());
     }
+    await this.repos.createCallbackTokens(tokenRows);
+
+    const previewMessages = await this.presentPreviewRevision({
+      chatId: runtime.chat_id,
+      payload,
+      revisionEntry,
+      tokensByAction,
+      runtime,
+    });
+
+    const nextRuntime = {
+      ...runtime,
+      collage_message_id: toStoredText(previewMessages.collageMessageId),
+      assets_message_ids: previewMessages.assetsMessageIds,
+      text_message_id: toStoredText(previewMessages.textMessageId),
+      active_callback_set_id: toStoredText(tokenSetId),
+      preview_payload: payload,
+      draft_payload: payload,
+    };
 
     await this.repos.upsertRuntime({
       job_id: runtime.job_id,
@@ -6618,32 +6730,215 @@ export class SalonBotService {
       topic_id: runtime.topic_id ?? '',
       collection_id: runtime.collection_id ?? '',
       active_revision: runtime.active_revision,
-      runtime_status: 'published',
-      collage_message_id: toStoredText(runtime.collage_message_id),
-      assets_message_ids_json: JSON.stringify(runtime.assets_message_ids ?? []),
-      text_message_id: toStoredText(runtime.text_message_id),
-      active_callback_set_id: toStoredText(runtime.active_callback_set_id),
+      runtime_status: runtime.runtime_status,
+      collage_message_id: nextRuntime.collage_message_id,
+      assets_message_ids_json: JSON.stringify(nextRuntime.assets_message_ids),
+      text_message_id: nextRuntime.text_message_id,
+      active_callback_set_id: nextRuntime.active_callback_set_id,
       schedule_input_pending: 0,
       lock_flags_json: JSON.stringify(runtime.lock_flags ?? {}),
-      preview_payload_json: JSON.stringify(runtime.preview_payload),
-      draft_payload_json: JSON.stringify(runtime.draft_payload),
+      preview_payload_json: JSON.stringify(payload),
+      draft_payload_json: JSON.stringify(payload),
       updated_at: nowIso(),
     });
 
-    this.logDurationBestEffort({
-      event: 'publish_confirmed',
-      stage: 'publish',
-      chatId: runtime.chat_id,
-      userId: runtime.user_id,
+    return nextRuntime;
+  }
+
+  async publishDraftToVk(runtime, queueRow) {
+    if (!this.env.vkPublishEnabled) {
+      return { channel: queueRow?.publish_channel ?? 'telegram', external: false };
+    }
+    if (!this.vkPublisher?.isConfigured()) {
+      const error = new Error('VK publish requested without valid configuration');
+      error.code = 'vk_not_configured';
+      error.userMessage = 'VK публикация пока не настроена.';
+      throw error;
+    }
+
+    const payload = this.getDraftPayload(runtime);
+    const revisionEntry = this.getViewedRevision(payload);
+    if (!revisionEntry) {
+      const error = new Error(`No preview revision available for publish ${runtime.job_id}`);
+      error.code = 'vk_missing_preview';
+      error.userMessage = 'Не нашла готовый preview для публикации.';
+      throw error;
+    }
+
+    const previewFileIds = this.assertReusableTelegramFileIds(
+      revisionEntry.previewTelegramFileIds ?? payload.previewTelegramFileIds ?? [],
+      `publish_confirm:${runtime.job_id}`,
+    );
+    const images = await Promise.all(previewFileIds.map(async (fileId, index) => {
+      const file = await this.downloadTelegramFile(fileId);
+      return {
+        buffer: file.buffer,
+        mimeType: file.mimeType,
+        fileName: basenameForMime(file.mimeType, `publish-${runtime.job_id}-${index + 1}.jpg`),
+      };
+    }));
+
+    const result = await this.vkPublisher.publishPost({
+      caption: revisionEntry.captionText ?? payload.captionText ?? queueRow?.caption_text ?? '',
+      images,
+    });
+    return {
+      external: true,
+      ...result,
+    };
+  }
+
+  async markDraftPublished(runtime) {
+    const startedAt = Date.now();
+    const lockKey = `publish:${runtime.job_id}`;
+    const acquired = await this.repos.acquirePublishLock({
+      lockKey,
       jobId: runtime.job_id,
-      queueId: queueRow?.queue_id ?? '',
-      collectionId: runtime.collection_id ?? '',
-      sourceType: runtime.job_type,
-      status: 'ok',
-      message: runtime.topic_id ?? runtime.job_id,
-    }, startedAt);
-    await this.sendMessage(runtime.chat_id, 'Отметила материал как опубликованный.');
-    return { ok: true, published: true };
+      queueId: runtime.preview_payload?.queueId ?? runtime.draft_payload?.queueId ?? '',
+      createdAt: nowIso(),
+      expiresAt: addMinutes(new Date(), 10),
+    });
+    if (!acquired) {
+      return { ok: true, locked: true };
+    }
+
+    try {
+      const freshRuntime = await this.repos.getRuntime(runtime.job_id) ?? runtime;
+      const queueRow = await this.getQueueRowByJobId(runtime.job_id);
+      const attemptNo = this.getNextPublishAttempt(queueRow);
+      const attemptAt = nowIso();
+
+      let publishResult = { channel: queueRow?.publish_channel ?? 'telegram', external: false };
+      try {
+        publishResult = await this.publishDraftToVk(freshRuntime, queueRow);
+      } catch (error) {
+        if (!this.env.vkPublishEnabled) {
+          throw error;
+        }
+
+        if (queueRow) {
+          await this.updateQueuePublishState(queueRow, {
+            status: queueRow.status,
+            publishChannel: 'vk',
+            attemptNo,
+            lastPublishAttemptAt: attemptAt,
+            lastErrorCode: error.providerCode ?? error.code ?? 'vk_publish_failed',
+            lastErrorMessage: error.message ?? 'VK publish failed',
+          });
+          await this.appendPublishLog({
+            queueId: queueRow.queue_id,
+            jobId: freshRuntime.job_id,
+            channel: 'vk',
+            status: 'failed',
+            attemptNo,
+            providerErrorCode: error.providerCode ?? error.code ?? 'vk_publish_failed',
+            providerErrorMessage: error.message ?? 'VK publish failed',
+            rawResponse: error.rawResponse ?? null,
+            createdAt: attemptAt,
+          });
+        }
+
+        await this.refreshDraftPreviewCallbacks(freshRuntime);
+        await this.logEvent({
+          event: 'publish_failed',
+          stage: 'publish',
+          chatId: freshRuntime.chat_id,
+          userId: freshRuntime.user_id,
+          jobId: freshRuntime.job_id,
+          queueId: queueRow?.queue_id ?? '',
+          collectionId: freshRuntime.collection_id ?? '',
+          sourceType: freshRuntime.job_type,
+          status: error.providerCode ?? error.code ?? 'vk_publish_failed',
+          message: error.message ?? 'VK publish failed',
+        });
+        await this.sendMessage(
+          freshRuntime.chat_id,
+          error.userMessage || 'Не получилось опубликовать материал в VK. Кнопки обновила, можно попробовать ещё раз.',
+        );
+        return { ok: false, published: false, publishFailed: true };
+      }
+
+      const sourceSheet = freshRuntime.lock_flags?.source_sheet ?? this.getTopicLikeSourceSheet(freshRuntime.job_type);
+      if (queueRow) {
+        await this.updateQueuePublishState(queueRow, {
+          status: 'published',
+          publishChannel: publishResult.channel ?? queueRow.publish_channel ?? 'telegram',
+          vkPostId: publishResult.postId ?? '',
+          attemptNo: publishResult.external ? attemptNo : Number(queueRow.publish_attempt_count ?? 0),
+          lastPublishAttemptAt: publishResult.external ? attemptAt : (queueRow.last_publish_attempt_at ?? ''),
+          lastErrorCode: '',
+          lastErrorMessage: '',
+        });
+        if (publishResult.external) {
+          await this.appendPublishLog({
+            queueId: queueRow.queue_id,
+            jobId: freshRuntime.job_id,
+            channel: publishResult.channel ?? 'vk',
+            status: 'success',
+            attemptNo,
+            vkOwnerId: publishResult.ownerId ?? '',
+            vkPostId: publishResult.postId ?? '',
+            vkAttachmentIds: publishResult.attachmentIds ?? [],
+            rawResponse: publishResult.rawResponse ?? null,
+            createdAt: attemptAt,
+          });
+        }
+      }
+
+      if (sourceSheet && freshRuntime.topic_id) {
+        await this.markSourceRowPublished(sourceSheet, freshRuntime.topic_id, freshRuntime.job_id);
+      }
+
+      if (freshRuntime.active_callback_set_id) {
+        await this.repos.supersedeTokenSet(freshRuntime.active_callback_set_id, nowIso());
+      }
+
+      await this.repos.upsertRuntime({
+        job_id: freshRuntime.job_id,
+        job_type: freshRuntime.job_type,
+        chat_id: freshRuntime.chat_id,
+        user_id: freshRuntime.user_id,
+        topic_id: freshRuntime.topic_id ?? '',
+        collection_id: freshRuntime.collection_id ?? '',
+        active_revision: freshRuntime.active_revision,
+        runtime_status: 'published',
+        collage_message_id: toStoredText(freshRuntime.collage_message_id),
+        assets_message_ids_json: JSON.stringify(freshRuntime.assets_message_ids ?? []),
+        text_message_id: toStoredText(freshRuntime.text_message_id),
+        active_callback_set_id: '',
+        schedule_input_pending: 0,
+        lock_flags_json: JSON.stringify(freshRuntime.lock_flags ?? {}),
+        preview_payload_json: JSON.stringify(freshRuntime.preview_payload),
+        draft_payload_json: JSON.stringify(freshRuntime.draft_payload),
+        updated_at: nowIso(),
+      });
+
+      this.logDurationBestEffort({
+        event: 'publish_confirmed',
+        stage: 'publish',
+        chatId: freshRuntime.chat_id,
+        userId: freshRuntime.user_id,
+        jobId: freshRuntime.job_id,
+        queueId: queueRow?.queue_id ?? '',
+        collectionId: freshRuntime.collection_id ?? '',
+        sourceType: freshRuntime.job_type,
+        status: publishResult.external ? (publishResult.channel ?? 'vk') : 'ok',
+        message: publishResult.postId ?? freshRuntime.topic_id ?? freshRuntime.job_id,
+      }, startedAt, publishResult.external ? {
+        channel: publishResult.channel ?? 'vk',
+        vkPostId: publishResult.postId ?? '',
+        vkOwnerId: publishResult.ownerId ?? '',
+      } : null);
+      await this.sendMessage(
+        freshRuntime.chat_id,
+        publishResult.external
+          ? 'Материал опубликован в VK.'
+          : 'Отметила материал как опубликованный.',
+      );
+      return { ok: true, published: true, channel: publishResult.channel ?? 'telegram', vkPostId: publishResult.postId ?? '' };
+    } finally {
+      await this.repos.releasePublishLock(lockKey);
+    }
   }
 
   async cancelDraft(jobId) {

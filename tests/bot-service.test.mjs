@@ -464,7 +464,12 @@ function createOpenRouter(options = {}) {
   };
 }
 
-function createService({ initialTables = {}, envOverrides = {}, openrouterOverrides = {} } = {}) {
+function createService({
+  initialTables = {},
+  envOverrides = {},
+  openrouterOverrides = {},
+  vkPublisher = null,
+} = {}) {
   const store = new FakeStore(initialTables);
   const repos = createRepositories(store);
   const bot = createFakeBot();
@@ -480,6 +485,9 @@ function createService({ initialTables = {}, envOverrides = {}, openrouterOverri
       webhookBaseUrl: '',
       internalWorkerDispatchEnabled: false,
       topicSourceStatusMutationsEnabled: true,
+      vkCommunityAccessToken: '',
+      vkGroupId: '',
+      vkPublishEnabled: false,
       ...envOverrides,
     },
     bot,
@@ -488,6 +496,7 @@ function createService({ initialTables = {}, envOverrides = {}, openrouterOverri
     openrouter,
     promptConfig: createPromptConfig(),
     botLogger,
+    vkPublisher,
   });
 
   service.downloadTelegramFile = async (fileId) => ({
@@ -2957,6 +2966,173 @@ test('publish_confirm marks source row as published', async () => {
   const rows = await ctx.store.getRows(TABLE_NAMES.storyTopics);
   assert.equal(rows[0].status, 'published');
   assert.equal((await ctx.store.getRows(TABLE_NAMES.contentQueue))[0].status, 'published');
+});
+
+test('publish_confirm posts draft to VK and stores publish metadata', async () => {
+  const vkCalls = [];
+  const ctx = createService({
+    envOverrides: {
+      vkPublishEnabled: true,
+      vkCommunityAccessToken: 'vk-token',
+      vkGroupId: '237715719',
+    },
+    vkPublisher: {
+      isConfigured() {
+        return true;
+      },
+      async publishPost(payload) {
+        vkCalls.push(payload);
+        return {
+          channel: 'vk',
+          ownerId: '-237715719',
+          postId: '42',
+          attachmentIds: ['photo-237715719_42'],
+          rawResponse: { ok: true },
+        };
+      },
+    },
+    initialTables: {
+      [TABLE_NAMES.storyTopics]: [buildTopicLikeSourceRow({
+        topicId: 'ST-VK',
+        title: 'VK publish test',
+        brief: 'Check confirmed publish flow.',
+      })],
+    },
+  });
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 180,
+    message: { message_id: 180, text: '/stories', chat: { id: 80 }, from: { id: 40 } },
+  });
+  const pickToken = await pickCallbackTokenByPrefix(ctx, 'pick_source_');
+  await ctx.service.handleTelegramUpdate({
+    update_id: 181,
+    callback_query: {
+      id: 'cb-vk-pick',
+      data: `pick_source_0_0:${pickToken}`,
+      from: { id: 40 },
+      message: { message_id: 180, chat: { id: 80 } },
+    },
+  });
+
+  const queueBeforePublish = (await ctx.store.getRows(TABLE_NAMES.contentQueue))[0];
+  const runtimeBeforePublish = await ctx.repos.getRuntime(queueBeforePublish.job_id);
+  const publishToken = await pickCallbackToken(ctx, 'publish_confirm');
+  await ctx.service.handleTelegramUpdate({
+    update_id: 182,
+    callback_query: {
+      id: 'cb-vk-publish',
+      data: `publish_confirm:${publishToken}`,
+      from: { id: 40 },
+      message: { message_id: runtimeBeforePublish.text_message_id ?? runtimeBeforePublish.collage_message_id, chat: { id: 80 } },
+    },
+  });
+
+  assert.equal(vkCalls.length, 1);
+  assert.equal(vkCalls[0].images.length, 1);
+  assert.match(vkCalls[0].caption, /\S/u);
+
+  const queueAfterPublish = (await ctx.store.getRows(TABLE_NAMES.contentQueue))[0];
+  assert.equal(queueAfterPublish.status, 'published');
+  assert.equal(queueAfterPublish.publish_channel, 'vk');
+  assert.equal(queueAfterPublish.vk_post_id, '42');
+  assert.equal(queueAfterPublish.publish_attempt_count, '1');
+  assert.equal(queueAfterPublish.last_error_code, '');
+  assert.equal(queueAfterPublish.last_error_message, '');
+
+  const publishLogRows = await ctx.store.getRows(TABLE_NAMES.publishLog);
+  assert.equal(publishLogRows.length, 1);
+  assert.equal(publishLogRows[0].channel, 'vk');
+  assert.equal(publishLogRows[0].status, 'success');
+  assert.equal(publishLogRows[0].vk_post_id, '42');
+
+  const sourceRows = await ctx.store.getRows(TABLE_NAMES.storyTopics);
+  assert.equal(sourceRows[0].status, 'published');
+
+  const runtimeAfterPublish = await ctx.repos.getRuntime(queueAfterPublish.job_id);
+  assert.equal(runtimeAfterPublish.runtime_status, 'published');
+  assert.equal(runtimeAfterPublish.active_callback_set_id, '');
+});
+
+test('publish_confirm keeps preview active when VK publish fails', async () => {
+  const ctx = createService({
+    envOverrides: {
+      vkPublishEnabled: true,
+      vkCommunityAccessToken: 'vk-token',
+      vkGroupId: '237715719',
+    },
+    vkPublisher: {
+      isConfigured() {
+        return true;
+      },
+      async publishPost() {
+        const error = new Error('VK wall.post failed');
+        error.code = 'vk_api_error';
+        error.providerCode = '5';
+        error.userMessage = 'VK publish failed';
+        error.rawResponse = { error: { error_code: 5, error_msg: 'User authorization failed' } };
+        throw error;
+      },
+    },
+    initialTables: {
+      [TABLE_NAMES.storyTopics]: [buildTopicLikeSourceRow({
+        topicId: 'ST-VK-FAIL',
+        title: 'VK publish failure test',
+        brief: 'Check failed publish flow.',
+      })],
+    },
+  });
+
+  await ctx.service.handleTelegramUpdate({
+    update_id: 190,
+    message: { message_id: 190, text: '/stories', chat: { id: 90 }, from: { id: 50 } },
+  });
+  const pickToken = await pickCallbackTokenByPrefix(ctx, 'pick_source_');
+  await ctx.service.handleTelegramUpdate({
+    update_id: 191,
+    callback_query: {
+      id: 'cb-vk-fail-pick',
+      data: `pick_source_0_0:${pickToken}`,
+      from: { id: 50 },
+      message: { message_id: 190, chat: { id: 90 } },
+    },
+  });
+
+  const queueBeforePublish = (await ctx.store.getRows(TABLE_NAMES.contentQueue))[0];
+  const runtimeBeforePublish = await ctx.repos.getRuntime(queueBeforePublish.job_id);
+  const previousTokenSetId = runtimeBeforePublish.active_callback_set_id;
+  const publishToken = await pickCallbackToken(ctx, 'publish_confirm');
+  await ctx.service.handleTelegramUpdate({
+    update_id: 192,
+    callback_query: {
+      id: 'cb-vk-fail-publish',
+      data: `publish_confirm:${publishToken}`,
+      from: { id: 50 },
+      message: { message_id: runtimeBeforePublish.text_message_id ?? runtimeBeforePublish.collage_message_id, chat: { id: 90 } },
+    },
+  });
+
+  const queueAfterPublish = (await ctx.store.getRows(TABLE_NAMES.contentQueue))[0];
+  assert.equal(queueAfterPublish.status, 'preview_ready');
+  assert.equal(queueAfterPublish.publish_channel, 'vk');
+  assert.equal(queueAfterPublish.vk_post_id, '');
+  assert.equal(queueAfterPublish.publish_attempt_count, '1');
+  assert.equal(queueAfterPublish.last_error_code, '5');
+  assert.match(queueAfterPublish.last_error_message, /VK wall\.post failed/u);
+
+  const publishLogRows = await ctx.store.getRows(TABLE_NAMES.publishLog);
+  assert.equal(publishLogRows.length, 1);
+  assert.equal(publishLogRows[0].channel, 'vk');
+  assert.equal(publishLogRows[0].status, 'failed');
+  assert.equal(publishLogRows[0].provider_error_code, '5');
+
+  const sourceRows = await ctx.store.getRows(TABLE_NAMES.storyTopics);
+  assert.equal(sourceRows[0].status, 'reserved');
+
+  const runtimeAfterPublish = await ctx.repos.getRuntime(queueAfterPublish.job_id);
+  assert.equal(runtimeAfterPublish.runtime_status, 'preview_ready');
+  assert.notEqual(runtimeAfterPublish.active_callback_set_id, previousTokenSetId);
+  assert.ok(await pickCallbackToken(ctx, 'publish_confirm'));
 });
 
 test('published topic is excluded from the picker on the next open for every topic-like mode', async () => {

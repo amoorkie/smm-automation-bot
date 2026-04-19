@@ -7,6 +7,7 @@ import OpenRouterService from './services/openrouter.mjs';
 import PromptConfigService from './services/prompt-config.mjs';
 import SalonBotService from './services/bot-service.mjs';
 import SupabaseStoreService from './services/supabase-store.mjs';
+import VkPublisher from './services/vk-publisher.mjs';
 import createServer from './http/server.mjs';
 
 export async function createRuntimeContext(sourceEnv = process.env) {
@@ -28,6 +29,11 @@ export async function createRuntimeContext(sourceEnv = process.env) {
     textModelId: env.textModelId,
     imageModelId: env.imageModelId,
   });
+  const vkPublisher = new VkPublisher({
+    accessToken: env.vkCommunityAccessToken,
+    groupId: env.vkGroupId,
+    enabled: env.vkPublishEnabled,
+  });
   const service = new SalonBotService({
     env,
     bot,
@@ -36,6 +42,7 @@ export async function createRuntimeContext(sourceEnv = process.env) {
     openrouter,
     promptConfig,
     botLogger,
+    vkPublisher,
   });
 
   return {
@@ -46,6 +53,7 @@ export async function createRuntimeContext(sourceEnv = process.env) {
     botLogger,
     promptConfig,
     openrouter,
+    vkPublisher,
     service,
   };
 }

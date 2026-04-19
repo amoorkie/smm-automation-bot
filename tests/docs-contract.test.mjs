@@ -56,6 +56,9 @@ test('env example stays aligned with current env contract', async () => {
     'APP_TIMEZONE',
     'WEBHOOK_BASE_URL',
     'PORT',
+    'VK_ACCESS_TOKEN',
+    'VK_GROUP_ID',
+    'VK_PUBLISH_ENABLED',
   ];
 
   for (const key of [...requiredKeys, ...optionalKeys]) {
