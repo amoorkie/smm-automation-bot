@@ -485,6 +485,7 @@ function createService({
       webhookBaseUrl: '',
       internalWorkerDispatchEnabled: false,
       topicSourceStatusMutationsEnabled: true,
+      vkAccessToken: '',
       vkCommunityAccessToken: '',
       vkGroupId: '',
       vkPublishEnabled: false,
@@ -2973,7 +2974,7 @@ test('publish_confirm posts draft to VK and stores publish metadata', async () =
   const ctx = createService({
     envOverrides: {
       vkPublishEnabled: true,
-      vkCommunityAccessToken: 'vk-token',
+      vkAccessToken: 'vk-token',
       vkGroupId: '237715719',
     },
     vkPublisher: {
@@ -3058,7 +3059,7 @@ test('publish_confirm keeps preview active when VK publish fails', async () => {
   const ctx = createService({
     envOverrides: {
       vkPublishEnabled: true,
-      vkCommunityAccessToken: 'vk-token',
+      vkAccessToken: 'vk-token',
       vkGroupId: '237715719',
     },
     vkPublisher: {

@@ -31,11 +31,13 @@ function buildAttachmentId(photo = {}) {
 export default class VkPublisher {
   constructor({
     accessToken = '',
+    wallPostAccessToken = '',
     groupId = '',
     enabled = false,
     apiVersion = VK_API_VERSION,
   } = {}) {
     this.accessToken = String(accessToken ?? '').trim();
+    this.wallPostAccessToken = String(wallPostAccessToken ?? '').trim();
     this.groupId = toPositiveGroupId(groupId);
     this.enabled = Boolean(enabled);
     this.apiVersion = apiVersion;
@@ -45,11 +47,11 @@ export default class VkPublisher {
     return Boolean(this.enabled && this.accessToken && this.groupId);
   }
 
-  async callMethod(method, params = {}) {
+  async callMethod(method, params = {}, { accessToken = this.accessToken } = {}) {
     const body = new URLSearchParams();
     for (const [key, value] of Object.entries({
       ...params,
-      access_token: this.accessToken,
+      access_token: accessToken,
       v: this.apiVersion,
     })) {
       if (value === undefined || value === null || value === '') {
@@ -181,6 +183,8 @@ export default class VkPublisher {
       from_group: 1,
       message: caption,
       attachments: attachments.join(','),
+    }, {
+      accessToken: this.wallPostAccessToken || this.accessToken,
     });
 
     if (!post?.post_id) {

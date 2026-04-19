@@ -57,6 +57,7 @@ test('env example stays aligned with current env contract', async () => {
     'WEBHOOK_BASE_URL',
     'PORT',
     'VK_ACCESS_TOKEN',
+    'VK_COMMUNITY_ACCESS_TOKEN',
     'VK_GROUP_ID',
     'VK_PUBLISH_ENABLED',
   ];

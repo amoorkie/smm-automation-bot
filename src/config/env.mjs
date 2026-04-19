@@ -89,7 +89,8 @@ export function loadEnv(source = process.env) {
     botDisabled: parseBoolean(source.BOT_DISABLED, false),
     internalWorkerDispatchEnabled: parseBoolean(source.INTERNAL_WORKER_DISPATCH_ENABLED, false),
     topicSourceStatusMutationsEnabled: parseBoolean(source.TOPIC_SOURCE_STATUS_MUTATIONS_ENABLED, true),
-    vkCommunityAccessToken: parseOptionalString(source.VK_ACCESS_TOKEN ?? source.VK_COMMUNITY_ACCESS_TOKEN),
+    vkAccessToken: parseOptionalString(source.VK_ACCESS_TOKEN ?? source.VK_COMMUNITY_ACCESS_TOKEN),
+    vkCommunityAccessToken: parseOptionalString(source.VK_COMMUNITY_ACCESS_TOKEN),
     vkGroupId: parseVkGroupId(source.VK_GROUP_ID),
     vkPublishEnabled: parseBoolean(source.VK_PUBLISH_ENABLED, false),
   };

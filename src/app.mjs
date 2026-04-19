@@ -30,7 +30,8 @@ export async function createRuntimeContext(sourceEnv = process.env) {
     imageModelId: env.imageModelId,
   });
   const vkPublisher = new VkPublisher({
-    accessToken: env.vkCommunityAccessToken,
+    accessToken: env.vkAccessToken,
+    wallPostAccessToken: env.vkCommunityAccessToken,
     groupId: env.vkGroupId,
     enabled: env.vkPublishEnabled,
   });
